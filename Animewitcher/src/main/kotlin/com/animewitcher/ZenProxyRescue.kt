@@ -1,7 +1,7 @@
 package com.animewitcher
 
 import android.content.Context
-import com.lagradost.cloudstream3.AcraApplication
+import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -15,7 +15,7 @@ object ZenProxyRescue {
     // 🛠️ READS FROM UI SETTINGS
     private fun getProxyHost(): String {
         return try {
-            val ctx = AcraApplication.context ?: return "issa-proxy.yazankal.workers.dev"
+            val ctx = CloudStreamApp.context ?: return "issa-proxy.yazankal.workers.dev"
             val prefs = ctx.getSharedPreferences("AnimeWitcherPrefs", Context.MODE_PRIVATE)
             prefs.getString("animewitcher_proxy_host", "issa-proxy.yazankal.workers.dev") ?: "issa-proxy.yazankal.workers.dev"
         } catch (e: Exception) {
