@@ -114,6 +114,34 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
+    // 🆕 ENHANCED MAIN PAGE (6 Sections mapped to working indices)
+    override val mainPage = mainPageOf(
+        "recent" to "أحدث الحلقات",
+        "series_fav_count_desc" to "الأكثر شعبية",
+        "best_mal_ranked" to "أفضل التقييمات",
+        "movies" to "أفلام الأنمي",
+        "dubbed" to "مدبلج",
+        "ongoing" to "يُعرض الآن"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
+        val recentEps = async { fetchRecentEpisodes() }
+        val popular = async { fetchAlgoliaList("series_fav_count_desc", "") }
+        val topRated = async { fetchAlgoliaList("best_mal_ranked", "") }
+        val movies = async { fetchAlgoliaList("series", "", "[\"type:فيلم\"]") }
+        val dubbed = async { fetchAlgoliaList("series", "", "[\"dubbed:true\"]") }
+        val ongoing = async { fetchAlgoliaList("series", "", "[\"state:يتم عرضه\"]") }
+        
+        return@withContext newHomePageResponse(listOf(
+            HomePageList("أحدث الحلقات", recentEps.await(), isHorizontalImages = true), 
+            HomePageList("الأكثر شعبية", popular.await()), 
+            HomePageList("أفضل التقييمات", topRated.await()), 
+            HomePageList("أفلام الأنمي", movies.await()),
+            HomePageList("مدبلج", dubbed.await()),
+            HomePageList("يُعرض الآن", ongoing.await())
+        ), hasNext = false)
+    }
+
     private suspend fun fetchAlgoliaList(indexName: String, query: String, facetFilters: String = "", excludeUnreleased: Boolean = false): List<SearchResponse> = withContext(Dispatchers.IO) {
         val attributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\"]")
         var params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query=" + URLEncoder.encode(query, "UTF-8")
@@ -146,12 +174,6 @@ class AnimeWitcherProvider : MainAPI() {
             list.add(newAnimeSearchResponse(displayTitle, url, TvType.Anime) { this.posterUrl = poster })
         }
         return@withContext list
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
-        val recentEps = async { fetchRecentEpisodes() }; val popular = async { fetchAlgoliaList("series_fav_count_desc", "") }
-        val topRated = async { fetchAlgoliaList("best_mal_ranked", "") }; val movies = async { fetchAlgoliaList("series", "", "[\"type:فيلم\"]") }
-        return@withContext newHomePageResponse(listOf(HomePageList("أحدث الحلقات", recentEps.await(), isHorizontalImages = true), HomePageList("الأكثر شعبية", popular.await()), HomePageList("أفضل التقييمات", topRated.await()), HomePageList("أفلام الأنمي", movies.await())), hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) { fetchAlgoliaList("series", query) }
@@ -231,7 +253,30 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext emptyList()
     }
 
-    // 🆕 EXTRACTED FOR PARALLEL EXECUTION
+    private suspend fun extractStreamTape(url: String): String? {
+        return try {
+            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language" to "en-US,en;q=0.5", "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1")
+            val html = app.get(url, headers = headers).text
+            val patterns = listOf(Regex("""id=["']norobotlink["'][^>]*>([^<]+)<"""), Regex("""getElementById\(['"]norobotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]"""), Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)"""))
+            for (regex in patterns) { val match = regex.find(html); if (match != null) { var link = match.groupValues[1].trim(); if (link.startsWith("//")) link = "https:$link" else if (!link.startsWith("http")) link = "https://streamtape.com$link"; if (!link.contains("&stream=1")) link += "&stream=1"; return link } }
+            null
+        } catch (e: Exception) { null }
+    }
+
+    private suspend fun extractMediaFire(url: String): String? {
+        return try {
+            val quickKey = Regex("""/file(?:_premium)?/([a-zA-Z0-9]+)/""").find(url)?.groupValues?.get(1)
+            val pageUrl = if (quickKey != null) "https://www.mediafire.com/file/$quickKey/" else url
+            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            val doc = app.get(pageUrl, headers = headers, referer = "https://www.mediafire.com/").document
+            val dlLink = doc.selectFirst("a#downloadButton")?.attr("href") ?: doc.selectFirst("a[aria-labelledby=\"downloadButton\"]")?.attr("href") ?: doc.selectFirst("a.download_link")?.attr("href")
+            if (!dlLink.isNullOrBlank() && dlLink.startsWith("http")) return dlLink
+            val html = doc.outerHtml(); val regexLink = Regex("""href="(https://download[^"]+)"""").find(html)?.groupValues?.get(1) ?: Regex("""(https://[a-zA-Z0-9\-]+\.mediafire\.com/[^"'\s]+)""").find(html)?.groupValues?.get(1)
+            if (regexLink != null && regexLink.startsWith("http")) return regexLink; null
+        } catch (e: Exception) { null }
+    }
+
+    // 🆕 EXTRACT SERVER LOGIC (For Parallel Execution)
     private suspend fun extractFromServer(server: ServerModel, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val rawServerName = server.name ?: "Server"
         val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
@@ -306,6 +351,7 @@ class AnimeWitcherProvider : MainAPI() {
         
         val allLinks = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
         
+        // 🚀 PARALLEL EXTRACTION
         coroutineScope {
             val jobs = servers.map { server ->
                 launch(Dispatchers.IO) {
@@ -315,6 +361,7 @@ class AnimeWitcherProvider : MainAPI() {
             withTimeoutOrNull(20000L) { jobs.joinAll() }
         }
 
+        // 🧹 DEDUPLICATION
         val deduplicated = allLinks.distinctBy { link ->
             if (link.url.contains(".m3u8") || link.url.contains(".mp4")) link.url.substringBefore("?").substringBefore("#") else link.url
         }.sortedByDescending { it.quality }
@@ -322,29 +369,6 @@ class AnimeWitcherProvider : MainAPI() {
         deduplicated.forEach(callback)
         if (deduplicated.isEmpty()) throw ErrorLoadingException("No working streams extracted.")
         return@withContext true
-    }
-
-    private suspend fun extractStreamTape(url: String): String? {
-        return try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language" to "en-US,en;q=0.5", "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1")
-            val html = app.get(url, headers = headers).text
-            val patterns = listOf(Regex("""id=["']norobotlink["'][^>]*>([^<]+)<"""), Regex("""getElementById\(['"]norobotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]"""), Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)"""))
-            for (regex in patterns) { val match = regex.find(html); if (match != null) { var link = match.groupValues[1].trim(); if (link.startsWith("//")) link = "https:$link" else if (!link.startsWith("http")) link = "https://streamtape.com$link"; if (!link.contains("&stream=1")) link += "&stream=1"; return link } }
-            null
-        } catch (e: Exception) { null }
-    }
-
-    private suspend fun extractMediaFire(url: String): String? {
-        return try {
-            val quickKey = Regex("""/file(?:_premium)?/([a-zA-Z0-9]+)/""").find(url)?.groupValues?.get(1)
-            val pageUrl = if (quickKey != null) "https://www.mediafire.com/file/$quickKey/" else url
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            val doc = app.get(pageUrl, headers = headers, referer = "https://www.mediafire.com/").document
-            val dlLink = doc.selectFirst("a#downloadButton")?.attr("href") ?: doc.selectFirst("a[aria-labelledby=\"downloadButton\"]")?.attr("href") ?: doc.selectFirst("a.download_link")?.attr("href")
-            if (!dlLink.isNullOrBlank() && dlLink.startsWith("http")) return dlLink
-            val html = doc.outerHtml(); val regexLink = Regex("""href="(https://download[^"]+)"""").find(html)?.groupValues?.get(1) ?: Regex("""(https://[a-zA-Z0-9\-]+\.mediafire\.com/[^"'\s]+)""").find(html)?.groupValues?.get(1)
-            if (regexLink != null && regexLink.startsWith("http")) return regexLink; null
-        } catch (e: Exception) { null }
     }
 
     private fun getQualityFromName(quality: String?): Int {
