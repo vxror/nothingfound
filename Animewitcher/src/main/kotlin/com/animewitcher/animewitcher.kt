@@ -31,7 +31,7 @@ class AnimeWitcherProvider : MainAPI() {
     private var lastServerRaw = ""
 
     companion object {
-        private const val FIREBASE_API_KEY = "AIzaSyC4UTcl1j5c0JG4emo1WQvsVWFKxhYEULI"
+        private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
         private const val USER_EMAIL = ""; private const val USER_PASSWORD = ""
         private var idToken: String? = null; private var refreshToken: String? = null
         private var genEmail = ""; private var genPassword = ""
@@ -113,7 +113,6 @@ class AnimeWitcherProvider : MainAPI() {
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
     private suspend fun fetchAlgoliaList(indexName: String, query: String, facetFilters: String = "", excludeUnreleased: Boolean = false): List<SearchResponse> = withContext(Dispatchers.IO) {
-        // [!] XMAX UPDATE: Added "story" to fetch the Arabic description
         val attributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\"]")
         var params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query=" + URLEncoder.encode(query, "UTF-8")
         if (facetFilters.isNotEmpty()) params += "&facetFilters=" + URLEncoder.encode(facetFilters, "UTF-8")
@@ -168,13 +167,7 @@ class AnimeWitcherProvider : MainAPI() {
         val epList = episodes.map { info -> newEpisode(data = "$animeId|${info.id}") { name = info.name ?: "الحلقة ${info.number}"; episode = info.number } }
         val tagsArray = animeJson.optJSONArray("tags")
         return@withContext newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
-            this.posterUrl = posterFrom(animeJson); this.year = details.optString("year").toIntOrNull()
-            // [!] XMAX UPDATE: Fallback chain to catch the Arabic description
-            this.plot = animeJson.optString("story")
-                .ifEmpty { animeJson.optString("synopsis") }
-                .ifEmpty { animeJson.optString("description") }
-                .ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
-                
+            this.posterUrl = posterFrom(animeJson); this.year = details.optString("year").toIntOrNull(); this.plot = animeJson.optString("story")
             this.showStatus = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
             this.tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList(); addEpisodes(DubStatus.Subbed, epList)
         }

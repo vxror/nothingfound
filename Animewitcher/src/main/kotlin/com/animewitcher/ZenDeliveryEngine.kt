@@ -26,7 +26,6 @@ object ZenDeliveryEngine {
             mapOf("User-Agent" to DEFAULT_UA, "Accept" to "*/*", "Referer" to (referer ?: "")),
             mapOf("User-Agent" to DEFAULT_UA, "Accept" to "*/*", "Referer" to (referer ?: ""), "Origin" to (origin ?: ""))
         )
-        // [!] CI/CD FIX: .toMutableList() allows .remove()
         val jobs = combos.map { headers ->
             async {
                 try {

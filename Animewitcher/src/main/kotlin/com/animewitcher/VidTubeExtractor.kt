@@ -12,14 +12,9 @@ object VidTubeExtractor {
             val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             val html = app.get(url, headers = headers, referer = url).text
             var text = html
-            
-            val packed = ZenCryptoAndObfuscation.findPackedJsInPage(text)
-            if (packed != null) {
-                text += "\n" + ZenCryptoAndObfuscation.decodePackedJs(packed.first, packed.second, packed.third)
-            } else {
+            if (text.contains("eval(function(p,a,c,k,e,d)")) {
                 try { JsUnpacker(text).unpack()?.let { text += "\n" + it } } catch (_: Exception) {}
             }
-
             val videoRegex = Regex("""(https?://[^"'\s\\<>]+\.(?:m3u8|mp4)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
             val match = videoRegex.find(text)
             val videoUrl = match?.groupValues?.get(1)
