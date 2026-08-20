@@ -5,14 +5,15 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 
 /**
- * [!] XMAX D8/R8 COMPILER WORKAROUND
- * D8 crashes when inline/suspend functions with lambdas (like newExtractorLink) 
- * are used directly inside suspend functions (coroutine state machines).
- * Furthermore, newExtractorLink is a suspend function itself.
- * This non-inline, non-suspend wrapper instantiates the data class directly,
- * completely bypassing both the Kotlin compiler error and the D8 metadata crash.
+ * [!] XMAX ULTIMATE D8/R8 & KOTLIN COMPILER WORKAROUND
+ * 1. Kotlin blocks the constructor because it's deprecated.
+ * 2. D8 blocks `newExtractorLink` because the inline lambda crashes the dexer.
+ * Solution: Suppress the Kotlin deprecation error and use the constructor directly.
  */
 object LinkBuilder {
+    
+    // 🚀 THE SILVER BULLET: Forces Kotlin to ignore the deprecation error
+    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     fun create(
         source: String,
         name: String,
