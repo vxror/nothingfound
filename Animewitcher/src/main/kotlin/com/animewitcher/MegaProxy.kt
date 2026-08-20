@@ -13,6 +13,7 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -25,6 +26,10 @@ object MegaProxy {
     // 🆕 AUTO-CLEANUP: Track token timestamps to prevent memory leaks
     private val tokenTimestamps = ConcurrentHashMap<String, Long>()
     private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutes
+
+    // 🆕 CONNECTION LIMITING: Prevent resource exhaustion
+    private val activeConnections = AtomicInteger(0)
+    private const val MAX_ACTIVE_CONNECTIONS = 10
 
     data class MegaFile(val dlUrl: String, val size: Long, val aesKey: ByteArray, val nonce: ByteArray)
 
@@ -50,7 +55,18 @@ object MegaProxy {
                 while (serverSocket != null && !serverSocket!!.isClosed) {
                     try {
                         val socket = serverSocket!!.accept()
-                        Thread { handleClient(socket) }.apply { isDaemon = true }.start()
+                        // 🆕 CONNECTION LIMITING
+                        if (activeConnections.get() >= MAX_ACTIVE_CONNECTIONS) {
+                            try {
+                                socket.getOutputStream().write("HTTP/1.1 503 Service Unavailable\r\n\r\n".toByteArray())
+                                socket.close()
+                            } catch (_: Exception) {}
+                            continue
+                        }
+                        activeConnections.incrementAndGet()
+                        Thread {
+                            try { handleClient(socket) } finally { activeConnections.decrementAndGet() }
+                        }.apply { isDaemon = true }.start()
                     } catch (e: Exception) {
                         if (serverSocket?.isClosed == true) break
                     }
