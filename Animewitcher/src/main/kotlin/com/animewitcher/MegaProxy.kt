@@ -13,7 +13,6 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -23,29 +22,7 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private var seq = 0
 
-    // 🆕 AUTO-CLEANUP: Track token timestamps to prevent memory leaks
-    private val tokenTimestamps = ConcurrentHashMap<String, Long>()
-    private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutes
-
-    // 🆕 CONNECTION LIMITING: Prevent resource exhaustion
-    private val activeConnections = AtomicInteger(0)
-    private const val MAX_ACTIVE_CONNECTIONS = 10
-
     data class MegaFile(val dlUrl: String, val size: Long, val aesKey: ByteArray, val nonce: ByteArray)
-
-    init {
-        // 🆕 AUTO-CLEANUP THREAD
-        Thread {
-            while (!Thread.currentThread().isInterrupted) {
-                try {
-                    Thread.sleep(60 * 1000)
-                    val now = System.currentTimeMillis()
-                    val expired = tokenTimestamps.entries.filter { now - it.value > TOKEN_TTL_MS }.map { it.key }
-                    expired.forEach { files.remove(it); tokenTimestamps.remove(it) }
-                } catch (_: InterruptedException) { break } catch (_: Exception) {}
-            }
-        }.apply { isDaemon = true; name = "MegaProxy-Cleanup"; start() }
-    }
 
     fun start() {
         if (serverSocket != null && !serverSocket!!.isClosed) return
@@ -55,18 +32,7 @@ object MegaProxy {
                 while (serverSocket != null && !serverSocket!!.isClosed) {
                     try {
                         val socket = serverSocket!!.accept()
-                        // 🆕 CONNECTION LIMITING
-                        if (activeConnections.get() >= MAX_ACTIVE_CONNECTIONS) {
-                            try {
-                                socket.getOutputStream().write("HTTP/1.1 503 Service Unavailable\r\n\r\n".toByteArray())
-                                socket.close()
-                            } catch (_: Exception) {}
-                            continue
-                        }
-                        activeConnections.incrementAndGet()
-                        Thread {
-                            try { handleClient(socket) } finally { activeConnections.decrementAndGet() }
-                        }.apply { isDaemon = true }.start()
+                        Thread { handleClient(socket) }.apply { isDaemon = true }.start()
                     } catch (e: Exception) {
                         if (serverSocket?.isClosed == true) break
                     }
@@ -90,7 +56,6 @@ object MegaProxy {
             val port = serverSocket?.localPort ?: return null
             val token = "${System.currentTimeMillis()}_${seq++}"
             files[token] = MegaFile(dlUrl, size, aesKey, nonce)
-            tokenTimestamps[token] = System.currentTimeMillis() // 🆕 Track for cleanup
             return "http://127.0.0.1:$port/v/$token.mp4"
         } catch (e: Exception) { return null }
     }
