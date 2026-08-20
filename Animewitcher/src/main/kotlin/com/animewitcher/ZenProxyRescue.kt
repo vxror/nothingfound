@@ -1,7 +1,5 @@
 package com.animewitcher
 
-import android.content.Context
-import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -11,22 +9,10 @@ import java.net.URI
 import java.net.URLEncoder
 
 object ZenProxyRescue {
-    
-    // 🛠️ READS FROM UI SETTINGS
-    private fun getProxyHost(): String {
-        return try {
-            val ctx = APIHolder.context ?: return "issa-proxy.yazankal.workers.dev"
-            // Cloudstream stores plugin settings in SharedPreferences
-            val prefs = ctx.getSharedPreferences("plugin_prefs", Context.MODE_PRIVATE)
-            prefs.getString("proxy_host", "issa-proxy.yazankal.workers.dev") ?: "issa-proxy.yazankal.workers.dev"
-        } catch (e: Exception) {
-            "issa-proxy.yazankal.workers.dev"
-        }
-    }
+    // 🛡️ HARDCODED PROXY HOST (Bypasses UI API mismatches)
+    private const val PROXY_HOST = "issa-proxy.yazankal.workers.dev"
+    private const val PROXY_BASE = "https://$PROXY_HOST"
 
-    private val PROXY_BASE get() = "https://${getProxyHost()}"
-
-    // 🛡️ NEVER PROXY THESE (They work directly or are local)
     private val SKIP_HOSTS = listOf(
         "pixeldrain.com", "pixeldrain.eu.cc", "cdn.pixeldrain.eu.cc",
         "127.0.0.1", "localhost", "mega.nz", "mega.co.nz"
