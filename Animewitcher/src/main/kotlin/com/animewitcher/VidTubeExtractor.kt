@@ -20,8 +20,7 @@ object VidTubeExtractor {
             if (videoUrl != null) {
                 val finalUrl = videoUrl.replace("\\/", "/")
                 val type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                // [!] D8 FIX: Using LinkBuilder
-                callback.invoke(LinkBuilder.create(sourceName, sourceName, finalUrl, type, quality, url))
+                callback.invoke(buildLink(sourceName, sourceName, finalUrl, type, quality, url))
                 return true
             }
             false
