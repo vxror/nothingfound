@@ -3,8 +3,6 @@ package com.animewitcher
 import android.util.Base64
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.parser.Parser
@@ -15,47 +13,6 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.random.Random
 
 object ZenHeavyweightExtractors {
-    
-    // 🆕 UNIVERSAL DIRECT LINK DETECTOR (Catches unknown hosts)
-    private suspend fun extractDirectLink(url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
-        return try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            val html = app.get(url, headers = headers, referer = referer, allowRedirects = true).text
-            val patterns = listOf(
-                Regex("""(https?://[^\s"'<>]+\.(?:mp4|mkv|avi|webm|m3u8)[^\s"'<>]*)""", RegexOption.IGNORE_CASE),
-                Regex("""(?:file|source|src)\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']""", RegexOption.IGNORE_CASE)
-            )
-            val foundLinks = mutableSetOf<String>()
-            for (pattern in patterns) {
-                pattern.findAll(html).forEach { match ->
-                    val videoUrl = match.groupValues[1].replace("\\/", "/")
-                    if (videoUrl.length > 20 && !videoUrl.contains(".css") && !videoUrl.contains(".js")) foundLinks.add(videoUrl)
-                }
-            }
-            // Handle P.A.C.K.E.R.
-            val packed = ZenCryptoAndObfuscation.findPackedJsInPage(html)
-            if (packed != null) {
-                val decoded = ZenCryptoAndObfuscation.decodePackedJs(packed.first, packed.second, packed.third)
-                patterns.forEach { pattern ->
-                    pattern.findAll(decoded).forEach { match ->
-                        val videoUrl = match.groupValues[1].replace("\\/", "/")
-                        if (videoUrl.length > 20 && !videoUrl.contains(".css") && !videoUrl.contains(".js")) foundLinks.add(videoUrl)
-                    }
-                }
-            }
-            if (foundLinks.isNotEmpty()) {
-                for (link in foundLinks) {
-                    val type = if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    callback.invoke(newExtractorLink(source = sourceName, name = "$sourceName Direct", url = link, type = type) {
-                        this.referer = url; this.quality = quality; this.headers = headers
-                    })
-                }
-                return true
-            }
-            false
-        } catch (e: Exception) { false }
-    }
-
     suspend fun tryExtract(host: String, url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
             when {
@@ -67,8 +24,6 @@ object ZenHeavyweightExtractors {
                 host.contains("luluvid") || host.contains("luluvdo") -> extractLuluvid(url, referer, sourceName, quality, callback)
                 host.contains("hgcloud") || host.contains("streamhg") -> extractStreamHG(url, referer, sourceName, quality, callback)
                 host.contains("vidguard") || host.contains("listeamed") -> extractVidguard(url, referer, sourceName, quality, callback)
-                // 🆕 NEW HOSTS
-                host.contains("mp4upload") || host.contains("streamsb") || host.contains("dood") || host.contains("ok.ru") || host.contains("uqload") || host.contains("filemoon") || host.contains("streamwish") || host.contains("vidhide") -> extractDirectLink(url, referer, sourceName, quality, callback)
                 else -> false
             }
         } catch (e: Exception) { false }
