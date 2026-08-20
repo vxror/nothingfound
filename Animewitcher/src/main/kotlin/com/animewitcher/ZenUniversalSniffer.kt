@@ -30,8 +30,7 @@ object ZenUniversalSniffer {
             if (allLinks.isNotEmpty()) {
                 for (link in allLinks) {
                     val type = if (link.contains(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    // [!] D8 FIX: Using LinkBuilder
-                    callback.invoke(LinkBuilder.create(sourceName, "$sourceName Sniffed", link, type, quality, url, headers))
+                    callback.invoke(buildLink(sourceName, "$sourceName Sniffed", link, type, quality, url, headers))
                 }
                 return true
             }
