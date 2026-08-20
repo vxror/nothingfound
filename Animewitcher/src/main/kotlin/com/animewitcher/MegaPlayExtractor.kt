@@ -34,14 +34,13 @@ open class MegaPlay : ExtractorApi() {
             val m3u8 = root.sources?.file; if (m3u8.isNullOrBlank()) return
             val generated = M3u8Helper.generateM3u8(serverName, m3u8, host, headers = playbackHeaders)
             if (generated.isNotEmpty()) { generated.forEach(callback) } else {
-                callback(LinkBuilder.create(serverName, serverName, m3u8, ExtractorLinkType.M3U8, referer = "$host/", headers = playbackHeaders))
+                callback(buildLink(serverName, serverName, m3u8, ExtractorLinkType.M3U8, referer = "$host/", headers = playbackHeaders))
             }
             try {
                 root.tracks.forEach { track ->
                     val kind = track.kind ?: return@forEach; if (kind != "captions" && kind != "subtitles") return@forEach
                     val file = track.file ?: return@forEach; val label = track.label ?: "Unknown"
-                    // [!] D8 FIX: Using Builders.subtitle
-                    subtitleCallback(Builders.subtitle(label, file, playbackHeaders))
+                    subtitleCallback(buildSubtitle(label, file, playbackHeaders))
                 }
             } catch (_: Exception) {}
         }
