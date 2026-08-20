@@ -2,7 +2,6 @@ package com.animewitcher
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.JsUnpacker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -145,8 +144,7 @@ class AnimeWitcherProvider : MainAPI() {
             val obj = hits.getJSONObject(i); val title = obj.optString("name"); if (title.isNullOrEmpty()) continue
             if (excludeUnreleased) { val st = obj.optJSONObject("details")?.optString("state") ?: ""; if (st.contains("لم يتم بثه")) continue }
             val animeId = sanitizeId(idFrom(obj)); val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8")
-            // [!] D8 FIX: Using Builders.searchResponse
-            list.add(Builders.searchResponse(title, url, posterFrom(obj)))
+            list.add(buildSearchResponse(title, url, posterFrom(obj)))
         }
         return@withContext list
     }
@@ -163,8 +161,7 @@ class AnimeWitcherProvider : MainAPI() {
             val displayTitle = if (epName.isNotEmpty()) "$title • $epName" else title
             val animeId = sanitizeId(obj.optString("anime_id").ifEmpty { obj.optString("doc_ref").substringAfter("anime_list/") })
             val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8"); val poster = obj.optString("thumb_uri").ifEmpty { obj.optString("poster_uri") }
-            // [!] D8 FIX: Using Builders.searchResponse
-            list.add(Builders.searchResponse(displayTitle, url, poster))
+            list.add(buildSearchResponse(displayTitle, url, poster))
         }
         return@withContext list
     }
@@ -188,15 +185,13 @@ class AnimeWitcherProvider : MainAPI() {
             if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
         }
         
-        // [!] D8 FIX: Using Builders.episode
-        val epList = episodes.map { info -> Builders.episode("$animeId|${info.id}", info.name ?: "الحلقة ${info.number}", info.number) }
+        val epList = episodes.map { info -> buildEpisode("$animeId|${info.id}", info.name ?: "الحلقة ${info.number}", info.number) }
         val tagsArray = animeJson.optJSONArray("tags")
         val tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList()
         val plot = animeJson.optString("story").ifEmpty { animeJson.optString("synopsis") }.ifEmpty { animeJson.optString("description") }.ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
         val status = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
         
-        // [!] D8 FIX: Using Builders.animeLoadResponse
-        return@withContext Builders.animeLoadResponse(
+        return@withContext buildAnimeLoadResponse(
             name = animeJson.optString("name", animeId),
             url = url,
             poster = posterFrom(animeJson),
@@ -277,8 +272,8 @@ class AnimeWitcherProvider : MainAPI() {
                 host.contains("pixeldrain") -> {
                     val id = fixedLink.substringAfterLast("/u/", fixedLink.substringAfterLast("/api/file/")).substringAfterLast("/file/")
                     if (id.isNotBlank() && !id.contains("/")) {
-                        callback(LinkBuilder.create(name, "PD", "https://pixeldrain.com/api/file/$id", ExtractorLinkType.VIDEO, q, mainUrl))
-                        callback(LinkBuilder.create(name, "PD Fast", "https://cdn.pixeldrain.eu.cc/$id", ExtractorLinkType.VIDEO, q, mainUrl))
+                        callback(buildLink(name, "PD", "https://pixeldrain.com/api/file/$id", ExtractorLinkType.VIDEO, q, mainUrl))
+                        callback(buildLink(name, "PD Fast", "https://cdn.pixeldrain.eu.cc/$id", ExtractorLinkType.VIDEO, q, mainUrl))
                     }
                 }
                 host.contains("photos.app.goo.gl") || host.contains("photos.google.com") || upperName.startsWith("GF") -> {
@@ -286,18 +281,18 @@ class AnimeWitcherProvider : MainAPI() {
                         val response = app.get(fixedLink, headers = mapOf("User-Agent" to "Mozilla/5.0")); val html = response.text
                         val streamMatch = Regex(""""(https://video-downloads\.googleusercontent\.com/[^"]+)"""").find(html)
                         if (streamMatch != null) { 
-                            callback(LinkBuilder.create(name, serverName, streamMatch.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/"), ExtractorLinkType.VIDEO, q, fixedLink))
+                            callback(buildLink(name, serverName, streamMatch.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/"), ExtractorLinkType.VIDEO, q, fixedLink))
                             return 
                         }
                         val matches = Regex("""(https?://[^"'\s\\]+(?:googlevideo\.com|googleusercontent\.com)[^"'\s\\]+)""").findAll(html).map { it.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/").replace("\\", "") }.distinct().toList()
                         for (u in matches) { 
                             if (u.contains("lh3.") || u.contains(".jpg")) continue
-                            callback(LinkBuilder.create(name, serverName, u, ExtractorLinkType.VIDEO, q, fixedLink))
+                            callback(buildLink(name, serverName, u, ExtractorLinkType.VIDEO, q, fixedLink))
                             return 
                         }
-                        callback(LinkBuilder.create(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
+                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
                     } catch (e: Exception) { 
-                        callback(LinkBuilder.create(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
+                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
                     }
                 }
                 host.contains("krakenfiles") || upperName.startsWith("KF") -> {
@@ -310,19 +305,19 @@ class AnimeWitcherProvider : MainAPI() {
                         } 
                     } catch (e: Exception) { }
                     if (direct != null) { 
-                        callback(LinkBuilder.create(name, serverName, direct, ExtractorLinkType.VIDEO, q, "https://krakenfiles.com/")) 
+                        callback(buildLink(name, serverName, direct, ExtractorLinkType.VIDEO, q, "https://krakenfiles.com/")) 
                     } else { 
                         var ok = false
                         try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
-                        if (!ok) callback(LinkBuilder.create(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
+                        if (!ok) callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
                     }
                 }
                 host.contains("mega.nz") || host.contains("mega.co.nz") || upperName.startsWith("MG") -> {
                     val proxyUrl = MegaProxy.resolve(fixedLink)
                     if (proxyUrl != null) { 
-                        callback(LinkBuilder.create(name, serverName, proxyUrl, ExtractorLinkType.VIDEO, q, mainUrl)) 
+                        callback(buildLink(name, serverName, proxyUrl, ExtractorLinkType.VIDEO, q, mainUrl)) 
                     } else { 
-                        callback(LinkBuilder.create(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
+                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
                     }
                 }
                 host.contains("streamtape") || host.contains("stape.") || host.contains("shavetape") || host.contains("watchadsontape") -> {
@@ -330,7 +325,7 @@ class AnimeWitcherProvider : MainAPI() {
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
                     if (ok) return
                     extractStreamTape(fixedLink)?.let { st -> 
-                        callback(LinkBuilder.create(name, "$serverName ST", st, ExtractorLinkType.VIDEO, q, mainUrl)) 
+                        callback(buildLink(name, "$serverName ST", st, ExtractorLinkType.VIDEO, q, mainUrl)) 
                     }
                 }
                 host.contains("mediafire") -> {
@@ -338,12 +333,12 @@ class AnimeWitcherProvider : MainAPI() {
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
                     if (ok) return
                     extractMediaFire(fixedLink)?.let { mf -> 
-                        callback(LinkBuilder.create(name, "$serverName MF", mf, ExtractorLinkType.VIDEO, q, mainUrl)) 
+                        callback(buildLink(name, "$serverName MF", mf, ExtractorLinkType.VIDEO, q, mainUrl)) 
                     }
                 }
                 host.contains("vidtube.one") || upperName == "VT" -> {
                     val extracted = VidTubeExtractor.extract(fixedLink, finalName, q, callback)
-                    if (!extracted) callback(LinkBuilder.create(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
+                    if (!extracted) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
                 }
                 host.contains("megaplay") || host.contains("vidwish") || host.contains("vidtube.site") -> {
                     var ok = false
@@ -351,18 +346,18 @@ class AnimeWitcherProvider : MainAPI() {
                     if (!ok) { 
                         try { MegaPlay.extractMegaPlayUrl(fixedLink, mainUrl, "https://${host}", finalName, subtitleCallback, callback); ok = true } catch (_: Exception) {} 
                     }
-                    if (!ok) callback(LinkBuilder.create(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
+                    if (!ok) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
                 }
                 else -> {
                     var ok = false
                     if (ZenHeavyweightExtractors.tryExtract(host, fixedLink, mainUrl, finalName, q, callback)) return
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
                     if (!ok) ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, q, callback)
-                    if (!ok) callback(LinkBuilder.create(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
+                    if (!ok) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
                 }
             }
         } catch (e: Exception) { 
-            callback(LinkBuilder.create(name, serverName, link, ExtractorLinkType.VIDEO, q, mainUrl)) 
+            callback(buildLink(name, serverName, link, ExtractorLinkType.VIDEO, q, mainUrl)) 
         }
     }
 
