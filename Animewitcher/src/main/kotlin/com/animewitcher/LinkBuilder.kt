@@ -6,18 +6,26 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 object LinkBuilder {
-    fun create(
-        source: String, name: String, url: String,
+    // MUST be suspend to call newExtractorLink
+    suspend fun create(
+        source: String,
+        name: String,
+        url: String,
         type: ExtractorLinkType = ExtractorLinkType.VIDEO,
         quality: Int = Qualities.Unknown.value,
         referer: String? = null,
         headers: Map<String, String> = emptyMap()
     ): ExtractorLink {
-        // Direct inline call. No runBlocking. No suspend context. Bulletproof.
-        return newExtractorLink(source, name, url, type) {
-            this.quality = quality
-            this.referer = referer ?: ""
-            this.headers = headers
-        }
+        // [!] THE SILVER BULLET: NO LAMBDA PASSED.
+        // This prevents the inline lambda from being captured inside the suspend state machine,
+        // which is the exact trigger for the D8/R8 "Should never be called" metadata crash.
+        val link = newExtractorLink(source, name, url, type)
+        
+        // Mutate properties directly. They are public 'var' in Cloudstream3.
+        link.quality = quality
+        link.referer = referer ?: ""
+        link.headers = headers
+        
+        return link
     }
 }
