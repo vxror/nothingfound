@@ -36,8 +36,7 @@ class AnimeWitcherSettingsBottomSheet(private val sharedPref: SharedPreferences)
                 title = "Proxy Worker Host"
                 setDefaultValue("issa-proxy.yazankal.workers.dev")
                 
-                // Load and display current value
-                val saved = sharedPref.getString("animewitcher_proxy_host", "issa-proxy.yazankal.workers.dev")
+                val saved = sharedPref.getString("animewitcher_proxy_host", "issa-proxy.yazankal.workers.dev") ?: "issa-proxy.yazankal.workers.dev"
                 summary = saved
                 text = saved
 
@@ -45,6 +44,7 @@ class AnimeWitcherSettingsBottomSheet(private val sharedPref: SharedPreferences)
                     val newVal = newValue as String
                     sharedPref.edit().putString("animewitcher_proxy_host", newVal).apply()
                     summary = newVal
+                    text = newVal
                     true
                 }
             }
