@@ -1,5 +1,7 @@
 package com.animewitcher
 
+import android.content.Context
+import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -9,9 +11,19 @@ import java.net.URI
 import java.net.URLEncoder
 
 object ZenProxyRescue {
-    // 🛡️ HARDCODED PROXY HOST (Bypasses UI API mismatches)
-    private const val PROXY_HOST = "issa-proxy.yazankal.workers.dev"
-    private const val PROXY_BASE = "https://$PROXY_HOST"
+    
+    // 🛠️ READS FROM UI SETTINGS
+    private fun getProxyHost(): String {
+        return try {
+            val ctx = AcraApplication.context ?: return "issa-proxy.yazankal.workers.dev"
+            val prefs = ctx.getSharedPreferences("AnimeWitcherPrefs", Context.MODE_PRIVATE)
+            prefs.getString("animewitcher_proxy_host", "issa-proxy.yazankal.workers.dev") ?: "issa-proxy.yazankal.workers.dev"
+        } catch (e: Exception) {
+            "issa-proxy.yazankal.workers.dev"
+        }
+    }
+
+    private val PROXY_BASE get() = "https://${getProxyHost()}"
 
     private val SKIP_HOSTS = listOf(
         "pixeldrain.com", "pixeldrain.eu.cc", "cdn.pixeldrain.eu.cc",
@@ -42,9 +54,6 @@ object ZenProxyRescue {
         return sb.toString()
     }
 
-    /**
-     * 🚑 EMERGENCY RESCUE: Try to extract video using proxy as a last resort
-     */
     suspend fun rescue(
         url: String,
         sourceName: String,
