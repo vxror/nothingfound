@@ -77,14 +77,12 @@ object ZenDeliveryEngine {
                 if (variants.isNotEmpty() && variants.size < masterText.lines().count { it.startsWith("#EXT-X-STREAM-INF") }) {
                     for ((variantPath, height) in variants) {
                         val variantUrl = resolveUrl(url, variantPath)
-                        // [!] D8 FIX: Using LinkBuilder instead of inline newExtractorLink
-                        callback(LinkBuilder.create(source, name, variantUrl, ExtractorLinkType.M3U8, height ?: quality, referer, effectiveHeaders))
+                        callback(buildLink(source, name, variantUrl, ExtractorLinkType.M3U8, height ?: quality, referer, effectiveHeaders))
                     }
                     return
                 }
             } catch (e: Exception) { }
         }
-        // [!] D8 FIX: Using LinkBuilder
-        callback(LinkBuilder.create(source, name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO, quality, referer, effectiveHeaders))
+        callback(buildLink(source, name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO, quality, referer, effectiveHeaders))
     }
 }
