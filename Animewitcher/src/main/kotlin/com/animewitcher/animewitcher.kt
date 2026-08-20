@@ -33,9 +33,8 @@ class AnimeWitcherProvider : MainAPI() {
     private var debugInfo = ""
     private var lastServerRaw = ""
 
-    // EPISODE CACHING
     private val episodesCache = ConcurrentHashMap<String, Pair<Long, List<EpisodeInfo>>>()
-    private val EPISODE_CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes
+    private val EPISODE_CACHE_TTL_MS = 5 * 60 * 1000L
 
     companion object {
         private const val FIREBASE_API_KEY = "AIzaSyC4UTcl1j5c0JG4emo1WQvsVWFKxhYEULI"
@@ -146,7 +145,8 @@ class AnimeWitcherProvider : MainAPI() {
             val obj = hits.getJSONObject(i); val title = obj.optString("name"); if (title.isNullOrEmpty()) continue
             if (excludeUnreleased) { val st = obj.optJSONObject("details")?.optString("state") ?: ""; if (st.contains("لم يتم بثه")) continue }
             val animeId = sanitizeId(idFrom(obj)); val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8")
-            list.add(newAnimeSearchResponse(title, url, TvType.Anime) { this.posterUrl = posterFrom(obj) })
+            // [!] D8 FIX: Using Builders.searchResponse
+            list.add(Builders.searchResponse(title, url, posterFrom(obj)))
         }
         return@withContext list
     }
@@ -163,7 +163,8 @@ class AnimeWitcherProvider : MainAPI() {
             val displayTitle = if (epName.isNotEmpty()) "$title • $epName" else title
             val animeId = sanitizeId(obj.optString("anime_id").ifEmpty { obj.optString("doc_ref").substringAfter("anime_list/") })
             val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8"); val poster = obj.optString("thumb_uri").ifEmpty { obj.optString("poster_uri") }
-            list.add(newAnimeSearchResponse(displayTitle, url, TvType.Anime) { this.posterUrl = poster })
+            // [!] D8 FIX: Using Builders.searchResponse
+            list.add(Builders.searchResponse(displayTitle, url, poster))
         }
         return@withContext list
     }
@@ -186,14 +187,25 @@ class AnimeWitcherProvider : MainAPI() {
             if (episodes.isEmpty()) { val count = Regex("\\d+").find(details.optString("eps_num", ""))?.value?.toIntOrNull() ?: 0; if (count in 1..2000) episodes = (1..count).map { n -> EpisodeInfo(if (count <= 999) String.format("%03d", n) else n.toString(), null, n, null) } }
             if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
         }
-        val epList = episodes.map { info -> newEpisode(data = "$animeId|${info.id}") { name = info.name ?: "الحلقة ${info.number}"; episode = info.number } }
+        
+        // [!] D8 FIX: Using Builders.episode
+        val epList = episodes.map { info -> Builders.episode("$animeId|${info.id}", info.name ?: "الحلقة ${info.number}", info.number) }
         val tagsArray = animeJson.optJSONArray("tags")
-        return@withContext newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
-            this.posterUrl = posterFrom(animeJson); this.year = details.optString("year").toIntOrNull()
-            this.plot = animeJson.optString("story").ifEmpty { animeJson.optString("synopsis") }.ifEmpty { animeJson.optString("description") }.ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
-            this.showStatus = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
-            this.tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList(); addEpisodes(DubStatus.Subbed, epList)
-        }
+        val tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList()
+        val plot = animeJson.optString("story").ifEmpty { animeJson.optString("synopsis") }.ifEmpty { animeJson.optString("description") }.ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
+        val status = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
+        
+        // [!] D8 FIX: Using Builders.animeLoadResponse
+        return@withContext Builders.animeLoadResponse(
+            name = animeJson.optString("name", animeId),
+            url = url,
+            poster = posterFrom(animeJson),
+            year = details.optString("year").toIntOrNull(),
+            plot = plot,
+            status = status,
+            tags = tags,
+            episodes = epList
+        )
     }
 
     private suspend fun fetchEpisodes(animeId: String): List<EpisodeInfo> = withContext(Dispatchers.IO) {
@@ -252,7 +264,6 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext emptyList()
     }
 
-    // D8 COMPILER FIX: No inline lambdas allowed inside this suspend function!
     private suspend fun extractFromServer(server: ServerModel, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val rawServerName = server.name ?: "Server"
         val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
