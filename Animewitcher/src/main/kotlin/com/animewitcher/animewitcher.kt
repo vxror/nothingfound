@@ -159,18 +159,18 @@ class AnimeWitcherProvider : MainAPI() {
                 ) {
                     this.posterUrl = poster
                     this.year = year
-                    this.score = ratingDouble?.let { Score(it * 10) }
+                    this.score = ratingDouble?.let { Score((it * 10).toInt()) }
                     this.plot = description
                     this.tags = genres
                 }
             } else {
                 // ✅ FIXED: TV Series load response
                 val episodes = getEpisodes(animeData)
-                return newTvSeriesLoadResponse(
-                    name = title,
-                    url = url,
-                    showType = TvType.Anime,
-                    episodes = episodes.map { ep ->
+           return newTvSeriesLoadResponse(
+               name = title,
+               url = url,
+               type = TvType.Anime,  // ← FIXED: parameter is 'type', not 'showType'
+               episodes = episodes.map { ep ->
                         newEpisode("$url&ep=${ep.number}") {
                             this.name = ep.name ?: "الحلقة ${ep.number}"
                             this.episode = ep.number
@@ -180,7 +180,7 @@ class AnimeWitcherProvider : MainAPI() {
                 ) {
                     this.posterUrl = poster
                     this.year = year
-                    this.score = ratingDouble?.let { Score(it * 10) }
+                    this.score = ratingDouble?.let { Score((it * 10).toInt()) }
                     this.plot = description
                     this.tags = genres
                     this.showStatus = getShowStatus(animeData)
