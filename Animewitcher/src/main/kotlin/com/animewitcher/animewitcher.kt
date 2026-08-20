@@ -114,13 +114,12 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
-    // 🆕 ENHANCED MAIN PAGE (6 Sections mapped to working indices)
+    // 🎯 PERFECTED MAIN PAGE (5 Working Sections based on live DB forensics)
     override val mainPage = mainPageOf(
         "recent" to "أحدث الحلقات",
         "series_fav_count_desc" to "الأكثر شعبية",
         "best_mal_ranked" to "أفضل التقييمات",
         "movies" to "أفلام الأنمي",
-        "dubbed" to "مدبلج",
         "ongoing" to "يُعرض الآن"
     )
 
@@ -129,15 +128,14 @@ class AnimeWitcherProvider : MainAPI() {
         val popular = async { fetchAlgoliaList("series_fav_count_desc", "") }
         val topRated = async { fetchAlgoliaList("best_mal_ranked", "") }
         val movies = async { fetchAlgoliaList("series", "", "[\"type:فيلم\"]") }
-        val dubbed = async { fetchAlgoliaList("series", "", "[\"dubbed:true\"]") }
-        val ongoing = async { fetchAlgoliaList("series", "", "[\"state:يتم عرضه\"]") }
+        // 🕵️‍♂️ FORENSIC FIX: The DB uses "details.state:مستمر" for ongoing anime
+        val ongoing = async { fetchAlgoliaList("series", "", "[\"details.state:مستمر\"]") } 
         
         return@withContext newHomePageResponse(listOf(
             HomePageList("أحدث الحلقات", recentEps.await(), isHorizontalImages = true), 
             HomePageList("الأكثر شعبية", popular.await()), 
             HomePageList("أفضل التقييمات", topRated.await()), 
             HomePageList("أفلام الأنمي", movies.await()),
-            HomePageList("مدبلج", dubbed.await()),
             HomePageList("يُعرض الآن", ongoing.await())
         ), hasNext = false)
     }
@@ -276,7 +274,7 @@ class AnimeWitcherProvider : MainAPI() {
         } catch (e: Exception) { null }
     }
 
-    // 🆕 EXTRACT SERVER LOGIC (For Parallel Execution)
+    // 🚀 EXTRACT SERVER LOGIC (For Parallel Execution)
     private suspend fun extractFromServer(server: ServerModel, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val rawServerName = server.name ?: "Server"
         val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
