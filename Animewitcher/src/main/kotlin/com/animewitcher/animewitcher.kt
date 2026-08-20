@@ -2,13 +2,11 @@ package com.animewitcher
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.JsUnpacker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.joinAll
 import org.json.JSONArray
 import org.json.JSONObject
 import okhttp3.MediaType.Companion.toMediaType
@@ -17,7 +15,6 @@ import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.*
-import java.util.concurrent.ConcurrentHashMap
 
 class AnimeWitcherProvider : MainAPI() {
     override var mainUrl = "https://animewitcher.com"
@@ -29,23 +26,23 @@ class AnimeWitcherProvider : MainAPI() {
     private var algoliaAppId = "D8LH9I7ZL7"
     private var algoliaApiKey = "b56c01ef52540ef334bcdbaa00ded9e4"
     private val FIREBASE_PROJECT_ID = "animewitcher-1c66d"
+    private val serverWordsCache = HashMap<String, ServerWords>()
     private var debugInfo = ""
     private var lastServerRaw = ""
-
-    private val episodesCache = ConcurrentHashMap<String, Pair<Long, List<EpisodeInfo>>>()
-    private val EPISODE_CACHE_TTL_MS = 5 * 60 * 1000L
 
     companion object {
         private const val FIREBASE_API_KEY = "AIzaSyC4UTcl1j5c0JG4emo1WQvsVWFKxhYEULI"
         private const val USER_EMAIL = ""; private const val USER_PASSWORD = ""
         private var idToken: String? = null; private var refreshToken: String? = null
         private var genEmail = ""; private var genPassword = ""
+        private val episodesCache = HashMap<String, List<EpisodeInfo>>()
     }
 
     init { MegaProxy.start() }
 
     data class EpisodeInfo(val id: String, val name: String?, val number: Int, val imageUrl: String? = null)
     data class ServerModel(val name: String?, val link: String?, val quality: String?, val originalLink: String?, val openBrowser: Boolean, val directLink: Boolean = false)
+    data class ServerWords(val name: String, val word1: String?, val word2: String?, val word3: String?, val word4: String?)
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
     private fun algoliaUrl(index: String) = "https://${algoliaAppId}-dsn.algolia.net/1/indexes/$index/query"
@@ -74,6 +71,7 @@ class AnimeWitcherProvider : MainAPI() {
     }
 
     private fun idFrom(obj: JSONObject): String = cleanId(obj.optString("path", "")).ifEmpty { cleanId(obj.optString("doc_ref", "")) }.ifEmpty { cleanId(obj.optString("anime_id", obj.optString("objectID"))) }
+
     private fun getAlgoliaHeaders(): Map<String, String> = mapOf("X-Algolia-Application-Id" to algoliaAppId, "X-Algolia-API-Key" to algoliaApiKey, "User-Agent" to "Algolia for Android (3.27.0); Android (14)", "Content-Type" to "application/json; charset=UTF-8")
 
     private suspend fun login(email: String, password: String): String? {
@@ -114,25 +112,8 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
-    override val mainPage = mainPageOf(
-        "recent" to "أحدث الحلقات",
-        "series_fav_count_desc" to "الأكثر شعبية",
-        "best_mal_ranked" to "أفضل التقييمات",
-        "movies" to "أفلام الأنمي"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val list = when (request.name) {
-            "recent" -> fetchRecentEpisodes()
-            "series_fav_count_desc" -> fetchAlgoliaList("series_fav_count_desc", "")
-            "best_mal_ranked" -> fetchAlgoliaList("best_mal_ranked", "")
-            "movies" -> fetchAlgoliaList("series", "", "[\"type:فيلم\"]")
-            else -> emptyList()
-        }
-        return newHomePageResponse(request.name, list, hasNext = false)
-    }
-
     private suspend fun fetchAlgoliaList(indexName: String, query: String, facetFilters: String = "", excludeUnreleased: Boolean = false): List<SearchResponse> = withContext(Dispatchers.IO) {
+        // [!] XMAX UPDATE: Added "story" to fetch the Arabic description
         val attributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\"]")
         var params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query=" + URLEncoder.encode(query, "UTF-8")
         if (facetFilters.isNotEmpty()) params += "&facetFilters=" + URLEncoder.encode(facetFilters, "UTF-8")
@@ -144,7 +125,7 @@ class AnimeWitcherProvider : MainAPI() {
             val obj = hits.getJSONObject(i); val title = obj.optString("name"); if (title.isNullOrEmpty()) continue
             if (excludeUnreleased) { val st = obj.optJSONObject("details")?.optString("state") ?: ""; if (st.contains("لم يتم بثه")) continue }
             val animeId = sanitizeId(idFrom(obj)); val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8")
-            list.add(buildSearchResponse(title, url, posterFrom(obj)))
+            list.add(newAnimeSearchResponse(title, url, TvType.Anime) { this.posterUrl = posterFrom(obj) })
         }
         return@withContext list
     }
@@ -161,9 +142,15 @@ class AnimeWitcherProvider : MainAPI() {
             val displayTitle = if (epName.isNotEmpty()) "$title • $epName" else title
             val animeId = sanitizeId(obj.optString("anime_id").ifEmpty { obj.optString("doc_ref").substringAfter("anime_list/") })
             val url = "$mainUrl/watch/${enc(animeId)}?data=" + URLEncoder.encode(obj.toString(), "utf-8"); val poster = obj.optString("thumb_uri").ifEmpty { obj.optString("poster_uri") }
-            list.add(buildSearchResponse(displayTitle, url, poster))
+            list.add(newAnimeSearchResponse(displayTitle, url, TvType.Anime) { this.posterUrl = poster })
         }
         return@withContext list
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
+        val recentEps = async { fetchRecentEpisodes() }; val popular = async { fetchAlgoliaList("series_fav_count_desc", "") }
+        val topRated = async { fetchAlgoliaList("best_mal_ranked", "") }; val movies = async { fetchAlgoliaList("series", "", "[\"type:فيلم\"]") }
+        return@withContext newHomePageResponse(listOf(HomePageList("أحدث الحلقات", recentEps.await(), isHorizontalImages = true), HomePageList("الأكثر شعبية", popular.await()), HomePageList("أفضل التقييمات", topRated.await()), HomePageList("أفلام الأنمي", movies.await())), hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) { fetchAlgoliaList("series", query) }
@@ -174,33 +161,23 @@ class AnimeWitcherProvider : MainAPI() {
         val details = animeJson.optJSONObject("details") ?: JSONObject(); val isUnreleased = (details.optString("state") ?: "").contains("لم يتم بثه")
         var episodes: List<EpisodeInfo> = emptyList()
         if (!isUnreleased) {
-            val cached = episodesCache[animeId]
-            if (cached != null && System.currentTimeMillis() - cached.first < EPISODE_CACHE_TTL_MS) {
-                episodes = cached.second
-            } else {
-                episodes = fetchEpisodes(animeId)
-                if (episodes.isNotEmpty()) episodesCache[animeId] = System.currentTimeMillis() to episodes
-            }
+            episodes = episodesCache[animeId] ?: fetchEpisodes(animeId); if (episodes.isNotEmpty()) episodesCache[animeId] = episodes
             if (episodes.isEmpty()) { val count = Regex("\\d+").find(details.optString("eps_num", ""))?.value?.toIntOrNull() ?: 0; if (count in 1..2000) episodes = (1..count).map { n -> EpisodeInfo(if (count <= 999) String.format("%03d", n) else n.toString(), null, n, null) } }
             if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
         }
-        
-        val epList = episodes.map { info -> buildEpisode("$animeId|${info.id}", info.name ?: "الحلقة ${info.number}", info.number) }
+        val epList = episodes.map { info -> newEpisode(data = "$animeId|${info.id}") { name = info.name ?: "الحلقة ${info.number}"; episode = info.number } }
         val tagsArray = animeJson.optJSONArray("tags")
-        val tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList()
-        val plot = animeJson.optString("story").ifEmpty { animeJson.optString("synopsis") }.ifEmpty { animeJson.optString("description") }.ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
-        val status = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
-        
-        return@withContext buildAnimeLoadResponse(
-            name = animeJson.optString("name", animeId),
-            url = url,
-            poster = posterFrom(animeJson),
-            year = details.optString("year").toIntOrNull(),
-            plot = plot,
-            status = status,
-            tags = tags,
-            episodes = epList
-        )
+        return@withContext newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
+            this.posterUrl = posterFrom(animeJson); this.year = details.optString("year").toIntOrNull()
+            // [!] XMAX UPDATE: Fallback chain to catch the Arabic description
+            this.plot = animeJson.optString("story")
+                .ifEmpty { animeJson.optString("synopsis") }
+                .ifEmpty { animeJson.optString("description") }
+                .ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() }
+                
+            this.showStatus = if (details.optString("state") == "مكتمل") ShowStatus.Completed else ShowStatus.Ongoing
+            this.tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList(); addEpisodes(DubStatus.Subbed, epList)
+        }
     }
 
     private suspend fun fetchEpisodes(animeId: String): List<EpisodeInfo> = withContext(Dispatchers.IO) {
@@ -259,133 +236,6 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext emptyList()
     }
 
-    private suspend fun extractFromServer(server: ServerModel, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val rawServerName = server.name ?: "Server"
-        val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
-        val link = server.link ?: return; val host = try { URL(link).host.lowercase() } catch (e: Exception) { "" }
-        val upperName = serverName.uppercase(Locale.getDefault()); val fixedLink = link.replace("filemoon.link", "filemoon.sx").replace("voe.sx", "voe.unblockit.cat")
-        val finalName = serverName
-        val q = getQualityFromName(server.quality)
-        
-        try {
-            when {
-                host.contains("pixeldrain") -> {
-                    val id = fixedLink.substringAfterLast("/u/", fixedLink.substringAfterLast("/api/file/")).substringAfterLast("/file/")
-                    if (id.isNotBlank() && !id.contains("/")) {
-                        callback(buildLink(name, "PD", "https://pixeldrain.com/api/file/$id", ExtractorLinkType.VIDEO, q, mainUrl))
-                        callback(buildLink(name, "PD Fast", "https://cdn.pixeldrain.eu.cc/$id", ExtractorLinkType.VIDEO, q, mainUrl))
-                    }
-                }
-                host.contains("photos.app.goo.gl") || host.contains("photos.google.com") || upperName.startsWith("GF") -> {
-                    try {
-                        val response = app.get(fixedLink, headers = mapOf("User-Agent" to "Mozilla/5.0")); val html = response.text
-                        val streamMatch = Regex(""""(https://video-downloads\.googleusercontent\.com/[^"]+)"""").find(html)
-                        if (streamMatch != null) { 
-                            callback(buildLink(name, serverName, streamMatch.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/"), ExtractorLinkType.VIDEO, q, fixedLink))
-                            return 
-                        }
-                        val matches = Regex("""(https?://[^"'\s\\]+(?:googlevideo\.com|googleusercontent\.com)[^"'\s\\]+)""").findAll(html).map { it.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/").replace("\\", "") }.distinct().toList()
-                        for (u in matches) { 
-                            if (u.contains("lh3.") || u.contains(".jpg")) continue
-                            callback(buildLink(name, serverName, u, ExtractorLinkType.VIDEO, q, fixedLink))
-                            return 
-                        }
-                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
-                    } catch (e: Exception) { 
-                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
-                    }
-                }
-                host.contains("krakenfiles") || upperName.startsWith("KF") -> {
-                    var direct: String? = null
-                    try { 
-                        val id = Regex("/(?:view|embed-video)/([0-9a-zA-Z]+)").find(fixedLink)?.groupValues?.get(1)
-                        if (!id.isNullOrEmpty()) { 
-                            val source = app.get("https://krakenfiles.com/embed-video/$id", headers = mapOf("Referer" to "https://krakenfiles.com/view/$id.html")).document.selectFirst("source")?.attr("src")
-                            if (!source.isNullOrEmpty()) direct = if (source.startsWith("//")) "https:$source" else source 
-                        } 
-                    } catch (e: Exception) { }
-                    if (direct != null) { 
-                        callback(buildLink(name, serverName, direct, ExtractorLinkType.VIDEO, q, "https://krakenfiles.com/")) 
-                    } else { 
-                        var ok = false
-                        try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
-                        if (!ok) callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
-                    }
-                }
-                host.contains("mega.nz") || host.contains("mega.co.nz") || upperName.startsWith("MG") -> {
-                    val proxyUrl = MegaProxy.resolve(fixedLink)
-                    if (proxyUrl != null) { 
-                        callback(buildLink(name, serverName, proxyUrl, ExtractorLinkType.VIDEO, q, mainUrl)) 
-                    } else { 
-                        callback(buildLink(name, serverName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl)) 
-                    }
-                }
-                host.contains("streamtape") || host.contains("stape.") || host.contains("shavetape") || host.contains("watchadsontape") -> {
-                    var ok = false
-                    try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
-                    if (ok) return
-                    extractStreamTape(fixedLink)?.let { st -> 
-                        callback(buildLink(name, "$serverName ST", st, ExtractorLinkType.VIDEO, q, mainUrl)) 
-                    }
-                }
-                host.contains("mediafire") -> {
-                    var ok = false
-                    try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
-                    if (ok) return
-                    extractMediaFire(fixedLink)?.let { mf -> 
-                        callback(buildLink(name, "$serverName MF", mf, ExtractorLinkType.VIDEO, q, mainUrl)) 
-                    }
-                }
-                host.contains("vidtube.one") || upperName == "VT" -> {
-                    val extracted = VidTubeExtractor.extract(fixedLink, finalName, q, callback)
-                    if (!extracted) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
-                }
-                host.contains("megaplay") || host.contains("vidwish") || host.contains("vidtube.site") -> {
-                    var ok = false
-                    try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
-                    if (!ok) { 
-                        try { MegaPlay.extractMegaPlayUrl(fixedLink, mainUrl, "https://${host}", finalName, subtitleCallback, callback); ok = true } catch (_: Exception) {} 
-                    }
-                    if (!ok) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
-                }
-                else -> {
-                    var ok = false
-                    if (ZenHeavyweightExtractors.tryExtract(host, fixedLink, mainUrl, finalName, q, callback)) return
-                    try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
-                    if (!ok) ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, q, callback)
-                    if (!ok) callback(buildLink(name, finalName, fixedLink, ExtractorLinkType.VIDEO, q, mainUrl))
-                }
-            }
-        } catch (e: Exception) { 
-            callback(buildLink(name, serverName, link, ExtractorLinkType.VIDEO, q, mainUrl)) 
-        }
-    }
-
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean = withContext(Dispatchers.IO) {
-        val parts = data.split('|'); if (parts.size < 2) return@withContext false
-        val animeId = sanitizeId(parts[0]); val episodeId = parts[1].trim(); if (episodeId == "000") return@withContext false
-        val servers = fetchServersForEpisode(animeId, episodeId); if (servers.isEmpty()) throw ErrorLoadingException("NO SERVERS FOUND :: $lastServerRaw")
-        
-        val allLinks = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
-        
-        coroutineScope {
-            val jobs = servers.map { server ->
-                launch(Dispatchers.IO) {
-                    try { extractFromServer(server, subtitleCallback) { link -> allLinks.add(link) } } catch (_: Exception) {}
-                }
-            }
-            withTimeoutOrNull(20000L) { jobs.joinAll() }
-        }
-
-        val deduplicated = allLinks.distinctBy { link ->
-            if (link.url.contains(".m3u8") || link.url.contains(".mp4")) link.url.substringBefore("?").substringBefore("#") else link.url
-        }.sortedByDescending { it.quality }
-
-        deduplicated.forEach(callback)
-        if (deduplicated.isEmpty()) throw ErrorLoadingException("No working streams extracted.")
-        return@withContext true
-    }
-
     private suspend fun extractStreamTape(url: String): String? {
         return try {
             val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language" to "en-US,en;q=0.5", "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1")
@@ -407,6 +257,82 @@ class AnimeWitcherProvider : MainAPI() {
             val html = doc.outerHtml(); val regexLink = Regex("""href="(https://download[^"]+)"""").find(html)?.groupValues?.get(1) ?: Regex("""(https://[a-zA-Z0-9\-]+\.mediafire\.com/[^"'\s]+)""").find(html)?.groupValues?.get(1)
             if (regexLink != null && regexLink.startsWith("http")) return regexLink; null
         } catch (e: Exception) { null }
+    }
+
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean = withContext(Dispatchers.IO) {
+        val parts = data.split('|'); if (parts.size < 2) return@withContext false
+        val animeId = sanitizeId(parts[0]); val episodeId = parts[1].trim(); if (episodeId == "000") return@withContext false
+        val servers = fetchServersForEpisode(animeId, episodeId); if (servers.isEmpty()) throw ErrorLoadingException("NO SERVERS FOUND :: $lastServerRaw")
+        var added = 0
+        for (server in servers) {
+            val rawServerName = server.name ?: "Server"
+            val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
+            val link = server.link ?: continue; val host = try { URL(link).host.lowercase() } catch (e: Exception) { "" }
+            val upperName = serverName.uppercase(Locale.getDefault()); val fixedLink = link.replace("filemoon.link", "filemoon.sx").replace("voe.sx", "voe.unblockit.cat")
+            val finalName = serverName
+            try {
+                when {
+                    host.contains("pixeldrain") -> {
+                        val id = fixedLink.substringAfterLast("/u/", fixedLink.substringAfterLast("/api/file/")).substringAfterLast("/file/")
+                        if (id.isNotBlank() && !id.contains("/")) {
+                            callback.invoke(newExtractorLink(source = name, name = "PD", url = "https://pixeldrain.com/api/file/$id") { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++
+                            callback.invoke(newExtractorLink(source = name, name = "PD Fast", url = "https://cdn.pixeldrain.eu.cc/$id") { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++
+                        }
+                    }
+                    host.contains("photos.app.goo.gl") || host.contains("photos.google.com") || upperName.startsWith("GF") -> {
+                        try {
+                            val response = app.get(fixedLink, headers = mapOf("User-Agent" to "Mozilla/5.0")); val html = response.text
+                            val streamMatch = Regex(""""(https://video-downloads\.googleusercontent\.com/[^"]+)"""").find(html)
+                            if (streamMatch != null) { callback.invoke(newExtractorLink(source = name, name = serverName, url = streamMatch.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")) { referer = fixedLink; quality = getQualityFromName(server.quality) }); added++; continue }
+                            val matches = Regex("""(https?://[^"'\s\\]+(?:googlevideo\.com|googleusercontent\.com)[^"'\s\\]+)""").findAll(html).map { it.groupValues[1].replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/").replace("\\", "") }.distinct().toList()
+                            var found = false; for (u in matches) { if (u.contains("lh3.") || u.contains(".jpg")) continue; callback.invoke(newExtractorLink(source = name, name = serverName, url = u) { referer = fixedLink; quality = getQualityFromName(server.quality) }); added++; found = true; break }
+                            if (!found) { callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                        } catch (e: Exception) { callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("krakenfiles") || upperName.startsWith("KF") -> {
+                        var direct: String? = null
+                        try { val id = Regex("/(?:view|embed-video)/([0-9a-zA-Z]+)").find(fixedLink)?.groupValues?.get(1); if (!id.isNullOrEmpty()) { val source = app.get("https://krakenfiles.com/embed-video/$id", headers = mapOf("Referer" to "https://krakenfiles.com/view/$id.html")).document.selectFirst("source")?.attr("src"); if (!source.isNullOrEmpty()) direct = if (source.startsWith("//")) "https:$source" else source } } catch (e: Exception) { }
+                        if (direct != null) { callback.invoke(newExtractorLink(source = name, name = serverName, url = direct, type = ExtractorLinkType.VIDEO) { this.referer = "https://krakenfiles.com/"; this.quality = getQualityFromName(server.quality) }); added++ } 
+                        else { var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}; if (!ok) callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("mega.nz") || host.contains("mega.co.nz") || upperName.startsWith("MG") -> {
+                        val proxyUrl = MegaProxy.resolve(fixedLink)
+                        if (proxyUrl != null) { callback.invoke(newExtractorLink(source = name, name = serverName, url = proxyUrl) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ } 
+                        else { callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("streamtape") || host.contains("stape.") || host.contains("shavetape") || host.contains("watchadsontape") -> {
+                        var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
+                        if (ok) { added++; continue }
+                        extractStreamTape(fixedLink)?.let { st -> callback.invoke(newExtractorLink(source = name, name = "$serverName ST", url = st) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("mediafire") -> {
+                        var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
+                        if (ok) { added++; continue }
+                        extractMediaFire(fixedLink)?.let { mf -> callback.invoke(newExtractorLink(source = name, name = "$serverName MF", url = mf) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("vidtube.one") || upperName == "VT" -> {
+                        val extracted = VidTubeExtractor.extract(fixedLink, finalName, getQualityFromName(server.quality), callback)
+                        if (extracted) { added++ } else { callback.invoke(newExtractorLink(source = name, name = finalName, url = fixedLink) { referer = mainUrl; this.quality = getQualityFromName(server.quality) }); added++ }
+                    }
+                    host.contains("megaplay") || host.contains("vidwish") || host.contains("vidtube.site") -> {
+                        var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
+                        if (!ok) { try { MegaPlay.extractMegaPlayUrl(fixedLink, mainUrl, "https://${host}", finalName, subtitleCallback, callback); ok = true } catch (_: Exception) {} }
+                        if (!ok) { callback.invoke(newExtractorLink(source = name, name = finalName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
+                        added++
+                    }
+                    else -> {
+                        var ok = false
+                        if (ZenHeavyweightExtractors.tryExtract(host, fixedLink, mainUrl, finalName, getQualityFromName(server.quality), callback)) { added++; continue }
+                        try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
+                        if (!ok) { ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, getQualityFromName(server.quality), callback) }
+                        if (!ok) { callback.invoke(newExtractorLink(source = name, name = finalName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
+                        added++
+                    }
+                }
+            } catch (e: Exception) { callback.invoke(newExtractorLink(source = name, name = serverName, url = link) { referer = mainUrl; quality = getQualityFromName(server.quality) }); added++ }
+        }
+        if (added == 0) throw ErrorLoadingException("No working streams extracted.")
+        return@withContext true
     }
 
     private fun getQualityFromName(quality: String?): Int {
