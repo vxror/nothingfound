@@ -3,7 +3,6 @@ package com.animewitcher
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -78,16 +77,14 @@ object ZenDeliveryEngine {
                 if (variants.isNotEmpty() && variants.size < masterText.lines().count { it.startsWith("#EXT-X-STREAM-INF") }) {
                     for ((variantPath, height) in variants) {
                         val variantUrl = resolveUrl(url, variantPath)
-                        callback(newExtractorLink(source = source, name = name, url = variantUrl, type = ExtractorLinkType.M3U8) {
-                            this.quality = height ?: quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
-                        })
+                        // [!] D8 FIX: Using LinkBuilder instead of inline newExtractorLink
+                        callback(LinkBuilder.create(source, name, variantUrl, ExtractorLinkType.M3U8, height ?: quality, referer, effectiveHeaders))
                     }
                     return
                 }
             } catch (e: Exception) { }
         }
-        callback(newExtractorLink(source = source, name = name, url = url, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-            this.quality = quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
-        })
+        // [!] D8 FIX: Using LinkBuilder
+        callback(LinkBuilder.create(source, name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO, quality, referer, effectiveHeaders))
     }
 }
