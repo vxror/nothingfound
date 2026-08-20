@@ -16,15 +16,17 @@ import kotlin.random.Random
 
 object ZenHeavyweightExtractors {
     
-    // 🆕 UNIVERSAL DIRECT LINK DETECTOR (Catches unknown hosts)
+    // 🧠 BEAST FEATURE: Universal Direct Link Detector
     private suspend fun extractDirectLink(url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept" to "text/html,*/*")
             val html = app.get(url, headers = headers, referer = referer, allowRedirects = true).text
+            
             val patterns = listOf(
                 Regex("""(https?://[^\s"'<>]+\.(?:mp4|mkv|avi|webm|m3u8)[^\s"'<>]*)""", RegexOption.IGNORE_CASE),
                 Regex("""(?:file|source|src)\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']""", RegexOption.IGNORE_CASE)
             )
+            
             val foundLinks = mutableSetOf<String>()
             for (pattern in patterns) {
                 pattern.findAll(html).forEach { match ->
@@ -32,16 +34,19 @@ object ZenHeavyweightExtractors {
                     if (videoUrl.length > 20 && !videoUrl.contains(".css") && !videoUrl.contains(".js")) foundLinks.add(videoUrl)
                 }
             }
+            
+            // Check Packed JS
             val packed = ZenCryptoAndObfuscation.findPackedJsInPage(html)
             if (packed != null) {
                 val decoded = ZenCryptoAndObfuscation.decodePackedJs(packed.first, packed.second, packed.third)
                 patterns.forEach { pattern ->
                     pattern.findAll(decoded).forEach { match ->
                         val videoUrl = match.groupValues[1].replace("\\/", "/")
-                        if (videoUrl.length > 20 && !videoUrl.contains(".css") && !videoUrl.contains(".js")) foundLinks.add(videoUrl)
+                        if (videoUrl.length > 20) foundLinks.add(videoUrl)
                     }
                 }
             }
+            
             if (foundLinks.isNotEmpty()) {
                 for (link in foundLinks) {
                     val type = if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -55,7 +60,33 @@ object ZenHeavyweightExtractors {
         } catch (e: Exception) { false }
     }
 
-    // 🆕 NEW EXTRACTORS
+    suspend fun tryExtract(host: String, url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
+        return try {
+            when {
+                host.contains("dailymotion") -> extractDailymotion(url, sourceName, quality, callback)
+                host.contains("voe.sx") || host.contains("voe.") -> extractVoe(url, sourceName, quality, callback)
+                host.contains("videa.hu") -> extractVidea(url, referer, sourceName, quality, callback)
+                host.contains("vk.com") || host.contains("vkvideo.ru") || host.contains("my.mail.ru") -> extractVKAndMailRu(url, referer, sourceName, quality, callback)
+                host.contains("vidmoly") -> extractVidmoly(url, referer, sourceName, quality, callback)
+                host.contains("luluvid") || host.contains("luluvdo") -> extractLuluvid(url, referer, sourceName, quality, callback)
+                host.contains("hgcloud") || host.contains("streamhg") -> extractStreamHG(url, referer, sourceName, quality, callback)
+                host.contains("vidguard") || host.contains("listeamed") -> extractVidguard(url, referer, sourceName, quality, callback)
+                host.contains("streamsb") || host.contains("sbplay") -> extractStreamSB(url, referer, sourceName, quality, callback)
+                host.contains("dood") || host.contains("dstream") -> extractDoodStream(url, referer, sourceName, quality, callback)
+                host.contains("ok.ru") || host.contains("odnoklassniki") -> extractOkRu(url, referer, sourceName, quality, callback)
+                host.contains("uqload") -> extractUqload(url, referer, sourceName, quality, callback)
+                host.contains("filemoon") || host.contains("moonplayer") -> extractFileMoon(url, referer, sourceName, quality, callback)
+                host.contains("streamwish") || host.contains("wishfast") -> extractStreamWish(url, referer, sourceName, quality, callback)
+                host.contains("vidhide") || host.contains("vidhidepro") -> extractVidhide(url, referer, sourceName, quality, callback)
+                // 🚀 BEAST FALLBACK: Try Universal Direct Link Extraction on ANY unknown host
+                else -> extractDirectLink(url, referer, sourceName, quality, callback)
+            }
+        } catch (e: Exception) { false }
+    }
+
+    // ... [KEEP ALL YOUR EXISTING EXTRACTOR METHODS HERE: extractDailymotion, extractVoe, etc.] ...
+    // (I have omitted them for brevity, but ensure you keep all your existing private suspend fun extract... methods below this line)
+    
     private suspend fun extractStreamSB(url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
             val html = app.get(url, referer = referer).text
@@ -133,30 +164,9 @@ object ZenHeavyweightExtractors {
         } catch (e: Exception) { false }
     }
 
-    suspend fun tryExtract(host: String, url: String, referer: String?, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
-        return try {
-            when {
-                host.contains("dailymotion") -> extractDailymotion(url, sourceName, quality, callback)
-                host.contains("voe.sx") || host.contains("voe.") -> extractVoe(url, sourceName, quality, callback)
-                host.contains("videa.hu") -> extractVidea(url, referer, sourceName, quality, callback)
-                host.contains("vk.com") || host.contains("vkvideo.ru") || host.contains("my.mail.ru") -> extractVKAndMailRu(url, referer, sourceName, quality, callback)
-                host.contains("vidmoly") -> extractVidmoly(url, referer, sourceName, quality, callback)
-                host.contains("luluvid") || host.contains("luluvdo") -> extractLuluvid(url, referer, sourceName, quality, callback)
-                host.contains("hgcloud") || host.contains("streamhg") -> extractStreamHG(url, referer, sourceName, quality, callback)
-                host.contains("vidguard") || host.contains("listeamed") -> extractVidguard(url, referer, sourceName, quality, callback)
-                // 🆕 NEW HOSTS
-                host.contains("streamsb") || host.contains("sbplay") -> extractStreamSB(url, referer, sourceName, quality, callback)
-                host.contains("dood") || host.contains("dstream") -> extractDoodStream(url, referer, sourceName, quality, callback)
-                host.contains("ok.ru") || host.contains("odnoklassniki") -> extractOkRu(url, referer, sourceName, quality, callback)
-                host.contains("uqload") -> extractUqload(url, referer, sourceName, quality, callback)
-                host.contains("filemoon") || host.contains("moonplayer") -> extractFileMoon(url, referer, sourceName, quality, callback)
-                host.contains("streamwish") || host.contains("wishfast") -> extractStreamWish(url, referer, sourceName, quality, callback)
-                host.contains("vidhide") || host.contains("vidhidepro") -> extractVidhide(url, referer, sourceName, quality, callback)
-                else -> extractDirectLink(url, referer, sourceName, quality, callback)
-            }
-        } catch (e: Exception) { false }
-    }
-
+    // ... [REST OF YOUR EXTRACTORS: extractDailymotion, extractVoe, extractVidea, etc.] ...
+    // (Make sure to copy your existing private methods for Dailymotion, Voe, Videa, VK, Vidmoly, Luluvid, StreamHG, Vidguard from your current file into this block)
+    
     private suspend fun extractDailymotion(url: String, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
         val idRegex = Regex("""[?&]video=([^&]+)|/video/([a-zA-Z0-9]+)"""); val match = idRegex.find(url) ?: return false
         val id = match.groupValues[1].ifEmpty { match.groupValues[2] }; if (id.isBlank()) return false
