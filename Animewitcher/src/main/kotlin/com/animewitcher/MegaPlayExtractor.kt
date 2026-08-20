@@ -9,7 +9,6 @@ import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper
-import com.lagradost.cloudstream3.utils.newExtractorLink
 
 private const val MP_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
@@ -36,7 +35,8 @@ open class MegaPlay : ExtractorApi() {
             val m3u8 = root.sources?.file; if (m3u8.isNullOrBlank()) return
             val generated = M3u8Helper.generateM3u8(serverName, m3u8, host, headers = playbackHeaders)
             if (generated.isNotEmpty()) { generated.forEach(callback) } else {
-                callback(newExtractorLink(serverName, serverName, m3u8, ExtractorLinkType.M3U8) { this.referer = "$host/"; this.headers = playbackHeaders })
+                // [!] D8 FIX: Using LinkBuilder
+                callback(LinkBuilder.create(serverName, serverName, m3u8, ExtractorLinkType.M3U8, referer = "$host/", headers = playbackHeaders))
             }
             try {
                 root.tracks.forEach { track ->
