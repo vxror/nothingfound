@@ -3,6 +3,7 @@ package com.animewitcher
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -25,6 +26,7 @@ object ZenDeliveryEngine {
             mapOf("User-Agent" to DEFAULT_UA, "Accept" to "*/*", "Referer" to (referer ?: "")),
             mapOf("User-Agent" to DEFAULT_UA, "Accept" to "*/*", "Referer" to (referer ?: ""), "Origin" to (origin ?: ""))
         )
+        // [!] CI/CD FIX: .toMutableList() allows .remove()
         val jobs = combos.map { headers ->
             async {
                 try {
@@ -77,12 +79,16 @@ object ZenDeliveryEngine {
                 if (variants.isNotEmpty() && variants.size < masterText.lines().count { it.startsWith("#EXT-X-STREAM-INF") }) {
                     for ((variantPath, height) in variants) {
                         val variantUrl = resolveUrl(url, variantPath)
-                        callback(buildLink(source, name, variantUrl, ExtractorLinkType.M3U8, height ?: quality, referer, effectiveHeaders))
+                        callback(newExtractorLink(source = source, name = name, url = variantUrl, type = ExtractorLinkType.M3U8) {
+                            this.quality = height ?: quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
+                        })
                     }
                     return
                 }
             } catch (e: Exception) { }
         }
-        callback(buildLink(source, name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO, quality, referer, effectiveHeaders))
+        callback(newExtractorLink(source = source, name = name, url = url, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+            this.quality = quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
+        })
     }
 }
