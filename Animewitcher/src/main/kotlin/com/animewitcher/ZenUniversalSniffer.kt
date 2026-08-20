@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.JsUnpacker
-import com.lagradost.cloudstream3.utils.newExtractorLink
 
 object ZenUniversalSniffer {
     suspend fun deepScan(url: String, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
@@ -15,7 +14,6 @@ object ZenUniversalSniffer {
             var text = response.text
             if (text.contains("eval(function(p,a,c,k,e,d)")) { try { JsUnpacker(text).unpack()?.let { text += "\n" + it } } catch (_: Exception) {} }
             
-            // 🆕 Handle atob/base64 obfuscation
             Regex("""atob\s*\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)""").findAll(text).forEach { match ->
                 try { text += "\n" + String(Base64.decode(match.groupValues[1], Base64.DEFAULT)) } catch (_: Exception) {}
             }
@@ -32,9 +30,8 @@ object ZenUniversalSniffer {
             if (allLinks.isNotEmpty()) {
                 for (link in allLinks) {
                     val type = if (link.contains(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    callback.invoke(newExtractorLink(source = sourceName, name = "$sourceName Sniffed", url = link, type = type) {
-                        this.referer = url; this.quality = quality; this.headers = headers
-                    })
+                    // [!] D8 FIX: Using LinkBuilder
+                    callback.invoke(LinkBuilder.create(sourceName, "$sourceName Sniffed", link, type, quality, url, headers))
                 }
                 return true
             }
