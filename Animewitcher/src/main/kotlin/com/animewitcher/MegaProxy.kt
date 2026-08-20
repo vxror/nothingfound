@@ -22,7 +22,25 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private var seq = 0
 
+    // 🆕 AUTO-CLEANUP: Track token timestamps to prevent memory leaks
+    private val tokenTimestamps = ConcurrentHashMap<String, Long>()
+    private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutes
+
     data class MegaFile(val dlUrl: String, val size: Long, val aesKey: ByteArray, val nonce: ByteArray)
+
+    init {
+        // 🆕 AUTO-CLEANUP THREAD
+        Thread {
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(60 * 1000)
+                    val now = System.currentTimeMillis()
+                    val expired = tokenTimestamps.entries.filter { now - it.value > TOKEN_TTL_MS }.map { it.key }
+                    expired.forEach { files.remove(it); tokenTimestamps.remove(it) }
+                } catch (_: InterruptedException) { break } catch (_: Exception) {}
+            }
+        }.apply { isDaemon = true; name = "MegaProxy-Cleanup"; start() }
+    }
 
     fun start() {
         if (serverSocket != null && !serverSocket!!.isClosed) return
@@ -56,6 +74,7 @@ object MegaProxy {
             val port = serverSocket?.localPort ?: return null
             val token = "${System.currentTimeMillis()}_${seq++}"
             files[token] = MegaFile(dlUrl, size, aesKey, nonce)
+            tokenTimestamps[token] = System.currentTimeMillis() // 🆕 Track for cleanup
             return "http://127.0.0.1:$port/v/$token.mp4"
         } catch (e: Exception) { return null }
     }
