@@ -3,7 +3,6 @@ package com.animewitcher
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -35,14 +34,14 @@ open class MegaPlay : ExtractorApi() {
             val m3u8 = root.sources?.file; if (m3u8.isNullOrBlank()) return
             val generated = M3u8Helper.generateM3u8(serverName, m3u8, host, headers = playbackHeaders)
             if (generated.isNotEmpty()) { generated.forEach(callback) } else {
-                // [!] D8 FIX: Using LinkBuilder
                 callback(LinkBuilder.create(serverName, serverName, m3u8, ExtractorLinkType.M3U8, referer = "$host/", headers = playbackHeaders))
             }
             try {
                 root.tracks.forEach { track ->
                     val kind = track.kind ?: return@forEach; if (kind != "captions" && kind != "subtitles") return@forEach
                     val file = track.file ?: return@forEach; val label = track.label ?: "Unknown"
-                    subtitleCallback(newSubtitleFile(label, file) { this.headers = playbackHeaders })
+                    // [!] D8 FIX: Using Builders.subtitle
+                    subtitleCallback(Builders.subtitle(label, file, playbackHeaders))
                 }
             } catch (_: Exception) {}
         }
