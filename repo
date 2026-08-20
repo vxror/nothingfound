@@ -1,0 +1,8 @@
+{
+  "name": "VxROR_RX",
+  "description": "مشاهدة الافلام والمسلسلات والانميات",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/vxror/nothingfound/refs/heads/main/plugins.json"
+  ]
+}
