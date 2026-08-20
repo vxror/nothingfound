@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.JsUnpacker
-import com.lagradost.cloudstream3.utils.newExtractorLink
 
 object VidTubeExtractor {
     suspend fun extract(url: String, sourceName: String, quality: Int, callback: (ExtractorLink) -> Unit): Boolean {
@@ -21,7 +20,8 @@ object VidTubeExtractor {
             if (videoUrl != null) {
                 val finalUrl = videoUrl.replace("\\/", "/")
                 val type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                callback.invoke(newExtractorLink(source = sourceName, name = sourceName, url = finalUrl, type = type) { this.referer = url; this.quality = quality })
+                // [!] D8 FIX: Using LinkBuilder
+                callback.invoke(LinkBuilder.create(sourceName, sourceName, finalUrl, type, quality, url))
                 return true
             }
             false
