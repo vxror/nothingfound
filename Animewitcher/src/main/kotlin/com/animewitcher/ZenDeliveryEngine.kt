@@ -70,7 +70,9 @@ object ZenDeliveryEngine {
     suspend fun deliverSmartLink(source: String, name: String, url: String, referer: String?, quality: Int, callback: (ExtractorLink) -> Unit) {
         if (url.isBlank()) return
         val effectiveHeaders = probeHeaders(url, referer)
-        val isM3u8 = url.contains(".m3u8")
+        val isM3u8 = url.contains(".m3u8", ignoreCase = true)
+        
+        // 1. DELIVER DIRECT LINKS
         if (isM3u8) {
             try {
                 val masterText = app.get(url, headers = effectiveHeaders, timeout = 8000).text
@@ -78,16 +80,33 @@ object ZenDeliveryEngine {
                 if (variants.isNotEmpty() && variants.size < masterText.lines().count { it.startsWith("#EXT-X-STREAM-INF") }) {
                     for ((variantPath, height) in variants) {
                         val variantUrl = resolveUrl(url, variantPath)
-                        callback(newExtractorLink(source = source, name = name, url = variantUrl, type = ExtractorLinkType.M3U8) {
+                        // Direct
+                        callback(newExtractorLink(source, name, variantUrl, ExtractorLinkType.M3U8) {
                             this.quality = height ?: quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
                         })
+                        // 🛡️ PROXY FALLBACK (Auto-generated for every variant)
+                        if (!ZenProxyRescue.shouldSkip(variantUrl)) {
+                            callback(newExtractorLink(source, "$name (Proxy)", ZenProxyRescue.m3u8(variantUrl, effectiveHeaders, referer), ExtractorLinkType.M3U8) {
+                                this.quality = height ?: quality; this.referer = ""
+                            })
+                        }
                     }
                     return
                 }
             } catch (e: Exception) { }
         }
-        callback(newExtractorLink(source = source, name = name, url = url, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+        
+        // Fallback Single Link
+        callback(newExtractorLink(source, name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
             this.quality = quality; this.referer = referer ?: ""; this.headers = effectiveHeaders
         })
+
+        // 🛡️ PROXY FALLBACK (For single links)
+        if (!ZenProxyRescue.shouldSkip(url)) {
+            val pUrl = if (isM3u8) ZenProxyRescue.m3u8(url, effectiveHeaders, referer) else ZenProxyRescue.mp4(url, referer)
+            callback(newExtractorLink(source, "$name (Proxy)", pUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                this.quality = quality; this.referer = ""
+            })
+        }
     }
 }
