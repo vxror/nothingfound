@@ -9,7 +9,7 @@ repositories {
 }
 
 android {
-    namespace = "com.witanime" // Changed from com.arabseed to match your package
+    namespace = "com.witanime"
     compileSdk = 34
     defaultConfig {
         minSdk = 21
@@ -18,11 +18,16 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
-            freeCompilerArgs.add("-XXLanguage:+BreakContinueInInlineLambdas")
-        }
+}
+
+// 🚀 MOVED OUTSIDE android {} AND ADDED THE MAGIC FLAG
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+        freeCompilerArgs.addAll(
+            "-XXLanguage:+BreakContinueInInlineLambdas",
+            "-Xskip-metadata-version-check" // 🎯 THIS FIXES THE 2.4.0 METADATA CRASH
+        )
     }
 }
 
