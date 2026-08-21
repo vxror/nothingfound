@@ -82,7 +82,7 @@ object MegaProxy {
     private suspend fun megaApi(fileId: String): JSONObject? {
         return try {
             val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
-            val req = app.post("https://g.api.mega.co.nz/cs?id=${seq++}", requestBody = okhttp3.RequestBody.create(null, body)).text
+            val req = app.post("https://g.api.mega.co.nz/cs?id=${seq++}", requestBody = body.toRequestBody(okhttp3.MediaType.parse("application/json"))).text
             val j = JSONArray(req)
             if (j.length() > 0 && j.get(0) is JSONObject) j.getJSONObject(0) else null
         } catch (_: Exception) { null }
