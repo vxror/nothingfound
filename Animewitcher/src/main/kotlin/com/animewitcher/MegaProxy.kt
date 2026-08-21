@@ -23,18 +23,15 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private var seq = 0
 
-    // 🆕 AUTO-CLEANUP: Track token timestamps to prevent memory leaks
     private val tokenTimestamps = ConcurrentHashMap<String, Long>()
-    private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutes
+    private const val TOKEN_TTL_MS = 30 * 60 * 1000L
 
-    // 🆕 CONNECTION LIMITING: Prevent resource exhaustion
     private val activeConnections = AtomicInteger(0)
     private const val MAX_ACTIVE_CONNECTIONS = 10
 
     data class MegaFile(val dlUrl: String, val size: Long, val aesKey: ByteArray, val nonce: ByteArray)
 
     init {
-        // 🆕 AUTO-CLEANUP THREAD
         Thread {
             while (!Thread.currentThread().isInterrupted) {
                 try {
@@ -55,7 +52,6 @@ object MegaProxy {
                 while (serverSocket != null && !serverSocket!!.isClosed) {
                     try {
                         val socket = serverSocket!!.accept()
-                        // 🆕 CONNECTION LIMITING
                         if (activeConnections.get() >= MAX_ACTIVE_CONNECTIONS) {
                             try {
                                 socket.getOutputStream().write("HTTP/1.1 503 Service Unavailable\r\n\r\n".toByteArray())
@@ -90,7 +86,7 @@ object MegaProxy {
             val port = serverSocket?.localPort ?: return null
             val token = "${System.currentTimeMillis()}_${seq++}"
             files[token] = MegaFile(dlUrl, size, aesKey, nonce)
-            tokenTimestamps[token] = System.currentTimeMillis() // 🆕 Track for cleanup
+            tokenTimestamps[token] = System.currentTimeMillis()
             return "http://127.0.0.1:$port/v/$token.mp4"
         } catch (e: Exception) { return null }
     }
@@ -99,7 +95,7 @@ object MegaProxy {
         try {
             val url = "https://g.api.mega.co.nz/cs?id=${seq++}"
             val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
-            val req = app.post(url, requestBody = okhttp3.RequestBody.create(null, body)).text
+            val req = app.post(url, requestBody = body.toRequestBody(okhttp3.MediaType.parse("application/json"))).text
             val j = JSONArray(req)
             if (j.length() > 0 && j.get(0) is JSONObject) return j.getJSONObject(0)
             return null
