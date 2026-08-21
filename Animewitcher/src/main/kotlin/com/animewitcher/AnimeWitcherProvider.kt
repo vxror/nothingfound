@@ -53,18 +53,17 @@ class AnimeWitcherProvider : MainAPI() {
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-    // 🗓️ DYNAMIC SEASON CALCULATOR (Supports Past, Present, and Future!)
-    private fun getSeasonFilter(monthOffset: Int): String {
+// 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks — matches real anime seasons)
+    private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
-        cal.add(java.util.Calendar.MONTH, monthOffset)
+        cal.add(java.util.Calendar.MONTH, seasonOffset * 3) // 🆕 Jump a FULL season (3 months)
         val month = cal.get(java.util.Calendar.MONTH) + 1
         val year = cal.get(java.util.Calendar.YEAR)
         val seasonAr = when (month) {
-            12, 1, 2 -> "شتاء"
-            3, 4, 5 -> "ربيع"
-            6, 7, 8 -> "صيف"
-            9, 10, 11 -> "خريف"
-            else -> "شتاء"
+            1, 2, 3 -> "شتاء"
+            4, 5, 6 -> "ربيع"
+            7, 8, 9 -> "صيف"
+            else -> "خريف" // 10, 11, 12
         }
         return "[\"details.season:$seasonAr عام $year\"]"
     }
