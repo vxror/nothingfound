@@ -10,12 +10,5 @@ class WitAnimePlugin : Plugin() {
         registerMainAPI(WitAnime())
         registerExtractorAPI(VideaExtractor())
         registerExtractorAPI(MailruExtractor())
-        
-        // Start MegaProxy safely with error handling
-        try {
-            MegaProxy.start()
-        } catch (e: Exception) {
-            android.util.Log.e("WitAnime", "MegaProxy failed to start", e)
-        }
     }
 }
