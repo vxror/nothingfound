@@ -1,0 +1,17 @@
+{
+  "name": "Witch Repo",
+  "description": "WitAnime & AnimeWitcher",
+  "manifestVersion": 1,
+  "plugins": [
+    {
+      "name": "WitAnime",
+      "url": "https://github.com/vxror/Witch/raw/main/build/WitAnime.cs3",
+      "version": 1
+    },
+    {
+      "name": "AnimeWitcher",
+      "url": "https://github.com/vxror/nothingfound/raw/main/build/Animewitcher.cs3",
+      "version": 1
+    }
+  ]
+}
