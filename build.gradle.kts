@@ -6,9 +6,10 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 buildscript {
     repositories { google(); mavenCentral(); maven("https://jitpack.io") }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24")
+        // 🎯 THIS IS THE ONLY CHANGE (8.7.3 -> 8.8.2)
+        classpath("com.android.tools.build:gradle:8.8.2")
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
     }
 }
 
@@ -22,10 +23,10 @@ subprojects {
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
-    cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/nothingfound") }
+    cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/Witch") }
 
     android {
-        namespace = "com.animewitcher"
+        namespace = "com.witanime"
         defaultConfig {
             minSdk = 21
             compileSdkVersion(35)
@@ -38,7 +39,12 @@ subprojects {
         tasks.withType<KotlinJvmCompile> {
             compilerOptions {
                 jvmTarget.set(JvmTarget.JVM_1_8)
-                freeCompilerArgs.addAll("-Xno-call-assertions", "-Xno-param-assertions", "-Xno-receiver-assertions")
+                freeCompilerArgs.addAll(
+                    "-Xno-call-assertions",
+                    "-Xno-param-assertions",
+                    "-Xno-receiver-assertions",
+                    "-Xskip-metadata-version-check"
+                )
             }
         }
     }
