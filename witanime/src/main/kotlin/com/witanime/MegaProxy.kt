@@ -3,6 +3,8 @@ package com.witanime
 import android.util.Base64
 import com.lagradost.cloudstream3.app
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -82,7 +84,7 @@ object MegaProxy {
     private suspend fun megaApi(fileId: String): JSONObject? {
         return try {
             val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
-            val req = app.post("https://g.api.mega.co.nz/cs?id=${seq++}", requestBody = body.toRequestBody(okhttp3.MediaType.parse("application/json"))).text
+            val req = app.post("https://g.api.mega.co.nz/cs?id=${seq++}", requestBody = body.toRequestBody("application/json".toMediaType())).text
             val j = JSONArray(req)
             if (j.length() > 0 && j.get(0) is JSONObject) j.getJSONObject(0) else null
         } catch (_: Exception) { null }
