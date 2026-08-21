@@ -31,7 +31,6 @@ class AnimeWitcherProvider : MainAPI() {
     private var debugInfo = ""
     private var lastServerRaw = ""
 
-    // 📦 EPISODE CACHING
     private val episodesCache = HashMap<String, Pair<Long, List<EpisodeInfo>>>()
     private val EPISODE_CACHE_TTL_MS = 5 * 60 * 1000L
 
@@ -54,9 +53,10 @@ class AnimeWitcherProvider : MainAPI() {
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-    // 🗓️ DYNAMIC SEASON CALCULATOR (Auto-updates every year/month!)
-    private fun getCurrentSeasonFilter(): String {
+    // 🗓️ DYNAMIC SEASON CALCULATOR (Supports Past, Present, and Future!)
+    private fun getSeasonFilter(monthOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
+        cal.add(java.util.Calendar.MONTH, monthOffset)
         val month = cal.get(java.util.Calendar.MONTH) + 1
         val year = cal.get(java.util.Calendar.YEAR)
         val seasonAr = when (month) {
@@ -140,13 +140,14 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
-    // ==================== MAIN PAGE (8 SECTIONS) ====================
+    // ==================== MAIN PAGE (9 SECTIONS) ====================
 
     override val mainPage = mainPageOf(
         "recent" to "أحدث الحلقات",
-        "latest_animes" to "اخر الأعمال المضافة",
         "most_watched_animations" to "الانميشن الاكثر مشاهدة",
-        "current_season" to "أنمي الموسم الحالي",
+        "prev_season" to "الموسم السابق",
+        "current_season" to "الموسم الحالي",
+        "next_season" to "الموسم القادم",
         "series_fav_count_desc" to "الأكثر شعبية",
         "best_mal_ranked" to "أفضل التقييمات",
         "movies" to "أفلام الأنمي",
@@ -155,9 +156,10 @@ class AnimeWitcherProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
         val recentEps = async { fetchRecentEpisodes() }
-        val latestAdded = async { fetchAlgoliaList("latest_animes", "") }
         val mostWatched = async { fetchAlgoliaList("most_watched_animations", "") }
-        val currentSeason = async { fetchAlgoliaList("series", "", getCurrentSeasonFilter()) }
+        val prevSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(-1)) }
+        val currentSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(0)) }
+        val nextSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(1)) }
         val popular = async { fetchAlgoliaList("series_fav_count_desc", "") }
         val topRated = async { fetchAlgoliaList("best_mal_ranked", "") }
         val movies = async { fetchAlgoliaList("series", "", "[\"type:فيلم\"]") }
@@ -165,9 +167,10 @@ class AnimeWitcherProvider : MainAPI() {
 
         return@withContext newHomePageResponse(listOf(
             HomePageList("أحدث الحلقات", recentEps.await(), isHorizontalImages = true),
-            HomePageList("اخر الأعمال المضافة", latestAdded.await()),
             HomePageList("الانميشن الاكثر مشاهدة", mostWatched.await()),
-            HomePageList("أنمي الموسم الحالي", currentSeason.await()),
+            HomePageList("الموسم السابق", prevSeason.await()),
+            HomePageList("الموسم الحالي", currentSeason.await()),
+            HomePageList("الموسم القادم", nextSeason.await()),
             HomePageList("الأكثر شعبية", popular.await()),
             HomePageList("أفضل التقييمات", topRated.await()),
             HomePageList("أفلام الأنمي", movies.await()),
@@ -195,7 +198,6 @@ class AnimeWitcherProvider : MainAPI() {
     }
 
     private suspend fun fetchRecentEpisodes(): List<SearchResponse> = withContext(Dispatchers.IO) {
-        // 🆕 Added "story", "details", "tags", "type" to attributes
         val attributes = enc("[\"objectID\",\"name\",\"poster_uri\",\"thumb_uri\",\"episode_name\",\"doc_ref\",\"anime_id\",\"story\",\"details\",\"tags\",\"type\"]")
         val params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query="
         val body = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType())
@@ -222,7 +224,7 @@ class AnimeWitcherProvider : MainAPI() {
         val animeJson = try { JSONObject(URLDecoder.decode(url.substringAfter("?data=", ""), "utf-8")) } catch (e: Exception) { JSONObject() }
         var animeId = sanitizeId(idFrom(animeJson)); if (animeId.isEmpty()) animeId = sanitizeId(URLDecoder.decode(url.substringAfterLast('/').substringBefore('?'), "utf-8"))
         
-        // 🚀 SMART METADATA FILL: If Arabic story is missing (e.g. from Recent Episodes), fetch full data from Algolia
+        // 🚀 SMART METADATA FILL
         if (animeJson.optString("story").isEmpty() && animeId.isNotEmpty()) {
             try {
                 val fullAttributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
@@ -239,7 +241,7 @@ class AnimeWitcherProvider : MainAPI() {
                     val keys = fullObj.keys()
                     while (keys.hasNext()) {
                         val k = keys.next()
-                        animeJson.put(k, fullObj.opt(k)) // Merge full Arabic metadata into our JSON
+                        animeJson.put(k, fullObj.opt(k))
                     }
                 }
             } catch (_: Exception) {}
@@ -262,8 +264,6 @@ class AnimeWitcherProvider : MainAPI() {
         val epList = episodes.map { info -> newEpisode(data = "$animeId|${info.id}") { this.name = info.name ?: "الحلقة ${info.number}"; this.episode = info.number } }
         val tagsArray = animeJson.optJSONArray("tags")
         val tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList()
-        
-        // Extract Arabic Plot
         val plot = animeJson.optString("story").ifEmpty { animeJson.optString("description").ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() } }
 
         return@withContext newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
@@ -352,7 +352,6 @@ class AnimeWitcherProvider : MainAPI() {
 
         val allLinks = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
 
-        // 🚀 PARALLEL EXTRACTION
         coroutineScope {
             val jobs = servers.map { server ->
                 launch(Dispatchers.IO) {
@@ -362,7 +361,6 @@ class AnimeWitcherProvider : MainAPI() {
             withTimeoutOrNull(20000L) { jobs.joinAll() }
         }
 
-        // 🧹 DEDUPLICATION
         val deduplicated = allLinks.distinctBy { link ->
             if (link.url.contains(".m3u8") || link.url.contains(".mp4")) link.url.substringBefore("?").substringBefore("#") else link.url
         }.sortedByDescending { it.quality }
@@ -435,7 +433,7 @@ class AnimeWitcherProvider : MainAPI() {
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
                     if (!ok) ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, getQualityFromName(server.quality), callback)
                     
-                    // 🚑 EMERGENCY RESCUE: If everything failed, deploy the Cloudflare Proxy
+                    // 🚑 EMERGENCY RESCUE
                     if (!ok) {
                         ZenProxyRescue.rescue(fixedLink, finalName, getQualityFromName(server.quality), mainUrl, callback)
                     }
