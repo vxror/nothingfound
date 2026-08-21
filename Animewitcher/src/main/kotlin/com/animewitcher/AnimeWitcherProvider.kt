@@ -53,7 +53,7 @@ class AnimeWitcherProvider : MainAPI() {
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-// 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks — matches real anime seasons)
+    // 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks — matches real anime seasons)
     private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
         cal.add(java.util.Calendar.MONTH, seasonOffset * 3) // 🆕 Jump a FULL season (3 months)
@@ -154,6 +154,9 @@ class AnimeWitcherProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
+        // 🛑 STOP DUPLICATION: If the app asks for page 2, 3, etc., give it nothing and stop.
+        if (page > 0) return@withContext newHomePageResponse(emptyList(), hasNext = false)
+
         val recentEps = async { fetchRecentEpisodes() }
         val mostWatched = async { fetchAlgoliaList("most_watched_animations", "") }
         val prevSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(-1)) }
