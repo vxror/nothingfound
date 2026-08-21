@@ -1,49 +1,11 @@
-plugins {
-    id("com.android.library")
-    id("org.jetbrains.kotlin.android")
-}
-
-repositories {
-    mavenCentral()
-    maven { url = uri("https://jitpack.io") }
-}
-
-android {
-    namespace = "com.animewitcher"
-    compileSdk = 34
-    defaultConfig {
-        minSdk = 21
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
-    }
-}
-
-// 🚀 MOVED OUTSIDE android {} AND INJECTED THE MAGIC FLAG
-kotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
-        freeCompilerArgs.addAll(
-            "-XXLanguage:+BreakContinueInInlineLambdas",
-            "-Xskip-metadata-version-check" // 🎯 THIS FIXES THE 2.4.0 METADATA CRASH
-        )
-    }
-}
+version = 1
 
 dependencies {
-    val cloudstream by configurations
+    // ... [KEEP ALL YOUR EXISTING DEPENDENCIES HERE] ...
     
-    implementation("com.google.android.material:material:1.13.0")
-    implementation("androidx.browser:browser:1.9.0")
-    implementation("androidx.room:room-ktx:2.8.0")
-    testImplementation("junit:junit:4.13.2")
-    
-    cloudstream("com.lagradost:cloudstream3:pre-release")
-
-    // 🆕 CRITICAL DEPENDENCIES REQUIRED BY YOUR CODE
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.16.0")
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.16.0")
-    implementation("org.jsoup:jsoup:1.17.2")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // 🆕 ADD THESE 4 LINES FOR THE SETTINGS UI:
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.preference:preference-ktx:1.2.1")
+    implementation("androidx.fragment:fragment-ktx:1.8.2")
 }
