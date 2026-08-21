@@ -97,8 +97,7 @@ object WitExtractors {
         val html = app.get(url, referer = referer).text
         val m = Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(html)
             ?: Regex("""file\s*:\s*["']([^"']+)["']""").find(html) ?: return false
-        val link = m.groupValues[1].replace("\\/", "/")
-        emit(sn, "StreamSB", link, ExtractorLinkType.M3U8, url, quality(link), cb); return true
+        emit(sn, "StreamSB", m.groupValues[1].replace("\\/", "/"), ExtractorLinkType.M3U8, url, quality(m.groupValues[1]), cb); return true
     }
 
     private suspend fun mp4Upload(url: String, referer: String?, sn: String, cb: (ExtractorLink) -> Unit): Boolean {
@@ -144,7 +143,7 @@ object WitExtractors {
         emit(sn, "VidHide", m.groupValues[1], ExtractorLinkType.M3U8, url, quality(m.groupValues[1]), cb); return true
     }
 
-    // 🧠 ADVANCED UNIVERSAL SNIFFER (5-layer deobfuscation + iframe recursion)
+    // 🧠 ADVANCED UNIVERSAL SNIFFER
     private fun deepUnwrap(html: String): String {
         var result = html; var depth = 0
         while (depth < 5) {
