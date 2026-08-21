@@ -15,5 +15,26 @@
     "internalName": "AnimeWitcher",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/AnimeWitcher.cs3",
     "name": "AnimeWitcher"
+  },
+  {
+    "iconUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ7AH2oC7LwumXRpHM8_WLpIFvDIfmS67jkjlhsCKpPaZdqcneigzUQX4g&s=10",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/Abodabodd/re-3arabi",
+    "fileSize": 18732,
+    "status": 1,
+    "language": "ar",
+    "authors": [
+      "vxror"
+    ],
+    "tvTypes": [
+      "TvSeries",
+      "Anime",
+      "Movie"
+    ],
+    "version": 1,
+    "internalName": "Witanime",
+    "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/AnimeWitcher.cs3",
+    "name": "Witanime"
   }
 ]
+
