@@ -24,18 +24,18 @@ jobs:
       - name: Copy
         run: |
           mkdir -p build
-          rm -f build/AnimeWitcher.cs3
-          cp Animewitcher/build/*.cs3 build/AnimeWitcher.cs3
+          rm -f build/WitAnime.cs3
+          cp witanime/build/*.cs3 build/WitAnime.cs3
           ls -la build/
       - name: Push
         continue-on-error: true
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f build/AnimeWitcher.cs3
+          git add -f build/WitAnime.cs3
           git commit -m "update cs3 [skip ci]" || echo "nothing to commit"
           git push || echo "push failed"
       - uses: actions/upload-artifact@v4
         with:
-          name: AnimeWitcher-cs3
-          path: build/AnimeWitcher.cs3
+          name: WitAnime-cs3
+          path: build/WitAnime.cs3
