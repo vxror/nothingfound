@@ -6,7 +6,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.joinAll
@@ -32,11 +31,8 @@ class AnimeWitcherProvider : MainAPI() {
     private var debugInfo = ""
     private var lastServerRaw = ""
 
-    // ⚡ SPEED: 30-min episode cache + instant LoadResponse cache
     private val episodesCache = HashMap<String, Pair<Long, List<EpisodeInfo>>>()
-    private val EPISODE_CACHE_TTL_MS = 30 * 60 * 1000L
-    private val loadCache = HashMap<String, Pair<Long, LoadResponse>>()
-    private val LOAD_CACHE_TTL_MS = 30 * 60 * 1000L
+    private val EPISODE_CACHE_TTL_MS = 5 * 60 * 1000L
 
     companion object {
         private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
@@ -57,17 +53,17 @@ class AnimeWitcherProvider : MainAPI() {
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-    // 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks)
+// 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks — matches real anime seasons)
     private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
-        cal.add(java.util.Calendar.MONTH, seasonOffset * 3)
+        cal.add(java.util.Calendar.MONTH, seasonOffset * 3) // 🆕 Jump a FULL season (3 months)
         val month = cal.get(java.util.Calendar.MONTH) + 1
         val year = cal.get(java.util.Calendar.YEAR)
         val seasonAr = when (month) {
             1, 2, 3 -> "شتاء"
             4, 5, 6 -> "ربيع"
             7, 8, 9 -> "صيف"
-            else -> "خريف"
+            else -> "خريف" // 10, 11, 12
         }
         return "[\"details.season:$seasonAr عام $year\"]"
     }
@@ -143,17 +139,21 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
-    // ==================== 🛡️ MAIN PAGE (SINGLE ENTRY - NO DUPLICATES) ====================
+    // ==================== MAIN PAGE (9 SECTIONS) ====================
 
-    // 🛡️ SINGLE ENTRY: Triggers getMainPage() exactly ONCE (prevents 9x duplication)
-    override val mainPage = mainPageOf("" to "")
+    override val mainPage = mainPageOf(
+        "recent" to "أحدث الحلقات",
+        "most_watched_animations" to "الانميشن الاكثر مشاهدة",
+        "prev_season" to "الموسم السابق",
+        "current_season" to "الموسم الحالي",
+        "next_season" to "الموسم القادم",
+        "series_fav_count_desc" to "الأكثر شعبية",
+        "best_mal_ranked" to "أفضل التقييمات",
+        "movies" to "أفلام الأنمي",
+        "ongoing" to "يُعرض الآن"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
-        // 🛡️ PREVENT DUPLICATES: Only load on first call
-        if (page > 1) {
-            return@withContext newHomePageResponse(emptyList(), hasNext = false)
-        }
-
         val recentEps = async { fetchRecentEpisodes() }
         val mostWatched = async { fetchAlgoliaList("most_watched_animations", "") }
         val prevSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(-1)) }
@@ -213,41 +213,59 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext list
     }
 
+    // ==================== SEARCH ====================
+
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) { fetchAlgoliaList("series", query) }
 
-    // ==================== ⚡ FAST LOAD (Cache + Parallel) ====================
+    // ==================== LOAD ANIME ====================
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val animeJson = try { JSONObject(URLDecoder.decode(url.substringAfter("?data=", ""), "utf-8")) } catch (e: Exception) { JSONObject() }
         var animeId = sanitizeId(idFrom(animeJson)); if (animeId.isEmpty()) animeId = sanitizeId(URLDecoder.decode(url.substringAfterLast('/').substringBefore('?'), "utf-8"))
-
-        // ⚡ INSTANT REOPEN: serve cached page (30 min)
-        loadCache[animeId]?.let { (ts, resp) ->
-            if (System.currentTimeMillis() - ts < LOAD_CACHE_TTL_MS) return@withContext resp
+        
+        // 🚀 SMART METADATA FILL
+        if (animeJson.optString("story").isEmpty() && animeId.isNotEmpty()) {
+            try {
+                val fullAttributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
+                val filterQuery = enc("path:\"anime_list/$animeId\" OR objectID:\"$animeId\"")
+                val params = "attributesToRetrieve=$fullAttributes&hitsPerPage=1&query=&filters=$filterQuery"
+                val fullAnimeRes = app.post(
+                    algoliaUrl("series"),
+                    requestBody = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType()),
+                    headers = getAlgoliaHeaders()
+                ).text
+                val fullHits = JSONObject(fullAnimeRes).optJSONArray("hits")
+                if (fullHits != null && fullHits.length() > 0) {
+                    val fullObj = fullHits.getJSONObject(0)
+                    val keys = fullObj.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        animeJson.put(k, fullObj.opt(k))
+                    }
+                }
+            } catch (_: Exception) {}
         }
-
-        // Pre-read safe values BEFORE parallel jobs
-        val earlyDetails = animeJson.optJSONObject("details") ?: JSONObject()
-        val isUnreleased = (earlyDetails.optString("state") ?: "").contains("لم يتم بثه")
-        val epsNum = earlyDetails.optString("eps_num", "")
-
-        // 🚀 PARALLEL: Arabic metadata fill + episodes fetch at the SAME time
-        val metaJob = async {
-            if (animeJson.optString("story").isEmpty() && animeId.isNotEmpty()) {
-                try { withTimeoutOrNull(5000L) { fillMetadata(animeJson, animeId) } } catch (_: Exception) {}
-            }
-        }
-        val epsJob = async { fetchEpisodesSmart(animeId, isUnreleased, epsNum) }
-        metaJob.await()
-        val episodes = epsJob.await()
 
         val details = animeJson.optJSONObject("details") ?: JSONObject()
+        val isUnreleased = (details.optString("state") ?: "").contains("لم يتم بثه")
+        var episodes: List<EpisodeInfo> = emptyList()
+        if (!isUnreleased) {
+            val cached = episodesCache[animeId]
+            if (cached != null && System.currentTimeMillis() - cached.first < EPISODE_CACHE_TTL_MS) {
+                episodes = cached.second
+            } else {
+                episodes = fetchEpisodes(animeId)
+                if (episodes.isNotEmpty()) episodesCache[animeId] = System.currentTimeMillis() to episodes
+            }
+            if (episodes.isEmpty()) { val count = Regex("\\d+").find(details.optString("eps_num", ""))?.value?.toIntOrNull() ?: 0; if (count in 1..2000) episodes = (1..count).map { n -> EpisodeInfo(if (count <= 999) String.format("%03d", n) else n.toString(), null, n, null) } }
+            if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
+        }
         val epList = episodes.map { info -> newEpisode(data = "$animeId|${info.id}") { this.name = info.name ?: "الحلقة ${info.number}"; this.episode = info.number } }
         val tagsArray = animeJson.optJSONArray("tags")
         val tags = if (tagsArray != null) (0 until tagsArray.length()).map { tagsArray.getString(it) } else emptyList()
-        val plot = animeJson.optString("story").ifEmpty { animeJson.optString("description").ifEmpty { details.optString("story") } }
+        val plot = animeJson.optString("story").ifEmpty { animeJson.optString("description").ifEmpty { animeJson.optJSONObject("details")?.optString("story").orEmpty() } }
 
-        val response = newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
+        return@withContext newAnimeLoadResponse(animeJson.optString("name", animeId), url, TvType.Anime) {
             this.posterUrl = posterFrom(animeJson)
             this.year = details.optString("year").toIntOrNull()
             this.plot = plot
@@ -255,37 +273,6 @@ class AnimeWitcherProvider : MainAPI() {
             this.tags = tags
             addEpisodes(DubStatus.Subbed, epList)
         }
-        loadCache[animeId] = System.currentTimeMillis() to response
-        return@withContext response
-    }
-
-    // 🚀 Metadata fill (Arabic story) — isolated for parallel execution
-    private suspend fun fillMetadata(animeJson: JSONObject, animeId: String) {
-        val fullAttributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
-        val filterQuery = enc("path:\"anime_list/$animeId\" OR objectID:\"$animeId\"")
-        val params = "attributesToRetrieve=$fullAttributes&hitsPerPage=1&query=&filters=$filterQuery"
-        val fullAnimeRes = app.post(
-            algoliaUrl("series"),
-            requestBody = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType()),
-            headers = getAlgoliaHeaders()
-        ).text
-        val fullHits = JSONObject(fullAnimeRes).optJSONArray("hits")
-        if (fullHits != null && fullHits.length() > 0) {
-            val fullObj = fullHits.getJSONObject(0)
-            val keys = fullObj.keys()
-            while (keys.hasNext()) { val k = keys.next(); animeJson.put(k, fullObj.opt(k)) }
-        }
-    }
-
-    private suspend fun fetchEpisodesSmart(animeId: String, isUnreleased: Boolean, epsNum: String): List<EpisodeInfo> {
-        if (isUnreleased) return emptyList()
-        val cached = episodesCache[animeId]
-        if (cached != null && System.currentTimeMillis() - cached.first < EPISODE_CACHE_TTL_MS) return cached.second
-        var episodes = fetchEpisodes(animeId)
-        if (episodes.isNotEmpty()) episodesCache[animeId] = System.currentTimeMillis() to episodes
-        if (episodes.isEmpty()) { val count = Regex("\\d+").find(epsNum)?.value?.toIntOrNull() ?: 0; if (count in 1..2000) episodes = (1..count).map { n -> EpisodeInfo(if (count <= 999) String.format("%03d", n) else n.toString(), null, n, null) } }
-        if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
-        return episodes
     }
 
     // ==================== FETCH EPISODES FROM FIRESTORE ====================
@@ -326,15 +313,13 @@ class AnimeWitcherProvider : MainAPI() {
         }
     }
 
-    // ==================== ⚡ PARALLEL SERVER FETCH ====================
+    // ==================== FETCH SERVERS FROM FIRESTORE ====================
 
     private suspend fun fetchServersForEpisode(animeId: String, episodeId: String): List<ServerModel> = withContext(Dispatchers.IO) {
-        val a = enc(animeId)
-        val candidates = LinkedHashSet<String>(); candidates.add(episodeId)
+        val a = enc(animeId); val candidates = LinkedHashSet<String>(); candidates.add(episodeId)
         episodeId.toIntOrNull()?.let { n -> candidates.add(String.format("%03d", n)); candidates.add(n.toString()) }
-        // 🚀 Try ALL id formats at the same time
-        val results = candidates.map { e -> async { fetchServersAt(a, e) } }.awaitAll()
-        results.firstOrNull { it.isNotEmpty() } ?: emptyList()
+        for (e in candidates) { val r = fetchServersAt(a, e); if (r.isNotEmpty()) return@withContext r }
+        return@withContext emptyList()
     }
 
     private suspend fun fetchServersAt(a: String, e: String): List<ServerModel> = withContext(Dispatchers.IO) {
@@ -357,7 +342,7 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext emptyList()
     }
 
-    // ==================== LOAD LINKS (PARALLEL EXTRACTION + DEDUPLICATION) ====================
+    // ==================== LOAD LINKS (PARALLEL EXTRACTION) ====================
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean = withContext(Dispatchers.IO) {
         val parts = data.split('|'); if (parts.size < 2) return@withContext false
@@ -375,14 +360,9 @@ class AnimeWitcherProvider : MainAPI() {
             withTimeoutOrNull(20000L) { jobs.joinAll() }
         }
 
-        // 🧹 DEDUPLICATION (no lambda with sortedByDescending to avoid D8 warnings)
-        val seen = mutableSetOf<String>()
-        val deduplicated = mutableListOf<ExtractorLink>()
-        val sorted = allLinks.sortedByDescending { it.quality }
-        for (link in sorted) {
-            val key = if (link.url.contains(".m3u8") || link.url.contains(".mp4")) link.url.substringBefore("?").substringBefore("#") else link.url
-            if (seen.add(key)) deduplicated.add(link)
-        }
+        val deduplicated = allLinks.distinctBy { link ->
+            if (link.url.contains(".m3u8") || link.url.contains(".mp4")) link.url.substringBefore("?").substringBefore("#") else link.url
+        }.sortedByDescending { it.quality }
 
         deduplicated.forEach(callback)
         if (deduplicated.isEmpty()) throw ErrorLoadingException("No working streams extracted.")
@@ -451,8 +431,11 @@ class AnimeWitcherProvider : MainAPI() {
                     if (ZenHeavyweightExtractors.tryExtract(host, fixedLink, mainUrl, finalName, getQualityFromName(server.quality), callback)) return
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
                     if (!ok) ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, getQualityFromName(server.quality), callback)
-                    // 🚑 EMERGENCY RESCUE: If everything failed, deploy the Cloudflare Proxy
-                    if (!ok) { ZenProxyRescue.rescue(fixedLink, finalName, getQualityFromName(server.quality), mainUrl, callback) }
+                    
+                    // 🚑 EMERGENCY RESCUE
+                    if (!ok) {
+                        ZenProxyRescue.rescue(fixedLink, finalName, getQualityFromName(server.quality), mainUrl, callback)
+                    }
                 }
             }
         } catch (e: Exception) { callback.invoke(newExtractorLink(source = name, name = serverName, url = link) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
