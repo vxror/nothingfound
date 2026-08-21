@@ -24,9 +24,9 @@ jobs:
       - name: Copy Both Extensions
         run: |
           mkdir -p build
-          rm -f build/Animewitcher.cs3 build/WitAnime.cs3
+          rm -f build/Animewitcher.cs3 build/witanime.cs3
           cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
-          cp witanime/build/*.cs3 build/WitAnime.cs3 2>/dev/null || true
+          cp witanime/build/*.cs3 build/witanime.cs3 2>/dev/null || true
           ls -la build/
       - name: Push
         continue-on-error: true
