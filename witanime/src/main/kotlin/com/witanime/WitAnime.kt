@@ -37,7 +37,7 @@ class WitAnime : MainAPI() {
             }
             if (items.isNotEmpty()) homePageList.add(HomePageList(title, items))
         }
-        return HomePageResponse(homePageList)
+        return newHomePageResponse(homePageList)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -58,13 +58,15 @@ class WitAnime : MainAPI() {
             val epUrl = ep.attr("href")
             val epNum = ep.text().toIntOrNull()
             if (epUrl.isNotEmpty() && epNum != null) {
-                Episode(epUrl, episode = epNum)
+                newEpisode(epUrl) {
+                    episode = epNum
+                }
             } else null
         }
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             plot = description
-            this.episodes[1] = episodes
+            this.episodes[DubStatus.Subbed] = episodes
         }
     }
 
