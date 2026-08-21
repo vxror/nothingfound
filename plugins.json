@@ -5,12 +5,8 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": [
-      "VxROR"
-    ],
-    "tvTypes": [
-      "Anime"
-    ],
+    "authors": ["VxROR"],
+    "tvTypes": ["Anime"],
     "version": 1,
     "internalName": "AnimeWitcher",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Animewitcher.cs3",
@@ -22,16 +18,11 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": [
-      "vxror"
-    ],
-    "tvTypes": [
-      "Anime"
-    ],
+    "authors": ["vxror"],
+    "tvTypes": ["Anime"],
     "version": 1,
     "internalName": "WitAnime",
-    "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/WitAnime.cs3",
+    "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/witanime.cs3",
     "name": "WitAnime"
   }
 ]
-
