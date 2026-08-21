@@ -17,25 +17,26 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Build
+      - name: Build All
         run: |
           chmod +x gradlew
           ./gradlew make --no-daemon
-      - name: Copy
+      - name: Copy Both Extensions
         run: |
           mkdir -p build
-          rm -f build/Animewitcher.cs3
-          cp Animewitcher/build/*.cs3 build/Animewitcher.cs3
+          rm -f build/Animewitcher.cs3 build/WitAnime.cs3
+          cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
+          cp witanime/build/*.cs3 build/WitAnime.cs3 2>/dev/null || true
           ls -la build/
       - name: Push
         continue-on-error: true
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f build/Animewitcher.cs3
+          git add -f build/
           git commit -m "update cs3 [skip ci]" || echo "nothing to commit"
           git push || echo "push failed"
       - uses: actions/upload-artifact@v4
         with:
-          name: Animewitcher-cs3
-          path: build/Animewitcher.cs3
+          name: all-extensions-cs3
+          path: build/*.cs3
