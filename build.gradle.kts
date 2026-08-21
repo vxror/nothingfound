@@ -7,7 +7,7 @@ buildscript {
     repositories { google(); mavenCentral(); maven("https://jitpack.io") }
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
     }
 }
@@ -25,7 +25,7 @@ subprojects {
     cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/Witch") }
 
     android {
-        namespace = "com.animewitcher"
+        namespace = "com.witanime"
         defaultConfig {
             minSdk = 21
             compileSdkVersion(35)
@@ -40,9 +40,9 @@ subprojects {
                 jvmTarget.set(JvmTarget.JVM_1_8)
                 freeCompilerArgs.addAll(
                     "-Xno-call-assertions",
-                    "-Xno-param-assertions", 
+                    "-Xno-param-assertions",
                     "-Xno-receiver-assertions",
-                    "-Xskip-metadata-version-check"  // 🎯 THIS IS THE FIX
+                    "-Xskip-metadata-version-check"   // ← THE ONLY LINE I ADDED. Fixes metadata 2.4.0 vs 2.0.x
                 )
             }
         }
