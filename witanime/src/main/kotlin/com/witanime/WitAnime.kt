@@ -22,6 +22,7 @@ class WitAnime : MainAPI() {
     private val defaultHeaders = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (page > 0) return newHomePageResponse(emptyList(), hasNext = false)
         val document = app.get(mainUrl, headers = defaultHeaders).document
         val homePageList = ArrayList<HomePageList>()
         document.select("div.main-widget").forEach { widget ->
@@ -37,7 +38,7 @@ class WitAnime : MainAPI() {
             }
             if (items.isNotEmpty()) homePageList.add(HomePageList(title, items))
         }
-        return newHomePageResponse(homePageList)
+        return newHomePageResponse(homePageList, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -49,40 +50,279 @@ class WitAnime : MainAPI() {
         }
     }
 
+    // ==================== LOAD (FIXED EPISODES) ====================
+
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = defaultHeaders).document
         val title = document.selectFirst("h1.anime-details-title")?.text()?.trim() ?: ""
         val poster = document.selectFirst("div.anime-thumbnail img")?.attr("src")
-        val description = document.selectFirst("div.anime-details-plot")?.text()?.trim()
-        val episodes = document.select("div.episodes-list a").mapNotNull { ep ->
-            val epUrl = ep.attr("href")
-            val epNum = ep.text().toIntOrNull()
-            if (epUrl.isNotEmpty() && epNum != null) {
-                newEpisode(epUrl) {
-                    episode = epNum
-                }
-            } else null
+        val description = document.selectFirst("p.anime-story")?.text()?.trim()
+        val genres = document.select("ul.anime-genres li a").map { it.text() }
+        var status = ShowStatus.Ongoing; var tvType = TvType.Anime
+        document.select(".anime-info").forEach {
+            val t = it.text()
+            if (t.startsWith("حالة الأنمي:")) status = if (t.contains("مكتمل")) ShowStatus.Completed else ShowStatus.Ongoing
+            if (t.startsWith("النوع:")) tvType = if (t.contains("Movie")) TvType.AnimeMovie else TvType.Anime
         }
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            posterUrl = poster
-            plot = description
-            this.episodes[DubStatus.Subbed] = episodes
+
+        var episodes = mutableListOf<Episode>()
+
+        // 🥇 METHOD 1: The site's hidden XOR-encoded episode JSON
+        val match = Regex("""var\s+processedEpisodeData\s*=\s*'([^']+)'""").find(document.html())
+        val encodedData = match?.groupValues?.get(1)
+        if (!encodedData.isNullOrBlank()) {
+            try {
+                val parts = encodedData.split(".")
+                if (parts.size == 2) {
+                    val p1 = String(Base64.decode(parts[0], Base64.DEFAULT)); val p2 = String(Base64.decode(parts[1], Base64.DEFAULT))
+                    val decoded = StringBuilder(); for (i in p1.indices) decoded.append((p1[i].code xor p2[i % p2.length].code).toChar())
+                    (AppUtils.parseJson(decoded.toString()) as? List<Map<String, Any>>)?.let { list ->
+                        episodes = list.mapNotNull { ep ->
+                            val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
+                            newEpisode(epUrl) { name = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة" }
+                        }.toMutableList()
+                    }
+                }
+            } catch (e: Exception) { logError(e) }
+        }
+
+        // 🥈 METHOD 2: Bulletproof HTML fallback (NEVER returns empty if the page has episode links)
+        if (episodes.isEmpty()) {
+            val anchors = listOf(
+                "div.episodes-list a", "ul.episodes-list a", ".episode-card a",
+                ".eps-container a", "a[href*=\"/episode/\"]"
+            ).firstNotNullOfOrNull { sel -> document.select(sel).takeIf { it.isNotEmpty() } } ?: emptyList()
+            var idx = 0
+            anchors.forEach { ep ->
+                val epUrl = ep.attr("href")
+                if (epUrl.isNotEmpty()) {
+                    idx++
+                    val num = Regex("""(\d+)""").find(ep.text())?.groupValues?.get(1)?.toIntOrNull()
+                        ?: Regex("""(\d+)""").find(epUrl.substringAfterLast('/'))?.groupValues?.get(1)?.toIntOrNull()
+                        ?: idx
+                    episodes.add(newEpisode(epUrl) { name = "الحلقة $num"; episode = num })
+                }
+            }
+            episodes = episodes.distinctBy { it.data }.toMutableList()
+        }
+
+        return newAnimeLoadResponse(title, url, tvType) {
+            posterUrl = poster; plot = description; tags = genres; showStatus = status
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val document = app.get(data, headers = defaultHeaders).document
-        document.select("div.video-player-container iframe").forEach { iframe ->
-            val iframeSrc = iframe.attr("src")
-            if (iframeSrc.isNotEmpty()) {
-                loadExtractor(iframeSrc, null, subtitleCallback, callback)
+    // ==================== DECRYPTION HELPERS ====================
+
+    private fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
+    private fun b64Bytes(i: String?) = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
+    private fun bytesStr(b: ByteArray) = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
+    private fun hexBytes(h: String?) = if (h.isNullOrBlank()) ByteArray(0) else { val c = h.replace(Regex("[^0-9a-fA-F]"), ""); if (c.length % 2 != 0) ByteArray(0) else c.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
+    private fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
+    private fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
+    private suspend fun fetch(u: String) = try { app.get(u, headers = defaultHeaders).text } catch (_: Exception) { "" }
+
+    private fun paramOffset(config: Any?): Int {
+        try {
+            when (config) {
+                is Map<*, *> -> {
+                    val idx = bytesStr(b64Bytes(config["k"] as? String)).toIntOrNull() ?: return 0
+                    val d = config["d"]; if (d is List<*>) return (d.getOrNull(idx) as? Number)?.toInt() ?: 0
+                }
+                is JSONObject -> {
+                    val k = if (config.has("k")) config.optString("k", "") else ""; if (k.isBlank()) return 0
+                    val idx = bytesStr(b64Bytes(k)).toIntOrNull() ?: return 0
+                    val d = if (config.has("d")) config.get("d") else return 0
+                    if (d is JSONArray) return d.optInt(idx)
+                }
             }
+        } catch (_: Exception) {}
+        return 0
+    }
+
+    private fun decodeResource(raw: Any?, offset: Int): String {
+        var s: String? = null
+        when (raw) {
+            is String -> s = raw
+            is Map<*, *> -> s = (raw["r"] ?: raw["resource"] ?: raw["data"]) as? String
+            is JSONObject -> s = listOf("r", "resource", "data").firstNotNullOfOrNull { raw.optString(it, "") }?.takeIf { it.isNotBlank() }
         }
-        return true
+        if (s.isNullOrBlank()) return ""
+        val decoded = b64Bytes(cleanBase64Chars(s.reversed()))
+        val slice = if (offset in 1..decoded.size) decoded.copyOf(decoded.size - offset) else decoded
+        return trim(bytesStr(slice))
+    }
+
+    private fun parsePx9(js: String): Triple<String?, List<String>, Map<String, List<String>>> {
+        val mVal = Regex("""var\s+_m\s*=\s*\{\s*\"r\"\s*:\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
+        val sList = Regex("""var\s+_s\s*=\s*\[(.*?)\]\s*;""", RegexOption.DOT_MATCHES_ALL).find(js)
+            ?.let { Regex("\"([^\"]*)\"").findAll(it.groupValues[1]).map { m -> m.groupValues[1] }.toList() } ?: emptyList()
+        val pMap = mutableMapOf<String, List<String>>()
+        Regex("""var\s+(_p\d+)\s*=\s*\[\s*(.*?)\s*\]\s*;""", RegexOption.DOT_MATCHES_ALL).findAll(js).forEach { m ->
+            pMap[m.groupValues[1]] = Regex("\"([^\"]*)\"").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
+        }
+        return Triple(mVal, sList, pMap)
+    }
+
+    private fun chunk(hex: String?, secret: ByteArray) = trim(bytesStr(xor(hexBytes(hex), secret)))
+
+    private fun decryptPx9(mr: String?, sList: List<String>, pDict: Map<String, List<String>>): List<String> {
+        if (mr.isNullOrBlank()) return emptyList()
+        val secret = b64Bytes(mr); val out = mutableListOf<String>()
+        for (i in 0 until maxOf(sList.size, pDict.size)) {
+            val chunks = pDict["_p$i"] ?: continue
+            val decrypted = chunks.map { chunk(it, secret) }
+            val seq = if (i < sList.size) try { val a = JSONArray(chunk(sList[i], secret)); IntArray(a.length()) { a.getInt(it) } } catch (_: Exception) { null } else null
+            out.add(if (seq != null && seq.size == decrypted.size) {
+                val arr = Array(decrypted.size) { "" }
+                decrypted.indices.forEach { j -> if (seq[j] in arr.indices) arr[seq[j]] = decrypted[j] }
+                arr.joinToString("")
+            } else decrypted.joinToString(""))
+        }
+        return out.map { trim(it) }
+    }
+
+    private fun findServers(html: String): List<Pair<String, String>> {
+        val items = mutableListOf<Pair<String, String>>()
+        Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
+            val tag = m.groupValues[1]
+            val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
+            val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
+            if (sid != null) items.add(sid to (label ?: "server-$sid"))
+        }
+        return items
+    }
+
+    private fun lookup(reg: Any?, sid: String): Any? {
+        try {
+            when (reg) {
+                is JSONObject -> return if (reg.has(sid)) reg.get(sid) else { val i = sid.toIntOrNull(); if (i != null && reg.has(i.toString())) reg.get(i.toString()) else null }
+                is JSONArray -> { val i = sid.toIntOrNull(); if (i != null && i in 0 until reg.length()) return reg.get(i) }
+                is Map<*, *> -> return reg[sid] ?: reg[sid.toIntOrNull()]
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    // ==================== UNIFIED ROUTER ====================
+
+    private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
+        when {
+            host.contains("mega.nz") || host.contains("mega.co.nz") -> {
+                val local = MegaProxy.resolve(link)
+                if (local != null) callback(newExtractorLink("Mega", "Mega.nz", local, ExtractorLinkType.VIDEO) { this.referer = referer ?: ""; this.quality = Qualities.Unknown.value })
+                else loadExtractor(link, mainUrl, subtitleCallback, callback)
+            }
+            host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
+            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
+            else -> if (!WitExtractors.tryExtract(host, link, referer, name, callback)) loadExtractor(link, mainUrl, subtitleCallback, callback)
+        }
+    }
+
+    // ==================== LOAD LINKS ====================
+
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val FRAMEWORK_HASH = "1c0f3441-e3c2-4023-9e8b-bee77ff59adf"
+        return try {
+            val html = fetch(data)
+            var zG: String? = null; var zH: String? = null
+            val inlineScripts = Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.toList()
+            for (s in inlineScripts) {
+                if (zG == null) zG = Regex("""var\s+_zG\s*=\s*\"([^\"]+)\"""").find(s)?.groupValues?.get(1)
+                if (zH == null) zH = Regex("""var\s+_zH\s*=\s*\"([^\"]+)\"""").find(s)?.groupValues?.get(1)
+                if (zG != null && zH != null) break
+            }
+            if (zG == null || zH == null) {
+                Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
+                    if (zG != null && zH != null) return@forEach
+                    val src = if (m.groupValues[1].startsWith("http")) m.groupValues[1] else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
+                    val js = fetch(src)
+                    if (zG == null) zG = Regex("""var\s+_zG\s*=\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
+                    if (zH == null) zH = Regex("""var\s+_zH\s*=\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
+                }
+            }
+            fun toRegistry(b64: String?): Any? = try { val d = bytesStr(b64Bytes(b64)); try { JSONObject(d) } catch (_: Exception) { try { JSONArray(d) } catch (_: Exception) { null } } } catch (_: Exception) { null }
+            val resourceReg = toRegistry(zG); val configReg = toRegistry(zH)
+            val servers = findServers(html)
+            val semaphore = Semaphore(6)
+
+            supervisorScope {
+                servers.map { (sid, _) ->
+                    async(Dispatchers.IO) {
+                        semaphore.withPermit {
+                            try {
+                                val link = decodeResource(lookup(resourceReg, sid), paramOffset(lookup(configReg, sid)))
+                                val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
+                                if (finalLink.isNotBlank()) routeLink(finalLink, mainUrl, subtitleCallback, callback)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            var px_mr: String? = null; var px_s = listOf<String>(); val px_p = mutableMapOf<String, List<String>>()
+            for (s in inlineScripts) {
+                if ("_m" in s && "_p0" in s) { val (m, sl, pm) = parsePx9(s); px_mr = m ?: px_mr; if (sl.isNotEmpty()) px_s = sl; px_p.putAll(pm); if (px_mr != null && px_p.isNotEmpty()) break }
+            }
+            if (px_p.isEmpty() || px_mr == null) {
+                Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
+                    if (px_mr != null && px_p.isNotEmpty()) return@forEach
+                    val src = if (m.groupValues[1].startsWith("http")) m.groupValues[1] else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
+                    val js = fetch(src); if (js.isBlank()) return@forEach
+                    val (m2, sl2, pm2) = parsePx9(js)
+                    if (m2 != null && px_mr == null) px_mr = m2
+                    if (sl2.isNotEmpty() && px_s.isEmpty()) px_s = sl2
+                    if (pm2.isNotEmpty()) px_p.putAll(pm2)
+                }
+            }
+            if (px_p.isEmpty()) { val (m3, sl3, pm3) = parsePx9(html); px_mr = m3 ?: px_mr; if (sl3.isNotEmpty()) px_s = sl3; px_p.putAll(pm3) }
+
+            supervisorScope {
+                decryptPx9(px_mr, px_s, px_p).map { dl ->
+                    async(Dispatchers.IO) {
+                        semaphore.withPermit {
+                            try {
+                                val idx = dl.indexOf("http")
+                                val final = trim(if (idx >= 0) dl.substring(idx) else dl)
+                                if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }.awaitAll()
+            }
+            true
+        } catch (e: Exception) { logError(e); false }
+    }
+
+    // ==================== YONAPLAY DECODER ====================
+
+    private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        try {
+            val html = app.get(yonaplayUrl, referer = mainUrl, headers = defaultHeaders).text
+            Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
+                var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
+                try {
+                    val decoded = String(Base64.decode(fixed, Base64.DEFAULT))
+                    if (decoded.contains("drive.google.com/file/d/")) {
+                        Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
+                            callback(newExtractorLink("Yonaplay", "Google Drive", "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
+                                referer = "https://drive.google.com/"; quality = Qualities.Unknown.value
+                            })
+                            return@forEach
+                        }
+                    }
+                    Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").find(decoded)?.let { dm ->
+                        val u = dm.groupValues[1]
+                        callback(newExtractorLink("Yonaplay", "Direct", u, if (u.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                            referer = yonaplayUrl; quality = Qualities.Unknown.value
+                        })
+                        return@forEach
+                    }
+                    loadExtractor(decoded, subtitleCallback, callback)
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
     }
 }
