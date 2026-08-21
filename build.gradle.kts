@@ -8,7 +8,7 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24")
     }
 }
 
@@ -22,7 +22,7 @@ subprojects {
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
-    cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/Witch") }
+    cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/nothingfound") }
 
     android {
         namespace = "com.animewitcher"
