@@ -122,16 +122,6 @@ class WitAnime : MainAPI() {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════
-    // loadLinks v108 — DIAGNOSTIC + RESILIENT:
-    //   📸 dumpPage   → logs page structure (server anchor HTML, script list)
-    //   path 1        → classic _zG/_zH registries (inline or external js)
-    //   path 2        → generic "id":{"r":"b64"} registry anywhere
-    //   🌐 WV retry   → if static page had no registries, solve CF + refetch
-    //   path 3        → server anchor href fallback
-    //   path 4        → scan html for known embed hosts
-    //   path 5        → px9 download links
-    // ════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val FRAMEWORK_HASH = "1c0f3441-e3c2-4023-9e8b-bee77ff59adf"
 
@@ -146,16 +136,6 @@ class WitAnime : MainAPI() {
             app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
         } catch (_: Exception) { "" }
 
-        fun paramOffset(config: Any?): Int {
-            try {
-                when (config) {
-                    is Map<*, *> -> { val idx = bytesStr(b64Bytes(config["k"] as? String)).toIntOrNull() ?: return 0; val d = config["d"]; if (d is List<*>) return (d.getOrNull(idx) as? Number)?.toInt() ?: 0 }
-                    is JSONObject -> { val k = if (config.has("k")) config.optString("k", "") else ""; if (k.isBlank()) return 0; val idx = bytesStr(b64Bytes(k)).toIntOrNull() ?: return 0; val d = if (config.has("d")) config.get("d") else return 0; if (d is JSONArray) return d.optInt(idx) }
-                }
-            } catch (_: Exception) {}
-            return 0
-        }
-
         fun decodeResource(raw: Any?, offset: Int): String {
             var s: String? = null
             when (raw) {
@@ -167,6 +147,16 @@ class WitAnime : MainAPI() {
             val decoded = b64Bytes(cleanBase64Chars(s.reversed()))
             val slice = if (offset in 1..decoded.size) decoded.copyOf(decoded.size - offset) else decoded
             return trim(bytesStr(slice))
+        }
+
+        fun paramOffset(config: Any?): Int {
+            try {
+                when (config) {
+                    is Map<*, *> -> { val idx = bytesStr(b64Bytes(config["k"] as? String)).toIntOrNull() ?: return 0; val d = config["d"]; if (d is List<*>) return (d.getOrNull(idx) as? Number)?.toInt() ?: 0 }
+                    is JSONObject -> { val k = if (config.has("k")) config.optString("k", "") else ""; if (k.isBlank()) return 0; val idx = bytesStr(b64Bytes(k)).trim().toIntOrNull() ?: return 0; val d = if (config.has("d")) config.optJSONArray("d") else return 0 ?: return 0; if (d != null && idx < d.length()) return d.optInt(idx) }
+                }
+            } catch (_: Exception) {}
+            return 0
         }
 
         fun parsePx9(js: String): Triple<String?, List<String>, Map<String, List<String>>> {
@@ -221,99 +211,74 @@ class WitAnime : MainAPI() {
             return m.value.trimEnd('"', '\'', ')', ';', ',')
         }
 
-        // 📸 page dumper — tells us where the data lives now
-        fun dumpPage(tag: String, h: String) {
-            for (mk in listOf("server-link", "_zG", "data-server-id", "<iframe", "processedEpisodeData")) {
-                val i = h.indexOf(mk)
-                println("WitAnimeDebug: $tag [$mk] idx=$i")
-                if (i >= 0) println("WitAnimeDebug: $tag ctx=<<" + h.substring(maxOf(0, i - 150), minOf(h.length, i + 500)).replace("\n", " ") + ">>")
-            }
-            println("WitAnimeDebug: $tag flags atob=${h.contains("atob")} eval=${h.contains("eval(function")} iframe=${h.contains("<iframe")}")
-            Regex("""<script[^>]+src=["']([^"']+)["']""").findAll(h).take(10).forEachIndexed { n, m ->
-                println("WitAnimeDebug: $tag script[$n]=${m.groupValues[1]}")
-            }
-        }
-
         return try {
             val html = fetch(data)
             if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
             println("WitAnimeDebug: html len=${html.length}")
-            dumpPage("STATIC", html)
 
+            // ════ NEW FORMAT (witanime.you, 2026): _zT = resource ARRAY, _zV = config ARRAY ════
+            val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
+            val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
+            val resArr: JSONArray? = zT?.let { t -> try { JSONArray(String(Base64.decode(t, Base64.DEFAULT))) } catch (_: Exception) { null } }
+            val cfgArr: JSONArray? = zV?.let { v -> try { JSONArray(String(Base64.decode(v, Base64.DEFAULT))) } catch (_: Exception) { null } }
+            println("WitAnimeDebug: NEW-FORMAT zT=${zT != null} zV=${zV != null} resArr=${resArr?.length() ?: -1} cfgArr=${cfgArr?.length() ?: -1}")
+
+            // ════ LEGACY FORMAT: _zG/_zH object registries ════
             val zRxG = Regex("""_zG\s*=\s*\"([^\"]+)\"""")
             val zRxH = Regex("""_zH\s*=\s*\"([^\"]+)\"""")
             var zG: String? = zRxG.find(html)?.groupValues?.get(1)
             var zH: String? = zRxH.find(html)?.groupValues?.get(1)
-
-            val genericRes = mutableMapOf<String, String>()
-            val genericCfg = mutableMapOf<String, Pair<String, String>>()
-            fun scanGeneric(text: String) {
-                Regex(""""([^"]{1,40})"\s*:\s*\{\s*"r"\s*:\s*"([A-Za-z0-9+/=]{20,})"""").findAll(text).forEach { genericRes[it.groupValues[1]] = it.groupValues[2] }
-                Regex(""""([^"]{1,40})"\s*:\s*\{\s*"k"\s*:\s*"([^"]*)"\s*,\s*"d"\s*:\s*(\[[^\]]*\])""").findAll(text).forEach { genericCfg[it.groupValues[1]] = it.groupValues[2] to it.groupValues[3] }
-            }
-
-            val externalJs = StringBuilder()
-            val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).map { m ->
-                if (m.groupValues[1].startsWith("http")) m.groupValues[1]
-                else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
-            }.toList()
-            scriptSrcs.forEach { src ->
-                val js = fetch(src)
-                externalJs.append("\n").append(js)
-                if (zG == null) zG = zRxG.find(js)?.groupValues?.get(1)
-                if (zH == null) zH = zRxH.find(js)?.groupValues?.get(1)
-            }
-            scanGeneric("$html\n$externalJs")
-            println("WitAnimeDebug: extScripts=${scriptSrcs.size} zG=${zG != null} zH=${zH != null} genericRes=${genericRes.size}")
-
-            // 🌐 WebView retry if the static page gave us nothing
-            var bestHtml = html
-            if (zG == null && genericRes.isEmpty()) {
-                println("WitAnimeDebug: ⚠️ no registries in static html → WebView retry")
-                try { app.get(data, headers = mapOf("User-Agent" to userAgent), interceptor = wvResolver) } catch (_: Exception) {}
-                val html2 = fetch(data)
-                if (html2.isNotBlank() && html2 != html) {
-                    println("WitAnimeDebug: retry len=${html2.length}")
-                    dumpPage("WVRETRY", html2)
-                    if (zG == null) zG = zRxG.find(html2)?.groupValues?.get(1)
-                    if (zH == null) zH = zRxH.find(html2)?.groupValues?.get(1)
-                    scanGeneric(html2)
-                    bestHtml = html2
-                }
-            }
-
             fun toRegistry(b64: String?): Any? = try { val d = bytesStr(b64Bytes(b64)); try { JSONObject(d) } catch (_: Exception) { try { JSONArray(d) } catch (_: Exception) { null } } } catch (_: Exception) { null }
             val resourceReg = toRegistry(zG); val configReg = toRegistry(zH)
 
-            var servers = findServers(bestHtml)
-            if (servers.isEmpty()) servers = findServers(html)
+            // generic registry fallback
+            val genericRes = mutableMapOf<String, String>()
+            val genericCfg = mutableMapOf<String, Pair<String, String>>()
+            Regex(""""([^"]{1,40})"\s*:\s*\{\s*"r"\s*:\s*"([A-Za-z0-9+/=]{20,})"""").findAll(html).forEach { genericRes[it.groupValues[1]] = it.groupValues[2] }
+
+            val servers = findServers(html)
             println("WitAnimeDebug: servers=${servers.size}")
 
             val semaphore = Semaphore(6)
 
-            suspend fun decodeAndRoute(sid: String, anchorHref: String?) {
+            suspend fun decodeAndRoute(sid: String, label: String, anchorHref: String?) {
                 try {
                     var link = ""
-                    // path 1: classic registries
-                    val res = lookup(resourceReg, sid)
-                    if (res != null) link = sanitize(decodeResource(res, paramOffset(lookup(configReg, sid))))
-                    // path 2: generic registry
-                    if (link.isBlank() && genericRes.isNotEmpty()) {
-                        val raw = genericRes[sid] ?: genericRes[sid.toIntOrNull()?.toString() ?: ""]
-                        if (raw != null) {
+
+                    // ── PATH 1 (NEW): _zT/_zV arrays indexed by server id ──
+                    if (resArr != null) {
+                        val idx = sid.toIntOrNull() ?: -1
+                        if (idx in 0 until resArr.length()) {
+                            val raw = resArr.optString(idx)
                             var off = 0
-                            genericCfg[sid]?.let { (k, d) ->
-                                val idx = bytesStr(b64Bytes(k)).trim().toIntOrNull() ?: 0
-                                val nums = Regex("-?\\d+").findAll(d).mapNotNull { it.value.toIntOrNull() }.toList()
-                                off = nums.getOrNull(idx) ?: 0
+                            val cfg = cfgArr?.optJSONObject(idx)
+                            if (cfg != null) {
+                                val kIdx = String(Base64.decode(cfg.optString("k", ""), Base64.DEFAULT)).trim().toIntOrNull() ?: 0
+                                val d = cfg.optJSONArray("d")
+                                if (d != null && kIdx in 0 until d.length()) off = d.optInt(kIdx)
                             }
                             link = sanitize(decodeResource(raw, off))
                             if (link.isBlank()) link = sanitize(decodeResource(raw, 0))
+                            println("WitAnimeDebug: [$label] zT decode off=$off -> $link")
                         }
                     }
-                    // path 3: anchor href
+
+                    // ── PATH 2 (LEGACY): _zG/_zH registries ──
+                    if (link.isBlank()) {
+                        val res = lookup(resourceReg, sid)
+                        if (res != null) link = sanitize(decodeResource(res, paramOffset(lookup(configReg, sid))))
+                    }
+
+                    // ── PATH 3: generic registry ──
+                    if (link.isBlank() && genericRes.isNotEmpty()) {
+                        val raw = genericRes[sid] ?: genericRes[sid.toIntOrNull()?.toString() ?: ""]
+                        if (raw != null) link = sanitize(decodeResource(raw, 0))
+                    }
+
+                    // ── PATH 4: anchor href ──
                     if (link.isBlank() && anchorHref != null && anchorHref.startsWith("http")) link = anchorHref
-                    println("WitAnimeDebug: server $sid -> $link")
+
+                    println("WitAnimeDebug: server $sid [$label] -> $link")
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
                         routeLink(finalLink, data, subtitleCallback, callback)
@@ -322,28 +287,18 @@ class WitAnime : MainAPI() {
             }
 
             supervisorScope {
-                servers.map { (sid, _, href) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, href) } } }.awaitAll()
+                servers.map { (sid, label, href) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label, href) } } }.awaitAll()
             }
 
-            // path 4: last resort — scan for known embed hosts
-            if (servers.isEmpty() || (resourceReg == null && genericRes.isEmpty())) {
-                println("WitAnimeDebug: ⚠️ scanning html for embed links")
-                val known = listOf("videa", "dood", "wish", "mail.ru", "ok.ru", "mega.nz", "4shared", "mediafire.com", "filemoon", "mp4upload", "uqload", "streamtape", "yonaplay", "videas")
-                supervisorScope {
-                    Regex("""https?://[^\s"'<>]+""").findAll(bestHtml).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
-                        .filter { l -> known.any { l.contains(it, true) } }
-                        .distinct().take(15).toList()
-                        .map { l -> async(Dispatchers.IO) { semaphore.withPermit { try { routeLink(l, data, subtitleCallback, callback) } catch (_: Exception) {} } } }
-                        .awaitAll()
-                }
-            }
-
-            // path 5: px9 download links
+            // ════ DOWNLOAD LINKS: _m/_p0..N (+ _x/_v new vars) — px9 scheme ════
             var px_mr: String? = null; var px_s = listOf<String>(); val px_p = mutableMapOf<String, List<String>>()
-            Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(bestHtml).map { it.groupValues[1] }.forEach { s ->
+            Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.forEach { s ->
                 if ("_m" in s && "_p0" in s) { val (m, sl, pm) = parsePx9(s); px_mr = m ?: px_mr; if (sl.isNotEmpty()) px_s = sl; px_p.putAll(pm) }
             }
-            supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
+            val dlLinks = decryptPx9(px_mr, px_s, px_p)
+            println("WitAnimeDebug: px9 download links=${dlLinks.size}")
+            dlLinks.forEach { l -> if (l.contains("http")) println("WitAnimeDebug: px9 dl -> $l") }
+            supervisorScope { dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
                 if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
             } catch (_: Exception) {} } } }.awaitAll() }
@@ -351,7 +306,7 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER — wildcard matching, videas.fr included, full logging */
+    /** ⚡ THE ROUTER */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         println("WitAnimeDebug: routing -> $link")
         when {
@@ -365,6 +320,10 @@ class WitAnime : MainAPI() {
             linkHost(link).contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, callback)
             linkHost(link).contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
             linkHost(link).contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("workupload") || linkHost(link).contains("gofile") -> {
+                val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
+                if (!ok) UniversalExtractor().getUrl(link, referer, subtitleCallback, callback)
+            }
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
                 if (!ok) {
@@ -375,7 +334,7 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** Yonaplay = router: b64 players, iframes, mega/4shared hrefs ALL recurse into routeLink */
+    /** Yonaplay = router */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
@@ -389,7 +348,6 @@ class WitAnime : MainAPI() {
                 else -> Qualities.Unknown.value
             }
 
-            // 1) <source src label>
             Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
                 val url = m.groupValues[1]; val label = m.groupValues[2]
                 if (seen.add(url) && url.startsWith("http")) {
@@ -400,7 +358,6 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 2) go_to_player('b64') → may decode to 4shared / mega / gdrive / anything
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
@@ -418,12 +375,10 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 3) plain mega/4shared/mediafire hrefs
             Regex("""https?://(?:mega\.nz|www\.4shared\.com|www\.mediafire\.com)/[^\s"'<>]+""").findAll(html).forEach {
                 if (seen.add(it.value)) routeLink(it.value, yonaplayUrl, subtitleCallback, callback)
             }
 
-            // 4) iframes → recurse
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
@@ -432,7 +387,6 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 5) direct mp4/m3u8
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val url = m.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google") && seen.add(url)) {
