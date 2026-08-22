@@ -122,6 +122,14 @@ class WitAnime : MainAPI() {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // loadLinks v106 — registry-AGNOSTIC:
+    //   path 1: classic _zG/_zH (any syntax, inline or external js)
+    //   path 2: generic "id":{"r":"b64"} registry found ANYWHERE in page+scripts
+    //   path 3: server anchor href as fallback
+    //   path 4: if nothing decoded at all → scan html for known embed hosts
+    //   path 5: px9 download links (unchanged scheme)
+    // ════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val FRAMEWORK_HASH = "1c0f3441-e3c2-4023-9e8b-bee77ff59adf"
 
@@ -183,13 +191,15 @@ class WitAnime : MainAPI() {
             return out.map { trim(it) }
         }
 
-        fun findServers(html: String): List<Pair<String, String>> {
-            val items = mutableListOf<Pair<String, String>>()
+        // servers now carry anchor href as a fallback path
+        fun findServers(html: String): List<Triple<String, String, String?>> {
+            val items = mutableListOf<Triple<String, String, String?>>()
             Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
                 val tag = m.groupValues[1]
                 val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
                 val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
-                if (sid != null) items.add(sid to (label ?: "server-$sid"))
+                val href = Regex("""href\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
+                if (sid != null) items.add(Triple(sid, label ?: "server-$sid", href))
             }
             return items
         }
@@ -205,53 +215,115 @@ class WitAnime : MainAPI() {
             return null
         }
 
+        fun sanitize(l: String): String {
+            val m = Regex("""https?://\S+""").find(l.trim()) ?: return ""
+            return m.value.trimEnd('"', '\'', ')', ';', ',')
+        }
+
         return try {
             val html = fetch(data)
-            if (html.isBlank()) return false
+            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
+            println("WitAnimeDebug: html len=${html.length}")
 
-            var zG: String? = null; var zH: String? = null
-            val inlineScripts = Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.toList()
-            for (s in inlineScripts) {
-                if (zG == null) zG = Regex("""var\s+_zG\s*=\s*\"([^\"]+)\"""").find(s)?.groupValues?.get(1)
-                if (zH == null) zH = Regex("""var\s+_zH\s*=\s*\"([^\"]+)\"""").find(s)?.groupValues?.get(1)
-                if (zG != null && zH != null) break
+            // ── path 1 inputs: _zG/_zH with ANY syntax, in raw html OR external scripts ──
+            val zRxG = Regex("""_zG\s*=\s*\"([^\"]+)\"""")
+            val zRxH = Regex("""_zH\s*=\s*\"([^\"]+)\"""")
+            var zG: String? = zRxG.find(html)?.groupValues?.get(1)
+            var zH: String? = zRxH.find(html)?.groupValues?.get(1)
+
+            val externalJs = StringBuilder()
+            val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).map { m ->
+                if (m.groupValues[1].startsWith("http")) m.groupValues[1]
+                else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
+            }.toList()
+            scriptSrcs.forEach { src ->
+                val js = fetch(src)
+                externalJs.append("\n").append(js)
+                if (zG == null) zG = zRxG.find(js)?.groupValues?.get(1)
+                if (zH == null) zH = zRxH.find(js)?.groupValues?.get(1)
             }
-            if (zG == null || zH == null) {
-                Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
-                    if (zG != null && zH != null) return@forEach
-                    val src = if (m.groupValues[1].startsWith("http")) m.groupValues[1] else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
-                    val js = fetch(src)
-                    if (zG == null) zG = Regex("""var\s+_zG\s*=\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
-                    if (zH == null) zH = Regex("""var\s+_zH\s*=\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
-                }
-            }
+            val allJs = "$html\n$externalJs"
+            println("WitAnimeDebug: extScripts=${scriptSrcs.size} totalJs=${allJs.length} zG=${zG != null} zH=${zH != null}")
+
             fun toRegistry(b64: String?): Any? = try { val d = bytesStr(b64Bytes(b64)); try { JSONObject(d) } catch (_: Exception) { try { JSONArray(d) } catch (_: Exception) { null } } } catch (_: Exception) { null }
             val resourceReg = toRegistry(zG); val configReg = toRegistry(zH)
+
+            // ── path 2 inputs: generic registry — any "id":{"r":"b64"} / "id":{"k":"..","d":[..]} anywhere ──
+            val genericRes = mutableMapOf<String, String>()
+            Regex(""""([^"]{1,40})"\s*:\s*\{\s*"r"\s*:\s*"([A-Za-z0-9+/=]{20,})"""").findAll(allJs).forEach {
+                genericRes[it.groupValues[1]] = it.groupValues[2]
+            }
+            val genericCfg = mutableMapOf<String, Pair<String, String>>()
+            Regex(""""([^"]{1,40})"\s*:\s*\{\s*"k"\s*:\s*"([^"]*)"\s*,\s*"d"\s*:\s*(\[[^\]]*\])""").findAll(allJs).forEach { m ->
+                genericCfg[m.groupValues[1]] = m.groupValues[2] to m.groupValues[3]
+            }
+            println("WitAnimeDebug: generic registry res=${genericRes.size} cfg=${genericCfg.size}")
+
             val servers = findServers(html)
-            println("WitAnimeDebug: servers=${servers.size} zG=${zG != null} zH=${zH != null}")
+            println("WitAnimeDebug: servers=${servers.size}")
 
             val semaphore = Semaphore(6)
-            supervisorScope {
-                servers.map { (sid, _) -> async(Dispatchers.IO) { semaphore.withPermit { try {
-                    val link = decodeResource(lookup(resourceReg, sid), paramOffset(lookup(configReg, sid)))
-                    val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
-                    println("WitAnimeDebug: server $sid -> $finalLink")
-                    if (finalLink.isNotBlank()) routeLink(finalLink, data, subtitleCallback, callback)
-                } catch (_: Exception) {} } } }.awaitAll()
+
+            suspend fun decodeAndRoute(sid: String, anchorHref: String?) {
+                try {
+                    var link = ""
+                    // path 1: classic registries
+                    val res = lookup(resourceReg, sid)
+                    if (res != null) link = sanitize(decodeResource(res, paramOffset(lookup(configReg, sid))))
+                    // path 2: generic registry
+                    if (link.isBlank() && genericRes.isNotEmpty()) {
+                        val raw = genericRes[sid] ?: genericRes[sid.toIntOrNull()?.toString() ?: ""]
+                        if (raw != null) {
+                            var off = 0
+                            genericCfg[sid]?.let { (k, d) ->
+                                val idx = bytesStr(b64Bytes(k)).trim().toIntOrNull() ?: 0
+                                val nums = Regex("-?\\d+").findAll(d).mapNotNull { it.value.toIntOrNull() }.toList()
+                                off = nums.getOrNull(idx) ?: 0
+                            }
+                            link = sanitize(decodeResource(raw, off))
+                            if (link.isBlank()) link = sanitize(decodeResource(raw, 0))
+                        }
+                    }
+                    // path 3: anchor href
+                    if (link.isBlank() && anchorHref != null && anchorHref.startsWith("http")) link = anchorHref
+                    println("WitAnimeDebug: server $sid -> $link")
+                    if (link.isNotBlank()) {
+                        val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
+                        routeLink(finalLink, data, subtitleCallback, callback)
+                    }
+                } catch (_: Exception) {}
             }
 
-            var px_mr: String? = null; var px_s = listOf<String>(); val px_p = mutableMapOf<String, List<String>>()
-            for (s in inlineScripts) { if ("_m" in s && "_p0" in s) { val (m, sl, pm) = parsePx9(s); px_mr = m ?: px_mr; if (sl.isNotEmpty()) px_s = sl; px_p.putAll(pm); if (px_mr != null && px_p.isNotEmpty()) break } }
-            if (px_p.isEmpty() || px_mr == null) {
-                Regex("""<script[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
-                    if (px_mr != null && px_p.isNotEmpty()) return@forEach
-                    val src = if (m.groupValues[1].startsWith("http")) m.groupValues[1] else try { java.net.URL(java.net.URL(data), m.groupValues[1]).toString() } catch (_: Exception) { m.groupValues[1] }
-                    val js = fetch(src); if (js.isBlank()) return@forEach
-                    val (m2, sl2, pm2) = parsePx9(js); if (m2 != null && px_mr == null) px_mr = m2; if (sl2.isNotEmpty() && px_s.isEmpty()) px_s = sl2; if (pm2.isNotEmpty()) px_p.putAll(pm2)
+            supervisorScope {
+                servers.map { (sid, _, href) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, href) } } }.awaitAll()
+            }
+
+            // ── path 4: nothing decoded → scan raw html for known embed hosts ──
+            val producedNothing = servers.isEmpty() || (resourceReg == null && genericRes.isEmpty())
+            if (producedNothing) {
+                println("WitAnimeDebug: ⚠️ registry missing → scanning html for embed links")
+                val hostRx = Regex("""https?://[^\s"'<>]+""")
+                val known = listOf("videa", "dood", "wish", "mail.ru", "ok.ru", "odnoklassniki", "mega.nz", "4shared", "mediafire.com", "filemoon", "mp4upload", "uqload", "streamtape", "yonaplay", "flyfile", "videas")
+                supervisorScope {
+                    hostRx.findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
+                        .filter { l -> known.any { l.contains(it, true) } }
+                        .distinct().take(15).toList()
+                        .map { l -> async(Dispatchers.IO) { semaphore.withPermit { try { routeLink(l, data, subtitleCallback, callback) } catch (_: Exception) {} } } }
+                        .awaitAll()
                 }
             }
-            if (px_p.isEmpty()) { val (m3, sl3, pm3) = parsePx9(html); px_mr = m3 ?: px_mr; if (sl3.isNotEmpty()) px_s = sl3; px_p.putAll(pm3) }
 
+            // ── path 5: px9 download links ──
+            var px_mr: String? = null; var px_s = listOf<String>(); val px_p = mutableMapOf<String, List<String>>()
+            Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.forEach { s ->
+                if ("_m" in s && "_p0" in s) { val (m, sl, pm) = parsePx9(s); px_mr = m ?: px_mr; if (sl.isNotEmpty()) px_s = sl; px_p.putAll(pm) }
+            }
+            if (px_p.isEmpty() || px_mr == null) {
+                val m2 = parsePx9(allJs)
+                px_mr = m2.first ?: px_mr
+                if (m2.second.isNotEmpty()) px_s = m2.second
+                px_p.putAll(m2.third)
+            }
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
                 if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
@@ -260,8 +332,9 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER — wildcard matching, videas.fr included */
+    /** ⚡ THE ROUTER — wildcard matching, videas.fr included, full logging */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        println("WitAnimeDebug: routing -> $link")
         when {
             linkHost(link).contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
             linkHost(link).contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
@@ -308,7 +381,7 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 2) go_to_player('b64') → may decode to 4shared / mega / gdrive / mp4upload / anything
+            // 2) go_to_player('b64') → may decode to 4shared / mega / gdrive / anything
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
@@ -326,7 +399,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 3) plain mega/4shared/mediafire hrefs on the page
+            // 3) plain mega/4shared/mediafire hrefs
             Regex("""https?://(?:mega\.nz|www\.4shared\.com|www\.mediafire\.com)/[^\s"'<>]+""").findAll(html).forEach {
                 if (seen.add(it.value)) routeLink(it.value, yonaplayUrl, subtitleCallback, callback)
             }
@@ -340,7 +413,7 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 5) direct mp4/m3u8 on page
+            // 5) direct mp4/m3u8
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val url = m.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google") && seen.add(url)) {
