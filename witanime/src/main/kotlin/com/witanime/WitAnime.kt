@@ -268,6 +268,7 @@ class WitAnime : MainAPI() {
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
         when {
+            // Mega.nz - Use MegaProxy for streaming
             host.contains("mega.nz") || host.contains("mega.co.nz") -> {
                 val local = MegaProxy.resolve(link)
                 if (local != null) {
@@ -278,14 +279,29 @@ class WitAnime : MainAPI() {
                     loadExtractor(link, mainUrl, subtitleCallback, callback)
                 }
             }
+            // Yonaplay - Custom decoder with quality variants
             host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
-            host.contains("videa.hu") || host.contains("videa.fr") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // Videa.hu - Hungarian video host
+            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // Videas.fr - French video host (different from videa.hu!)
+            host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // Mail.ru - Russian video host
             host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // DoodStream variants
             host.contains("dood") || host.contains("dstream") -> DoodStreamExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // 4Shared
             host.contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // MediaFire
+            host.contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // StreamWish variants
+            host.contains("streamwish") || host.contains("awish") || host.contains("asnwish") || host.contains("cdnwish") -> StreamWishExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // Everything else - try native extractors, then Universal Sniffer
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
-                if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched: $link")
+                if (!ok) {
+                    println("WitAnimeDebug: ⚠️ Native extractors failed, using UniversalSniffer for: $link")
+                    UniversalExtractor().getUrl(link, referer, subtitleCallback, callback)
+                }
             }
         }
     }
@@ -294,7 +310,7 @@ class WitAnime : MainAPI() {
         try {
             val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
             
-            // Extract all quality variants
+            // Extract all quality variants from source tags
             val qualityRegex = Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             qualityRegex.findAll(html).forEach { match ->
                 val url = match.groupValues[1]
@@ -312,7 +328,7 @@ class WitAnime : MainAPI() {
                 })
             }
             
-            // Extract Google Drive links
+            // Extract Google Drive links from base64 encoded data
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
@@ -329,7 +345,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
             
-            // Extract direct video links
+            // Extract direct video links (mp4, m3u8)
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { match ->
                 val url = match.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google")) {
