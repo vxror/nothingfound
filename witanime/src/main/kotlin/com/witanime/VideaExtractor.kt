@@ -2,16 +2,9 @@ package com.witanime
 
 import android.net.Uri
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.parser.Parser
@@ -25,7 +18,6 @@ class VideaExtractor : ExtractorApi() {
     override val mainUrl: String = "https://videa.hu"
     override val requiresReferer: Boolean = false
 
-    private val TAG = "VIDEA_EXTRACTOR"
     private val STUPID_KEY = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p"
 
     override suspend fun getUrl(
@@ -34,20 +26,12 @@ class VideaExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-
         try {
             val iframeSrc = url.trim()
-            if (iframeSrc.isBlank()) {
-
-                return
-            }
+            if (iframeSrc.isBlank()) return
 
             val pageResp = app.get(iframeSrc).text
-            val nonceMatch = Regex("_xt\\s*=\\s*\"([^\"]+)\"").find(pageResp)
-            if (nonceMatch == null) {
-
-                return
-            }
+            val nonceMatch = Regex("_xt\\s*=\\s*\"([^\"]+)\"").find(pageResp) ?: return
             val nonce = nonceMatch.groupValues[1]
 
             val paramL = if (nonce.length >= 32) nonce.substring(0, 32) else nonce.padEnd(32, 'a')
@@ -68,19 +52,21 @@ class VideaExtractor : ExtractorApi() {
             }
             val result = resultBuilder.toString()
 
-            val seed = randomAlphaNumeric(8) // _s
+            val seed = randomAlphaNumeric(8)
             val paramT = if (result.length >= 16) result.substring(0, 16) else result.padEnd(16, '0')
             val rc4KeyPart = if (result.length > 16) result.substring(16) else ""
 
-            val videoId = extractQueryParamV(iframeSrc)
-            if (videoId.isNullOrBlank()) {
+            val videoId = extractQueryParamV(iframeSrc) ?: return
 
-                return
+            // Support both videa.hu and videa.fr
+            val baseHost = when {
+                iframeSrc.contains("videa.fr") -> "https://videa.fr"
+                else -> "https://videa.hu"
             }
-
-            val xmlUrl = "https://videa.hu/player/xml?platform=desktop"
+            
+            val xmlUrl = "$baseHost/player/xml?platform=desktop"
             val params = mapOf("_s" to seed, "_t" to paramT, "v" to videoId)
-            val headers = mapOf("Referer" to iframeSrc, "Origin" to "https://videa.hu")
+            val headers = mapOf("Referer" to iframeSrc, "Origin" to baseHost)
 
             val xmlResponse = app.get(xmlUrl, params = params, headers = headers)
             val body = xmlResponse.text
@@ -88,89 +74,53 @@ class VideaExtractor : ExtractorApi() {
 
             val finalDoc = if (body.trimStart().startsWith("<?xml")) {
                 val parsed = Jsoup.parse(body, "", Parser.xmlParser())
-                val err = parsed.selectFirst("error")
-                if (err != null) {
-
-                    return
-                }
+                if (parsed.selectFirst("error") != null) return
                 parsed
             } else {
                 try {
-
                     val decoded = Base64.decode(body.trim(), Base64.DEFAULT)
                     val finalRc4Key = rc4KeyPart + seed + xVideaXsHeader
                     val decrypted = rc4Decrypt(decoded, finalRc4Key)
                     Jsoup.parse(decrypted, "", Parser.xmlParser())
-                } catch (e: Exception) {
-
-                    return
-                }
+                } catch (e: Exception) { return }
             }
 
             val videoSources = finalDoc.select("video_source")
-            if (videoSources.isEmpty()) {
+            if (videoSources.isEmpty()) return
 
-                return
-            }
-
-            val collected = mutableListOf<Triple<Int, String, String>>() // Triple(qualityValue, name, finalUrl)
-
+            val collected = mutableListOf<Triple<Int, String, String>>()
             for (src in videoSources) {
                 try {
-                    val name = src.attr("name")
+                    val sName = src.attr("name")
                     val videoUrlPart = src.text().trim()
                     val exp = src.attr("exp")
-                    val hashTagName = "hash_value_$name"
-                    val hashElem = finalDoc.getElementsByTag(hashTagName).first()
+                    val hashElem = finalDoc.getElementsByTag("hash_value_$sName").first()
                     val md5 = hashElem?.text()?.trim() ?: continue
-                    val finalUrl = if (videoUrlPart.startsWith("http")) {
-                        "$videoUrlPart?md5=$md5&expires=$exp"
-                    } else {
-                        "https:$videoUrlPart?md5=$md5&expires=$exp"
-                    }
-
-                    val q = try {
-
-                        val qv = getQualityFromName(name)
-                        if (qv <= 0) Qualities.Unknown.value else qv
-                    } catch (e: Exception) {
-                        Qualities.Unknown.value
-                    }
-
-                    collected.add(Triple(q, name, finalUrl))
-                } catch (e: Exception) {
-
-                }
+                    val finalUrl = if (videoUrlPart.startsWith("http")) "$videoUrlPart?md5=$md5&expires=$exp" else "https:$videoUrlPart?md5=$md5&expires=$exp"
+                    val q = getQualityFromName(sName).takeIf { it > 0 } ?: Qualities.Unknown.value
+                    collected.add(Triple(q, sName, finalUrl))
+                } catch (_: Exception) {}
             }
 
-            val sorted = collected.sortedWith(compareByDescending<Triple<Int, String, String>> { it.first }
-                .thenByDescending { // tie-breaker: حاول ترتيب حسب اسم إن أردت (1080 قبل 720)
-
-                    Regex("(\\d{3,4})").find(it.second)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                })
-
+            val sorted = collected.sortedByDescending { it.first }
             withContext(Dispatchers.Main) {
-                for ((qualityVal, name, finalUrl) in sorted) {
+                for ((qualityVal, sName, finalUrl) in sorted) {
                     try {
-                        val ex = newExtractorLink(
-                            source = this@VideaExtractor.name,
-                            name = "$name (Videa)",
-                            url = finalUrl,
-                            type = if (finalUrl.contains(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = referer ?: iframeSrc
-                            this.quality = qualityVal
-                        }
-                        callback.invoke(ex)
-                    } catch (e: Exception) {
-
-                    }
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this@VideaExtractor.name,
+                                name = "$sName (Videa)",
+                                url = finalUrl,
+                                type = if (finalUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = referer ?: iframeSrc
+                                this.quality = qualityVal
+                            }
+                        )
+                    } catch (_: Exception) {}
                 }
             }
-
-        } catch (e: Exception) {
-
-        }
+        } catch (_: Exception) {}
     }
 
     private fun randomAlphaNumeric(len: Int): String {
@@ -180,8 +130,7 @@ class VideaExtractor : ExtractorApi() {
 
     private fun extractQueryParamV(url: String): String? {
         return try {
-            val uri = Uri.parse(url)
-            uri.getQueryParameter("v")
+            Uri.parse(url).getQueryParameter("v")
         } catch (e: Exception) {
             Regex("[?&]v=([^&]+)").find(url)?.groupValues?.get(1)
         }
@@ -194,9 +143,11 @@ class VideaExtractor : ExtractorApi() {
             cipher.init(Cipher.DECRYPT_MODE, spec)
             val out = cipher.update(data) ?: cipher.doFinal(data)
             String(out, StandardCharsets.UTF_8)
-        } catch (e: Exception) {
-
-            ""
-        }
+        } catch (e: Exception) { "" }
     }
+}
+
+class VideaFrExtractor : VideaExtractor() {
+    override val name = "VideaFr"
+    override val mainUrl = "https://videa.fr"
 }
