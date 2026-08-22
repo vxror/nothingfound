@@ -22,8 +22,7 @@ class WitAnime : MainAPI() {
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
+    private val userAgent = EXTRACTOR_UA
     private val cfKiller = CloudflareKiller()
     private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
 
@@ -237,9 +236,7 @@ class WitAnime : MainAPI() {
                     val link = decodeResource(lookup(resourceReg, sid), paramOffset(lookup(configReg, sid)))
                     val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
                     println("WitAnimeDebug: server $sid -> $finalLink")
-                    if (finalLink.isNotBlank()) {
-                        routeLink(finalLink, data, subtitleCallback, callback)
-                    }
+                    if (finalLink.isNotBlank()) routeLink(finalLink, data, subtitleCallback, callback)
                 } catch (_: Exception) {} } } }.awaitAll()
             }
 
@@ -257,105 +254,101 @@ class WitAnime : MainAPI() {
 
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                if (final.startsWith("http")) {
-                    routeLink(final, data, subtitleCallback, callback)
-                }
+                if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
             } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
     }
 
+    /** ⚡ THE ROUTER — wildcard matching means new dood/wish/mega domains work without code changes */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
         when {
-            // Mega.nz - Use MegaProxy for streaming
-            host.contains("mega.nz") || host.contains("mega.co.nz") -> {
-                val local = MegaProxy.resolve(link)
-                if (local != null) {
-                    callback(newExtractorLink("Mega", "Mega.nz (Proxy)", local, ExtractorLinkType.VIDEO) {
-                        this.referer = referer ?: ""; this.quality = Qualities.Unknown.value
-                    })
-                } else {
-                    loadExtractor(link, mainUrl, subtitleCallback, callback)
-                }
-            }
-            // Yonaplay - Custom decoder with quality variants
-            host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
-            // Videa.hu - Hungarian video host
-            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // Videas.fr - French video host (different from videa.hu!)
-            host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // Mail.ru - Russian video host
-            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // DoodStream variants
-            host.contains("dood") || host.contains("dstream") -> DoodStreamExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // 4Shared
-            host.contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // MediaFire
-            host.contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // StreamWish variants
-            host.contains("streamwish") || host.contains("awish") || host.contains("asnwish") || host.contains("cdnwish") -> StreamWishExtractor().getUrl(link, referer, subtitleCallback, callback)
-            // Everything else - try native extractors, then Universal Sniffer
+            linkHost(link).contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
+            linkHost(link).contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
+            isMegaLink(link) -> MegaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, callback)
+            isStreamWishLink(link) -> StreamWishExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
                 if (!ok) {
-                    println("WitAnimeDebug: ⚠️ Native extractors failed, using UniversalSniffer for: $link")
+                    println("WitAnimeDebug: ⚠️ no extractor matched: $link — trying UniversalSniffer")
                     UniversalExtractor().getUrl(link, referer, subtitleCallback, callback)
                 }
             }
         }
     }
 
+    /** Yonaplay = router: b64 players, iframes, mega hrefs ALL recurse into routeLink */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
-            
-            // Extract all quality variants from source tags
-            val qualityRegex = Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            qualityRegex.findAll(html).forEach { match ->
-                val url = match.groupValues[1]
-                val label = match.groupValues[2]
-                val q = when {
-                    label.contains("1080") || label.contains("FHD") -> Qualities.P1080.value
-                    label.contains("720") || label.contains("HD") -> Qualities.P720.value
-                    label.contains("480") -> Qualities.P480.value
-                    label.contains("360") -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
-                }
-                callback(newExtractorLink("Yonaplay", "Yonaplay $label", url, ExtractorLinkType.M3U8) {
-                    this.referer = yonaplayUrl
-                    this.quality = q
-                })
+            val seen = mutableSetOf<String>()
+
+            fun qualityOf(label: String) = when {
+                label.contains("1080") || label.contains("FHD") -> Qualities.P1080.value
+                label.contains("720") || label.contains("HD") -> Qualities.P720.value
+                label.contains("480") -> Qualities.P480.value
+                label.contains("360") -> Qualities.P360.value
+                else -> Qualities.Unknown.value
             }
-            
-            // Extract Google Drive links from base64 encoded data
+
+            // 1) <source src label>
+            Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
+                val url = m.groupValues[1]; val label = m.groupValues[2]
+                if (seen.add(url) && url.startsWith("http")) {
+                    callback(newExtractorLink("Yonaplay", "Yonaplay $label", url,
+                        if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                        this.referer = yonaplayUrl; this.quality = qualityOf(label)
+                    })
+                }
+            }
+
+            // 2) go_to_player('b64') → decoded may be 4shared / mega / gdrive / mp4upload / anything
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
-                    val decoded = String(Base64.decode(fixed, Base64.DEFAULT))
+                    val decoded = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
                     if (decoded.contains("drive.google.com/file/d/")) {
                         Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
-                            callback(newExtractorLink("Yonaplay", "Google Drive", "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
+                            val g = "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t"
+                            if (seen.add(g)) callback(newExtractorLink("Yonaplay", "Google Drive", g, ExtractorLinkType.VIDEO) {
                                 referer = "https://drive.google.com/"; quality = Qualities.Unknown.value
                             })
                         }
-                    } else if (decoded.startsWith("http")) {
-                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)
+                    } else if (decoded.startsWith("http") && seen.add(decoded)) {
+                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)   // ← recursion handles mega/4shared/everything
                     }
                 } catch (_: Exception) {}
             }
-            
-            // Extract direct video links (mp4, m3u8)
-            Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { match ->
-                val url = match.groupValues[1]
-                if (!url.contains("googleapis") && !url.contains("drive.google")) {
-                    callback(newExtractorLink("Yonaplay", "Yonaplay Direct", url, if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+
+            // 3) plain mega/4shared hrefs on the page
+            Regex("""https?://(?:mega\.nz|www\.4shared\.com|www\.mediafire\.com)/[^\s"'<>]+""").findAll(html).forEach {
+                if (seen.add(it.value)) routeLink(it.value, yonaplayUrl, subtitleCallback, callback)
+            }
+
+            // 4) iframes → recurse once
+            Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
+                var src = m.groupValues[1]
+                if (src.startsWith("//")) src = "https:$src"
+                if (src.startsWith("http") && !src.contains("yonaplay") && seen.add(src)) {
+                    routeLink(src, yonaplayUrl, subtitleCallback, callback)
+                }
+            }
+
+            // 5) direct mp4/m3u8 on page
+            Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
+                val url = m.groupValues[1]
+                if (!url.contains("googleapis") && !url.contains("drive.google") && seen.add(url)) {
+                    callback(newExtractorLink("Yonaplay", "Yonaplay Direct", url,
+                        if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                         referer = yonaplayUrl; quality = Qualities.Unknown.value
                     })
                 }
             }
-        } catch (e: Exception) {
-            println("WitAnimeDebug: Yonaplay error: ${e.message}")
-        }
+        } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
     }
 }
