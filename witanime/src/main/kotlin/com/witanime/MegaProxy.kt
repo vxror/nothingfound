@@ -2,6 +2,8 @@ package com.witanime
 
 import android.util.Base64
 import com.lagradost.cloudstream3.app
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import org.json.JSONArray
 import java.io.BufferedReader
@@ -45,7 +47,6 @@ object MegaProxy {
 
     suspend fun resolve(url: String): String? {
         return try {
-            // works with: /file/ID#KEY, /embed/ID#KEY, #!ID!KEY
             val m = Regex("""([A-Za-z0-9_-]{8})[!#]([A-Za-z0-9_-]{20,})""").find(url) ?: return null
             val fileId = m.groupValues[1]
             val key = try {
@@ -57,12 +58,13 @@ object MegaProxy {
             val aesKey = ByteArray(16) { (key[it].toInt() xor key[it + 16].toInt()).toByte() }
             val nonce = key.copyOfRange(16, 24)
 
-            // ✅ correct NiceHttp API: requestBody is a String param
+            // ✅ FIX: requestBody must be a real okhttp3.RequestBody in this API version
             val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
+                .toRequestBody("application/json".toMediaType())
             val resp = app.post(
                 "https://g.api.mega.co.nz/cs?id=${seq.incrementAndGet()}",
-                requestBody = body,
-                headers = mapOf("User-Agent" to EXTRACTOR_UA)
+                headers = mapOf("User-Agent" to EXTRACTOR_UA),
+                requestBody = body
             ).text
             val arr = JSONArray(resp)
             if (arr.length() == 0) return null
@@ -119,7 +121,6 @@ object MegaProxy {
             .build()
         app.baseClient.newCall(req).execute().use { resp ->
             val body = resp.body?.byteStream() ?: return
-            // AES-CTR: IV = nonce(8) + block counter(8); counter = start/16, skip start%16
             val iv = ByteBuffer.allocate(16)
             iv.put(file.nonce)
             iv.putLong(start / 16)
