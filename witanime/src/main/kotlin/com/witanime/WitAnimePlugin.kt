@@ -13,5 +13,6 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(Awish())
         registerExtractorAPI(Asnwish())
         registerExtractorAPI(CdnwishCom())
+        registerExtractorAPI(MediaFireExtractor())
     }
 }
