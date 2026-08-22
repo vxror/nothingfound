@@ -10,6 +10,7 @@ class WitAnimePlugin : Plugin() {
         registerMainAPI(WitAnime())
 
         registerExtractorAPI(VideaExtractor())
+        registerExtractorAPI(VideasFrExtractor())
         registerExtractorAPI(MailruExtractor())
 
         // StreamWish family
@@ -19,8 +20,7 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(CdnwishCom())
         registerExtractorAPI(EmbedWish())
 
-        // Dood (known domains registered for loadExtractor; unknown dood hosts
-        // are routed via isDoodLink() in routeLink and never miss)
+        // Dood — known domains registered; unknown dood hosts caught by isDoodLink() in routeLink
         registerExtractorAPI(DoodExtractor())
         registerExtractorAPI(DoodToExtractor())
         registerExtractorAPI(DoodLaExtractor())
@@ -37,7 +37,7 @@ class WitAnimePlugin : Plugin() {
         try { MegaProxy.start() } catch (e: Exception) {
             println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
         }
-        // NOTE: UniversalExtractor is called directly from routeLink — NOT registered,
-        // so it never shadows built-in extractors (mp4upload etc.)
+        // UniversalExtractor is invoked directly from routeLink — intentionally NOT registered,
+        // so it never shadows built-in extractors (mp4upload, uqload, streamtape, ...)
     }
 }
