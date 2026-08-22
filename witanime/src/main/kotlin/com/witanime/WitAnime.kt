@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mvvm.logError
-import org.json.JSONObject
 import org.json.JSONArray
 import java.net.URLEncoder
 import java.nio.charset.Charset
@@ -22,7 +21,6 @@ class WitAnime : MainAPI() {
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // ✅ from yh00.js: _m1+_m2+_m3+_m4 — the apiKey ROTATED, old hash was dead
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
     private val userAgent = EXTRACTOR_UA
@@ -134,29 +132,22 @@ class WitAnime : MainAPI() {
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
         suspend fun fetch(u: String) = try {
-            app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
+            app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data).text
         } catch (_: Exception) { "" }
 
-        fun sanitize(l: String): String {
-            val m = Regex("""https?://\S+""").find(l.trim()) ?: return ""
-            return m.value.trimEnd('"', '\'', ')', ';', ',')
-        }
-
-        fun findServers(html: String): List<Triple<String, String, String?>> {
-            val items = mutableListOf<Triple<String, String, String?>>()
+        fun findServers(html: String): List<Pair<String, String>> {
+            val items = mutableListOf<Pair<String, String>>()
             Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
                 val tag = m.groupValues[1]
                 val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
                 val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
-                val href = Regex("""href\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
-                if (sid != null) items.add(Triple(sid, label ?: "server-$sid", href))
+                if (sid != null) items.add(sid to (label ?: "server-$sid"))
             }
             return items
         }
 
-        // ════ WATCH SERVERS — exact port of yh00.js ════
-        // renderModuleContent(): reverse → clean → atob → slice(0,-off); off = d[parseInt(atob(k))]
-        fun decodeWatch(raw: String, cfg: JSONObject?): String {
+        // watch decode — exact port of yh00.js
+        fun decodeWatch(raw: String, cfg: org.json.JSONObject?): String {
             return try {
                 val cleaned = cleanBase64Chars(raw.reversed())
                 val decoded = b64Bytes(cleaned)
@@ -172,52 +163,26 @@ class WitAnime : MainAPI() {
             } catch (_: Exception) { "" }
         }
 
-        // ════ DOWNLOAD LINKS — exact port of cx2.js ════
-        // secret=atob(_m.r); seq=JSON.parse(xor(_x[i],secret)); chunks=_pN xor'd; arranged[seq[j]]=dec[j]; count=_b.l
+        // downloads — exact port of cx2.js (new _x/_b.l + legacy _s)
         fun decryptDownloads(html: String): List<String> {
             val out = mutableListOf<String>()
             try {
                 val mR = Regex("""var\s+_m\s*=\s*\{\s*"r"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return emptyList()
                 val secret = b64Bytes(mR)
                 if (secret.isEmpty()) return emptyList()
-
-                // NEW scheme: _x + _b.l
-                val xBlock = Regex("""var\s+_x\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
-                val xList = xBlock?.let { Regex(""""([^"]*)"""").findAll(it).map { m -> m.groupValues[1] }.toList() } ?: emptyList()
-                if (xList.isNotEmpty()) {
-                    val count = Regex(""""l"\s*:\s*(\d+)"""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: xList.size
-                    val pMap = mutableMapOf<Int, List<String>>()
-                    Regex("""var\s+_p(\d+)\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
-                        val n = m.groupValues[1].toIntOrNull() ?: return@forEach
-                        pMap[n] = Regex(""""([^"]*)"""").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
-                    }
-                    for (i in 0 until count) {
-                        val chunks = pMap[i] ?: continue
-                        val seqHex = xList.getOrNull(i) ?: continue
-                        val seqStr = trim(bytesStr(xor(hexBytes(seqHex), secret)))
-                        val seqArr = try { JSONArray(seqStr) } catch (_: Exception) { null } ?: continue
-                        val dec = chunks.map { trim(bytesStr(xor(hexBytes(it), secret))) }
-                        val arranged = Array(seqArr.length()) { "" }
-                        for (j in 0 until seqArr.length()) {
-                            val pos = seqArr.optInt(j)
-                            if (pos in arranged.indices) arranged[pos] = dec.getOrNull(j) ?: ""
-                        }
-                        out.add(arranged.joinToString(""))
-                    }
-                    return out
-                }
-
-                // LEGACY scheme: _s
-                val sBlock = Regex("""var\s+_s\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1) ?: return emptyList()
-                val sList = Regex("\"([^\"]*)\"").findAll(sBlock).map { it.groupValues[1] }.toList()
                 val pMap = mutableMapOf<Int, List<String>>()
                 Regex("""var\s+_p(\d+)\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
                     val n = m.groupValues[1].toIntOrNull() ?: return@forEach
-                    pMap[n] = Regex("\"([^\"]*)\"").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
+                    pMap[n] = Regex(""""([^"]*)"""").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
                 }
-                for (i in sList.indices) {
+                val seqList: List<String> = Regex("""var\s+_x\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+                    ?.let { Regex(""""([^"]*)"""").findAll(it).map { m -> m.groupValues[1] }.toList() }
+                    ?: Regex("""var\s+_s\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+                    ?.let { Regex("\"([^\"]*)\"").findAll(it).map { m -> m.groupValues[1] }.toList() }
+                    ?: emptyList()
+                for (i in seqList.indices) {
                     val chunks = pMap[i] ?: continue
-                    val seqStr = trim(bytesStr(xor(hexBytes(sList[i]), secret)))
+                    val seqStr = trim(bytesStr(xor(hexBytes(seqList[i]), secret)))
                     val seqArr = try { JSONArray(seqStr) } catch (_: Exception) { null } ?: continue
                     val dec = chunks.map { trim(bytesStr(xor(hexBytes(it), secret))) }
                     val arranged = Array(seqArr.length()) { "" }
@@ -234,52 +199,43 @@ class WitAnime : MainAPI() {
         return try {
             val html = fetch(data)
             if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
-            println("WitAnimeDebug: html len=${html.length}")
 
-            // _zT/_zV registries
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val resArr = zT?.let { t -> try { JSONArray(String(b64Bytes(t))) } catch (_: Exception) { null } }
             val cfgArr = zV?.let { v -> try { JSONArray(String(b64Bytes(v))) } catch (_: Exception) { null } }
-            println("WitAnimeDebug: zT=${zT != null} zV=${zV != null} resArr=${resArr?.length() ?: -1} cfgArr=${cfgArr?.length() ?: -1}")
-
             val servers = findServers(html)
-            println("WitAnimeDebug: servers=${servers.size}")
+            println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size}")
 
             val semaphore = Semaphore(6)
 
             suspend fun decodeAndRoute(sid: String, label: String) {
                 try {
-                    var link = ""
                     val idx = sid.toIntOrNull() ?: -1
-                    if (resArr != null && idx in 0 until resArr.length()) {
-                        val raw = resArr.optString(idx)
-                        val cfg = cfgArr?.optJSONObject(idx)
-                        link = decodeWatch(raw, cfg)
-                        println("WitAnimeDebug: [$label id=$idx] decode -> ${link.take(100)}")
-                    }
+                    if (resArr == null || idx !in 0 until resArr.length()) { println("WitAnimeDebug: [$label] no registry"); return }
+                    val link = decodeWatch(resArr.optString(idx), cfgArr?.optJSONObject(idx))
+                    println("WitAnimeDebug: [$label] -> ${link.take(90)}")
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
                             "$link&apiKey=$FRAMEWORK_HASH" else link
-                        routeLink(finalLink, data, subtitleCallback, callback)
-                    } else {
-                        println("WitAnimeDebug: [$label id=$idx] EMPTY")
+                        // ⏱ 20s hard cap per server — no more frozen loading
+                        withTimeoutOrNull(20_000) {
+                            routeLink(finalLink, data, subtitleCallback, callback)
+                        } ?: println("WitAnimeDebug: [$label] TIMEOUT")
                     }
                 } catch (_: Exception) {}
             }
 
             supervisorScope {
-                servers.map { (sid, label, _) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
+                servers.map { (sid, label) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
             }
 
-            // download links
             val dlLinks = decryptDownloads(html)
             println("WitAnimeDebug: downloads=${dlLinks.size}")
-            dlLinks.forEach { l -> if (l.contains("http")) println("WitAnimeDebug: dl -> ${l.take(100)}") }
             supervisorScope {
                 dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                     val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                    if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
+                    if (final.startsWith("http")) withTimeoutOrNull(20_000) { routeLink(final, data, subtitleCallback, callback) }
                 } catch (_: Exception) {} } } }.awaitAll()
             }
             true
@@ -302,20 +258,27 @@ class WitAnime : MainAPI() {
             linkHost(link).contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
-                if (!ok) {
-                    println("WitAnimeDebug: ⚠️ no extractor matched: $link — trying UniversalSniffer")
-                    UniversalExtractor().getUrl(link, referer, subtitleCallback, callback)
-                }
+                if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched: $link")
             }
         }
     }
 
-    /** Yonaplay = router */
+    /** 🔓 YONAPLAY v2 — catch-all base64 scanner finds mega/4shared/gdrive no matter the markup */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
-            val seen = mutableSetOf<String>()
+            val res = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent))
+            var html = res.text
+            println("WitAnimeDebug: Yona len=${html.length} final=${res.url}")
 
+            // follow meta-refresh / JS redirect (1 hop)
+            val redirect = Regex("""http-equiv=["']refresh["'][^>]*url=([^"'>]+)""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
+                ?: Regex("""location(?:\.href)?\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            if (redirect != null && redirect.startsWith("http") && !redirect.contains("yonaplay")) {
+                html = app.get(redirect, referer = res.url, headers = mapOf("User-Agent" to userAgent)).text
+                println("WitAnimeDebug: Yona redirect -> $redirect len=${html.length}")
+            }
+
+            val seen = mutableSetOf<String>()
             fun qualityOf(label: String) = when {
                 label.contains("1080") || label.contains("FHD") -> Qualities.P1080.value
                 label.contains("720") || label.contains("HD") -> Qualities.P720.value
@@ -324,6 +287,7 @@ class WitAnime : MainAPI() {
                 else -> Qualities.Unknown.value
             }
 
+            // 1) <source> tags
             Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { m ->
                 val url = m.groupValues[1]; val label = m.groupValues[2]
                 if (seen.add(url) && url.startsWith("http")) {
@@ -334,35 +298,41 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
-                var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
-                try {
-                    val decoded = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
-                    if (decoded.contains("drive.google.com/file/d/")) {
-                        Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
-                            val g = "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t"
-                            if (seen.add(g)) callback(newExtractorLink("Yonaplay", "Google Drive", g, ExtractorLinkType.VIDEO) {
-                                referer = "https://drive.google.com/"; quality = Qualities.Unknown.value
-                            })
-                        }
-                    } else if (decoded.startsWith("http") && seen.add(decoded)) {
-                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)
-                    }
-                } catch (_: Exception) {}
+            // 2) plain mega/4shared/mediafire/gdrive hrefs
+            Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|www\.mediafire\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
+                if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, callback) }
             }
 
-            Regex("""https?://(?:mega\.nz|www\.4shared\.com|www\.mediafire\.com)/[^\s"'<>]+""").findAll(html).forEach {
-                if (seen.add(it.value)) routeLink(it.value, yonaplayUrl, subtitleCallback, callback)
-            }
-
+            // 3) iframes → recurse once
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
                 if (src.startsWith("http") && !src.contains("yonaplay") && seen.add(src)) {
-                    routeLink(src, yonaplayUrl, subtitleCallback, callback)
+                    withTimeoutOrNull(15_000) { routeLink(src, yonaplayUrl, subtitleCallback, callback) }
                 }
             }
 
+            // 4) 🔑 CATCH-ALL: decode every base64 token; keep http results — finds go_to_player AND any new scheme
+            Regex("""[A-Za-z0-9+/=]{24,}""").findAll(html).map { it.value }.distinct().take(80).forEach { tok ->
+                val pad = tok.length % 4
+                val fixed = if (pad != 0) tok + "=".repeat(4 - pad) else tok
+                try {
+                    val d = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                    if (d.startsWith("http") && seen.add(d)) {
+                        println("WitAnimeDebug: Yona b64 -> ${d.take(90)}")
+                        if (d.contains("drive.google.com/file/d/")) {
+                            Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(d)?.groupValues?.get(1)?.let { fid ->
+                                callback(newExtractorLink("Yonaplay", "Google Drive",
+                                    "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
+                                    referer = "https://drive.google.com/"; quality = Qualities.Unknown.value
+                                })
+                            }
+                        } else withTimeoutOrNull(15_000) { routeLink(d, yonaplayUrl, subtitleCallback, callback) }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // 5) direct mp4/m3u8
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val url = m.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google") && seen.add(url)) {
@@ -372,6 +342,22 @@ class WitAnime : MainAPI() {
                     })
                 }
             }
+
+            // 6) nothing found → page is a JS shell → WebView network intercept
+            if (seen.isEmpty()) {
+                println("WitAnimeDebug: Yona empty → WebView intercept")
+                try {
+                    val wv = WebViewResolver(interceptUrl = Regex("""\.(m3u8|mp4)""", RegexOption.IGNORE_CASE))
+                    val r = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = wv)
+                    if (Regex("""\.(m3u8|mp4)""", RegexOption.IGNORE_CASE).containsMatchIn(r.url)) {
+                        callback(newExtractorLink("Yonaplay", "Yonaplay WV", r.url,
+                            if (r.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                            referer = yonaplayUrl; quality = Qualities.Unknown.value
+                        })
+                    }
+                } catch (_: Exception) {}
+            }
+            println("WitAnimeDebug: Yona emitted=${seen.size}")
         } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
     }
 }
