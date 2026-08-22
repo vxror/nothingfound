@@ -10,9 +10,20 @@ class WitAnimePlugin : Plugin() {
         registerMainAPI(WitAnime())
         registerExtractorAPI(VideaExtractor())
         registerExtractorAPI(MailruExtractor())
+        registerExtractorAPI(StreamWishExtractor())
         registerExtractorAPI(Awish())
         registerExtractorAPI(Asnwish())
         registerExtractorAPI(CdnwishCom())
         registerExtractorAPI(MediaFireExtractor())
+        registerExtractorAPI(DoodStreamExtractor())
+        registerExtractorAPI(FourSharedExtractor())
+        registerExtractorAPI(MegaProxyExtractor())
+        
+        // Start MegaProxy server
+        try {
+            MegaProxy.start()
+        } catch (e: Exception) {
+            println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
+        }
     }
 }
