@@ -7,39 +7,37 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class WitAnimePlugin : Plugin() {
     override fun load(context: Context) {
-        // 1. Register the Main Provider
         registerMainAPI(WitAnime())
-        
-        // 2. Register Video Host Extractors
-        registerExtractorAPI(VideaExtractor())       // Hungarian XML/RC4
-        registerExtractorAPI(VideasFrExtractor())    // French CDN m3u8
-        registerExtractorAPI(MailruExtractor())      // Mail.ru
-        
-        // 3. Register StreamWish Variants
+
+        registerExtractorAPI(VideaExtractor())
+        registerExtractorAPI(MailruExtractor())
+
+        // StreamWish family
         registerExtractorAPI(StreamWishExtractor())
         registerExtractorAPI(Awish())
         registerExtractorAPI(Asnwish())
         registerExtractorAPI(CdnwishCom())
-        
-        // 4. Register File Hosts
-        registerExtractorAPI(MediaFireExtractor())
+        registerExtractorAPI(EmbedWish())
+
+        // Dood (known domains registered for loadExtractor; unknown dood hosts
+        // are routed via isDoodLink() in routeLink and never miss)
+        registerExtractorAPI(DoodExtractor())
+        registerExtractorAPI(DoodToExtractor())
+        registerExtractorAPI(DoodLaExtractor())
+        registerExtractorAPI(DoodYtExtractor())
+        registerExtractorAPI(DoodWsExtractor())
+        registerExtractorAPI(Ds2PlayExtractor())
+        registerExtractorAPI(D000dExtractor())
+
+        registerExtractorAPI(FileMoonExtractor())
         registerExtractorAPI(FourSharedExtractor())
-        
-        // 5. Register DoodStream Variants
-        registerExtractorAPI(DoodStreamExtractor())
-        registerExtractorAPI(DoodStreamComExtractor())
-        registerExtractorAPI(DoodStreamToExtractor())
-        registerExtractorAPI(DoodStreamWatchExtractor())
-        
-        // 6. Register Mega & Universal Fallback
-        registerExtractorAPI(MegaProxyExtractor())
-        registerExtractorAPI(UniversalExtractor())
-        
-        // 7. Boot the local MegaProxy streaming server
-        try { 
-            MegaProxy.start() 
-        } catch (e: Exception) { 
-            println("WitAnimeDebug: MegaProxy start failed: ${e.message}") 
+        registerExtractorAPI(MediaFireExtractor())
+        registerExtractorAPI(MegaExtractor())
+
+        try { MegaProxy.start() } catch (e: Exception) {
+            println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
         }
+        // NOTE: UniversalExtractor is called directly from routeLink — NOT registered,
+        // so it never shadows built-in extractors (mp4upload etc.)
     }
 }
