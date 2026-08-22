@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 
-class DoodStreamExtractor : ExtractorApi() {
+open class DoodStreamExtractor : ExtractorApi() {
     override val name = "DoodStream"
     override val mainUrl = "https://doodstream.com"
     override val requiresReferer = false
