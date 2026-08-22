@@ -2,8 +2,10 @@ package com.witanime
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.network.WebViewResolver
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.mvvm.logError
 import org.json.JSONObject
 import org.json.JSONArray
@@ -13,13 +15,17 @@ import kotlinx.coroutines.sync.withPermit
 import java.nio.charset.Charset
 
 class WitAnime : MainAPI() {
-    override var mainUrl = "https://witanime.you" // Change to .red if .you is down
+    override var mainUrl = "https://witanime.you" 
     override var name = "WitAnime"
     override val hasMainPage = true
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val userAgent = "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36"
+
+    init {
+        Log.d("WitAnime_DEBUG", "🔥 WitAnime class instantiated!")
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 0) return newHomePageResponse(emptyList(), hasNext = false)
@@ -52,15 +58,18 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // 🎯 CRITICAL: WebViewResolver bypasses Cloudflare/JS challenges
+        Log.d("WitAnime_DEBUG", "🔥 load() called for $url")
+        // 🎯 WebViewResolver is critical for bypassing the site's JS/Cloudflare protection
         val document = app.get(url, interceptor = WebViewResolver(interceptUrl = Regex(url))).document
         
         val title = document.selectFirst("h1.anime-details-title")?.text()?.trim() ?: ""
         val poster = document.selectFirst("div.anime-thumbnail img")?.attr("src")
         val description = document.selectFirst("p.anime-story")?.text()?.trim()
         val genres = document.select("ul.anime-genres li a").map { it.text() }
-        var status = ShowStatus.Ongoing; var tvType = TvType.Anime
-
+        
+        var status = ShowStatus.Ongoing
+        var tvType = TvType.Anime
+        
         document.select(".anime-info").forEach {
             val infoText = it.text()
             if (infoText.startsWith("حالة الأنمي:")) status = if (infoText.contains("مكتمل")) ShowStatus.Completed else ShowStatus.Ongoing
@@ -68,35 +77,48 @@ class WitAnime : MainAPI() {
         }
 
         var episodes = listOf<Episode>()
-        val match = Regex("""var\s+processedEpisodeData\s*=\s*'([^']+)'""").find(document.html())
+        val regex = Regex("""var\s+processedEpisodeData\s*=\s*'([^']+)'""")
+        val match = regex.find(document.html())
         val encodedData = match?.groupValues?.get(1)
+
         if (!encodedData.isNullOrBlank()) {
             try {
                 val parts = encodedData.split(".")
                 if (parts.size == 2) {
                     val p1 = String(Base64.decode(parts[0], Base64.DEFAULT))
                     val p2 = String(Base64.decode(parts[1], Base64.DEFAULT))
-                    val decoded = StringBuilder()
-                    for (i in p1.indices) decoded.append((p1[i].code xor p2[i % p2.length].code).toChar())
-                    val list = AppUtils.parseJson(decoded.toString()) as? List<Map<String, Any>>
-                    if (list != null) {
-                        episodes = list.mapNotNull { ep ->
+                    val decodedJson = StringBuilder()
+                    for (i in p1.indices) {
+                        decodedJson.append((p1[i].code xor p2[i % p2.length].code).toChar())
+                    }
+                    val episodesList = parseJson(decodedJson.toString()) as? List<Map<String, Any>>
+                    if (episodesList != null) {
+                        episodes = episodesList.mapNotNull { ep ->
                             val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
-                            newEpisode(epUrl) { name = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة" }
+                            val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
+                            newEpisode(epUrl) { this.name = epName }
                         }
                     }
                 }
-            } catch (e: Exception) { logError(e) }
+            } catch (e: Exception) {
+                Log.e("WitAnime_DEBUG", "❌ Episode decoding failed", e)
+                logError(e)
+            }
         }
 
         return newAnimeLoadResponse(title, url, tvType) {
-            posterUrl = poster; plot = description; tags = genres; showStatus = status
+            this.posterUrl = poster
+            this.plot = description
+            this.tags = genres
+            this.showStatus = status
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        Log.d("WitAnime_DEBUG", "🔥 loadLinks() called")
         val FRAMEWORK_HASH = "1c0f3441-e3c2-4023-9e8b-bee77ff59adf"
+
         fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
         fun b64Bytes(i: String?) = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
         fun bytesStr(b: ByteArray) = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
@@ -130,6 +152,7 @@ class WitAnime : MainAPI() {
 
         fun parsePx9(js: String): Triple<String?, List<String>, Map<String, List<String>>> {
             val mVal = Regex("""var\s+_m\s*=\s*\{\s*\"r\"\s*:\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
+            // 🎯 Kept _s exactly as it was in your old working code
             val sList = Regex("""var\s+_s\s*=\s*\[(.*?)\]\s*;""", RegexOption.DOT_MATCHES_ALL).find(js)?.let { Regex("\"([^\"]*)\"").findAll(it.groupValues[1]).map { m -> m.groupValues[1] }.toList() } ?: emptyList()
             val pMap = mutableMapOf<String, List<String>>()
             Regex("""var\s+(_p\d+)\s*=\s*\[\s*(.*?)\s*\]\s*;""", RegexOption.DOT_MATCHES_ALL).findAll(js).forEach { m -> pMap[m.groupValues[1]] = Regex("\"([^\"]*)\"").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList() }
@@ -201,12 +224,7 @@ class WitAnime : MainAPI() {
                 servers.map { (sid, _) -> async(Dispatchers.IO) { semaphore.withPermit { try {
                     val link = decodeResource(lookup(resourceReg, sid), paramOffset(lookup(configReg, sid)))
                     val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
-                    if (finalLink.isNotBlank()) {
-                        if (finalLink.contains("yonaplay.net")) decodeYonaplayAndLoad(finalLink, subtitleCallback, callback)
-                        else if (finalLink.contains("videa.hu")) VideaExtractor().getUrl(finalLink, null, subtitleCallback, callback)
-                        else if (finalLink.contains("my.mail.ru") || finalLink.contains("/video/embed/")) MailruExtractor().getUrl(finalLink, null, subtitleCallback, callback)
-                        else loadExtractor(finalLink, mainUrl, subtitleCallback, callback)
-                    }
+                    if (finalLink.isNotBlank()) routeLink(finalLink, mainUrl, subtitleCallback, callback)
                 } catch (_: Exception) {} } } }.awaitAll()
             }
 
@@ -224,10 +242,21 @@ class WitAnime : MainAPI() {
 
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                if (final.startsWith("http")) loadExtractor(final, data, subtitleCallback, callback)
+                if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
             } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
+    }
+
+    private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
+        when {
+            host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
+            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
+            // 🎯 Relies entirely on Cloudstream's native, powerful loadExtractor for everything else
+            else -> loadExtractor(link, mainUrl, subtitleCallback, callback)
+        }
     }
 
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
