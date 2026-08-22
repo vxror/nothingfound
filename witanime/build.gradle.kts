@@ -1,25 +1,4 @@
 version = 1
-plugins {
-    id("com.android.library")
-    id("org.jetbrains.kotlin.android")
-}
-
-repositories {
-    mavenCentral()
-    maven { url = uri("https://jitpack.io") }
-}
-
-android {
-    namespace = "com.witanime"
-    compileSdk = 34
-    defaultConfig {
-        minSdk = 21
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
-    }
-}
 
 kotlin {
     compilerOptions {
@@ -35,6 +14,9 @@ dependencies {
     val cloudstream by configurations
     cloudstream("com.lagradost:cloudstream3:pre-release")
 
+    // 🎯 COPILOT'S CRITICAL FIX: Prevents silent ClassNotFoundException
+    implementation("org.json:json:20231013")
+    
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
     implementation("com.github.Blatzar:NiceHttp:0.4.11")
     implementation("org.jsoup:jsoup:1.18.3")
