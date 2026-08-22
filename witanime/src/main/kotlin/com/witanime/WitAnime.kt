@@ -25,8 +25,6 @@ class WitAnime : MainAPI() {
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     private val cfKiller = CloudflareKiller()
-
-    // matches any witanime mirror, so .cyou -> .you redirects don't break it
     private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
 
     private fun isChallenge(doc: Document): Boolean {
@@ -244,7 +242,10 @@ class WitAnime : MainAPI() {
                             finalLink.contains("yonaplay.net", true) -> decodeYonaplayAndLoad(finalLink, subtitleCallback, callback)
                             finalLink.contains("videa.hu", true) -> VideaExtractor().getUrl(finalLink, null, subtitleCallback, callback)
                             finalLink.contains("my.mail.ru", true) || finalLink.contains("/video/embed/", true) -> MailruExtractor().getUrl(finalLink, null, subtitleCallback, callback)
-                            else -> loadExtractor(finalLink, "$mainUrl/", subtitleCallback, callback)
+                            else -> {
+                                val ok = loadExtractor(finalLink, "$mainUrl/", subtitleCallback, callback)
+                                if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched: $finalLink")
+                            }
                         }
                     }
                 } catch (_: Exception) {} } } }.awaitAll()
@@ -264,7 +265,10 @@ class WitAnime : MainAPI() {
 
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                if (final.startsWith("http")) loadExtractor(final, data, subtitleCallback, callback)
+                if (final.startsWith("http")) {
+                    val ok = loadExtractor(final, data, subtitleCallback, callback)
+                    if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched (dl): $final")
+                }
             } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
