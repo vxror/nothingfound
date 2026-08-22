@@ -238,15 +238,7 @@ class WitAnime : MainAPI() {
                     val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
                     println("WitAnimeDebug: server $sid -> $finalLink")
                     if (finalLink.isNotBlank()) {
-                        when {
-                            finalLink.contains("yonaplay.net", true) -> decodeYonaplayAndLoad(finalLink, subtitleCallback, callback)
-                            finalLink.contains("videa.hu", true) -> VideaExtractor().getUrl(finalLink, null, subtitleCallback, callback)
-                            finalLink.contains("my.mail.ru", true) || finalLink.contains("/video/embed/", true) -> MailruExtractor().getUrl(finalLink, null, subtitleCallback, callback)
-                            else -> {
-                                val ok = loadExtractor(finalLink, "$mainUrl/", subtitleCallback, callback)
-                                if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched: $finalLink")
-                            }
-                        }
+                        routeLink(finalLink, data, subtitleCallback, callback)
                     }
                 } catch (_: Exception) {} } } }.awaitAll()
             }
@@ -266,30 +258,88 @@ class WitAnime : MainAPI() {
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
                 if (final.startsWith("http")) {
-                    val ok = loadExtractor(final, data, subtitleCallback, callback)
-                    if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched (dl): $final")
+                    routeLink(final, data, subtitleCallback, callback)
                 }
             } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
     }
 
+    private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
+        when {
+            host.contains("mega.nz") || host.contains("mega.co.nz") -> {
+                val local = MegaProxy.resolve(link)
+                if (local != null) {
+                    callback(newExtractorLink("Mega", "Mega.nz (Proxy)", local, ExtractorLinkType.VIDEO) {
+                        this.referer = referer ?: ""; this.quality = Qualities.Unknown.value
+                    })
+                } else {
+                    loadExtractor(link, mainUrl, subtitleCallback, callback)
+                }
+            }
+            host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
+            host.contains("videa.hu") || host.contains("videa.fr") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("dood") || host.contains("dstream") -> DoodStreamExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
+            else -> {
+                val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
+                if (!ok) println("WitAnimeDebug: ⚠️ no extractor matched: $link")
+            }
+        }
+    }
+
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
+            
+            // Extract all quality variants
+            val qualityRegex = Regex("""<source[^>]*src=["']([^"']+)["'][^>]*label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            qualityRegex.findAll(html).forEach { match ->
+                val url = match.groupValues[1]
+                val label = match.groupValues[2]
+                val q = when {
+                    label.contains("1080") || label.contains("FHD") -> Qualities.P1080.value
+                    label.contains("720") || label.contains("HD") -> Qualities.P720.value
+                    label.contains("480") -> Qualities.P480.value
+                    label.contains("360") -> Qualities.P360.value
+                    else -> Qualities.Unknown.value
+                }
+                callback(newExtractorLink("Yonaplay", "Yonaplay $label", url, ExtractorLinkType.M3U8) {
+                    this.referer = yonaplayUrl
+                    this.quality = q
+                })
+            }
+            
+            // Extract Google Drive links
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
                     val decoded = String(Base64.decode(fixed, Base64.DEFAULT))
                     if (decoded.contains("drive.google.com/file/d/")) {
                         Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
-                            callback(newExtractorLink("Yonaplay", "Google Drive", "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) { referer = "https://drive.google.com/"; quality = Qualities.Unknown.value })
-                            return@forEach
+                            callback(newExtractorLink("Yonaplay", "Google Drive", "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
+                                referer = "https://drive.google.com/"; quality = Qualities.Unknown.value
+                            })
                         }
+                    } else if (decoded.startsWith("http")) {
+                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)
                     }
-                    loadExtractor(decoded, "$mainUrl/", subtitleCallback, callback)
                 } catch (_: Exception) {}
             }
-        } catch (_: Exception) {}
+            
+            // Extract direct video links
+            Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { match ->
+                val url = match.groupValues[1]
+                if (!url.contains("googleapis") && !url.contains("drive.google")) {
+                    callback(newExtractorLink("Yonaplay", "Yonaplay Direct", url, if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                        referer = yonaplayUrl; quality = Qualities.Unknown.value
+                    })
+                }
+            }
+        } catch (e: Exception) {
+            println("WitAnimeDebug: Yonaplay error: ${e.message}")
+        }
     }
 }
