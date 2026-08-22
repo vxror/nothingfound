@@ -3,6 +3,7 @@ package com.witanime
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.logError
+import com.lagradost.cloudstream3.network.CloudflareKiller   // ← FIX #1
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.json.JSONArray
@@ -15,19 +16,17 @@ import kotlinx.coroutines.sync.withPermit
 
 class WitAnime : MainAPI() {
 
-    // ⚠️ FIX #1: PUT THE REAL DOMAIN YOU OPEN IN YOUR BROWSER HERE (no trailing slash!)
-    // "witanime.you" is not a real domain — every request was going to a dead host.
-    override var mainUrl = "https://witanime.net"   // <-- CHANGE to your real working domain
+    // ⚠️ PUT YOUR REAL WORKING DOMAIN HERE (https://..., no trailing slash)
+    override var mainUrl = "https://witanime.net"
     override var name = "WitAnime"
     override val hasMainPage = true
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // FIX #2: modern UA (old Chrome/83 mobile UA is often blocked)
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-    // FIX #3: Cloudflare bypass used on EVERY request (does nothing if site has no CF)
-    private val cfKiller by lazy { CloudflareKiller() }
+    // FIX #1: direct init instead of `by lazy` (the lazy delegate caused the error cascade when the import was missing)
+    private val cfKiller = CloudflareKiller()
 
     private suspend fun getDocument(url: String, referer: String? = null): Document? = try {
         val res = app.get(url, referer = referer, headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
@@ -48,7 +47,7 @@ class WitAnime : MainAPI() {
                 val itemUrl = fixUrl(a?.attr("href") ?: return@mapNotNull null)
                 val itemName = (if (isEpisodeList) a?.text() else it.selectFirst(".anime-card-title a")?.text()) ?: ""
                 val img = it.selectFirst("img")
-                val itemPoster = img?.attr("src")?.ifBlank { img.attr("data-src") }  // lazy-load fallback
+                val itemPoster = img?.attr("src")?.ifBlank { img.attr("data-src") }
                 val finalTitle = if (isEpisodeList) "$itemName - ${it.selectFirst(".episodes-card-title a")?.text() ?: ""}" else itemName
                 newAnimeSearchResponse(finalTitle, itemUrl, TvType.Anime) { posterUrl = fixUrlNull(itemPoster) }
             }
@@ -60,7 +59,6 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // FIX #4: URL-encode the query (Arabic text/spaces broke the old URL)
         val q = URLEncoder.encode(query, "UTF-8")
         val document = getDocument("$mainUrl/?search_param=animes&s=$q") ?: return emptyList()
         return document.select("div.anime-list-content div.anime-card-container").mapNotNull {
@@ -73,7 +71,6 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // FIX #5: WebViewResolver(Regex(url)) removed — broken regex + CF challenge page risk
         val document = getDocument(url) ?: throw ErrorLoadingException("تعذر تحميل $url")
 
         val title = document.selectFirst("h1.anime-details-title")?.text()?.trim() ?: ""
@@ -113,13 +110,12 @@ class WitAnime : MainAPI() {
             } catch (e: Exception) { logError(e) }
         }
 
-        // FIX #6: fallback — read episode links directly from HTML if the JS var wasn't found
         if (episodes.isEmpty()) {
             episodes = document.select("a[href*='/episode/'], div.episodes-card-container a").mapNotNull { el ->
                 val href = fixUrl(el.attr("href")).takeIf { it.startsWith("http") } ?: return@mapNotNull null
                 val name = el.text().trim().ifBlank { el.selectFirst("h3,span")?.text()?.trim() ?: "" }
                 newEpisode(href) { this.name = name }
-            }.distinctBy { it.url }
+            }.distinctBy { it.data }   // ← FIX #2: Episode has .data, not .url
         }
 
         return newAnimeLoadResponse(title, url, tvType) {
@@ -141,7 +137,6 @@ class WitAnime : MainAPI() {
         fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
-        // FIX #7: CF bypass + only accept successful responses
         suspend fun fetch(u: String) = try {
             val r = app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller)
             if (r.isSuccessful) r.text else ""
@@ -291,7 +286,6 @@ class WitAnime : MainAPI() {
                             return@forEach
                         }
                     }
-                    // FIX #8: referer was missing here
                     loadExtractor(decoded, mainUrl, subtitleCallback, callback)
                 } catch (_: Exception) {}
             }
