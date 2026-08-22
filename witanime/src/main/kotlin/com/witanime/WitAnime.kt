@@ -2,22 +2,21 @@ package com.witanime
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.mvvm.logError
-import com.lagradost.cloudstream3.network.CloudflareKiller   // ← FIX #1
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.mvvm.logError
 import org.json.JSONObject
 import org.json.JSONArray
-import org.jsoup.nodes.Document
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import org.jsoup.nodes.Document
 
 class WitAnime : MainAPI() {
-
-    // ⚠️ PUT YOUR REAL WORKING DOMAIN HERE (https://..., no trailing slash)
-    override var mainUrl = "https://witanime.cyou"
+    override var mainUrl = "https://witanime.you"
     override var name = "WitAnime"
     override val hasMainPage = true
     override var lang = "ar"
@@ -25,18 +24,29 @@ class WitAnime : MainAPI() {
 
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-    // FIX #1: direct init instead of `by lazy` (the lazy delegate caused the error cascade when the import was missing)
     private val cfKiller = CloudflareKiller()
 
-    private suspend fun getDocument(url: String, referer: String? = null): Document? = try {
-        val res = app.get(url, referer = referer, headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
-        if (res.isSuccessful) res.document else null
-    } catch (e: Exception) { logError(e); null }
+    // matches any witanime mirror, so .cyou -> .you redirects don't break it
+    private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
+
+    private fun isChallenge(doc: Document): Boolean {
+        val h = doc.html()
+        return h.contains("Just a moment") || h.contains("challenge-platform") || h.contains("cf-chl")
+    }
+
+    private suspend fun fetchDoc(url: String): Document {
+        val fast = try {
+            val d = app.get(url, headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller).document
+            if (!isChallenge(d)) d else null
+        } catch (e: Exception) { null }
+        return fast ?: app.get(url, interceptor = wvResolver).document
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
-        val document = getDocument(mainUrl)
-            ?: throw ErrorLoadingException("تعذر تحميل $mainUrl — الدومين خطأ أو الحماية تمنع الطلب")
+        val document = try { fetchDoc(mainUrl) } catch (e: Exception) {
+            throw ErrorLoadingException("فشل تحميل الموقع: ${e.message}")
+        }
+        println("WitAnimeDebug: title=${document.title()} widgets=${document.select("div.main-widget").size}")
 
         val homePageList = ArrayList<HomePageList>()
         document.select("div.main-widget").forEach { widget ->
@@ -53,14 +63,12 @@ class WitAnime : MainAPI() {
             }
             if (items.isNotEmpty()) homePageList.add(HomePageList(title, items))
         }
-        if (homePageList.isEmpty())
-            throw ErrorLoadingException("الصفحة فتحت لكن ما في أقسام — الـ selectors تحتاج تحديث")
         return newHomePageResponse(homePageList, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8")
-        val document = getDocument("$mainUrl/?search_param=animes&s=$q") ?: return emptyList()
+        val url = "$mainUrl/?search_param=animes&s=" + URLEncoder.encode(query, "UTF-8")
+        val document = try { fetchDoc(url) } catch (e: Exception) { return emptyList() }
         return document.select("div.anime-list-content div.anime-card-container").mapNotNull {
             val href = it.selectFirst("div.anime-card-poster a")?.attr("href") ?: return@mapNotNull null
             val title = it.selectFirst("div.anime-card-title h3 a")?.text() ?: return@mapNotNull null
@@ -71,7 +79,7 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = getDocument(url) ?: throw ErrorLoadingException("تعذر تحميل $url")
+        val document = fetchDoc(url)
 
         val title = document.selectFirst("h1.anime-details-title")?.text()?.trim() ?: ""
         val poster = document.selectFirst("div.anime-thumbnail img")?.attr("src")
@@ -89,34 +97,24 @@ class WitAnime : MainAPI() {
         var episodes = listOf<Episode>()
         val match = Regex("""var\s+processedEpisodeData\s*=\s*'([^']+)'""").find(document.html())
         val encodedData = match?.groupValues?.get(1)
-
         if (!encodedData.isNullOrBlank()) {
             try {
                 val parts = encodedData.split(".")
                 if (parts.size == 2) {
                     val p1 = String(Base64.decode(parts[0], Base64.DEFAULT))
                     val p2 = String(Base64.decode(parts[1], Base64.DEFAULT))
-                    val decodedJson = StringBuilder()
-                    for (i in p1.indices) decodedJson.append((p1[i].code xor p2[i % p2.length].code).toChar())
-                    val episodesList = AppUtils.parseJson(decodedJson.toString()) as? List<Map<String, Any>>
-                    if (episodesList != null) {
-                        episodes = episodesList.mapNotNull { ep ->
-                            val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
-                            val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
-                            newEpisode(epUrl) { this.name = epName }
-                        }
+                    val sb = StringBuilder()
+                    for (i in p1.indices) sb.append((p1[i].code xor p2[i % p2.length].code).toChar())
+                    val eps = AppUtils.parseJson(sb.toString()) as? List<Map<String, Any>>
+                    if (eps != null) episodes = eps.mapNotNull { ep ->
+                        val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
+                        val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
+                        newEpisode(epUrl) { this.name = epName }
                     }
                 }
             } catch (e: Exception) { logError(e) }
         }
-
-        if (episodes.isEmpty()) {
-            episodes = document.select("a[href*='/episode/'], div.episodes-card-container a").mapNotNull { el ->
-                val href = fixUrl(el.attr("href")).takeIf { it.startsWith("http") } ?: return@mapNotNull null
-                val name = el.text().trim().ifBlank { el.selectFirst("h3,span")?.text()?.trim() ?: "" }
-                newEpisode(href) { this.name = name }
-            }.distinctBy { it.data }   // ← FIX #2: Episode has .data, not .url
-        }
+        println("WitAnimeDebug: loaded '$title' episodes=${episodes.size}")
 
         return newAnimeLoadResponse(title, url, tvType) {
             this.posterUrl = fixUrlNull(poster)
@@ -138,8 +136,7 @@ class WitAnime : MainAPI() {
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
         suspend fun fetch(u: String) = try {
-            val r = app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller)
-            if (r.isSuccessful) r.text else ""
+            app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
         } catch (_: Exception) { "" }
 
         fun paramOffset(config: Any?): Int {
@@ -214,6 +211,7 @@ class WitAnime : MainAPI() {
         return try {
             val html = fetch(data)
             if (html.isBlank()) return false
+
             var zG: String? = null; var zH: String? = null
             val inlineScripts = Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.toList()
             for (s in inlineScripts) {
@@ -233,13 +231,22 @@ class WitAnime : MainAPI() {
             fun toRegistry(b64: String?): Any? = try { val d = bytesStr(b64Bytes(b64)); try { JSONObject(d) } catch (_: Exception) { try { JSONArray(d) } catch (_: Exception) { null } } } catch (_: Exception) { null }
             val resourceReg = toRegistry(zG); val configReg = toRegistry(zH)
             val servers = findServers(html)
-            val semaphore = Semaphore(6)
+            println("WitAnimeDebug: servers=${servers.size} zG=${zG != null} zH=${zH != null}")
 
+            val semaphore = Semaphore(6)
             supervisorScope {
                 servers.map { (sid, _) -> async(Dispatchers.IO) { semaphore.withPermit { try {
                     val link = decodeResource(lookup(resourceReg, sid), paramOffset(lookup(configReg, sid)))
                     val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
-                    if (finalLink.isNotBlank()) routeLink(finalLink, mainUrl, subtitleCallback, callback)
+                    println("WitAnimeDebug: server $sid -> $finalLink")
+                    if (finalLink.isNotBlank()) {
+                        when {
+                            finalLink.contains("yonaplay.net", true) -> decodeYonaplayAndLoad(finalLink, subtitleCallback, callback)
+                            finalLink.contains("videa.hu", true) -> VideaExtractor().getUrl(finalLink, null, subtitleCallback, callback)
+                            finalLink.contains("my.mail.ru", true) || finalLink.contains("/video/embed/", true) -> MailruExtractor().getUrl(finalLink, null, subtitleCallback, callback)
+                            else -> loadExtractor(finalLink, "$mainUrl/", subtitleCallback, callback)
+                        }
+                    }
                 } catch (_: Exception) {} } } }.awaitAll()
             }
 
@@ -257,25 +264,15 @@ class WitAnime : MainAPI() {
 
             supervisorScope { decryptPx9(px_mr, px_s, px_p).map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                 val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
+                if (final.startsWith("http")) loadExtractor(final, data, subtitleCallback, callback)
             } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
     }
 
-    private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val host = try { java.net.URI(link).host?.lowercase() ?: "" } catch (e: Exception) { "" }
-        when {
-            host.contains("yonaplay.net") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
-            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
-            else -> loadExtractor(link, mainUrl, subtitleCallback, callback)
-        }
-    }
-
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val html = app.get(yonaplayUrl, referer = mainUrl, headers = mapOf("User-Agent" to userAgent)).text
+            val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
@@ -286,7 +283,7 @@ class WitAnime : MainAPI() {
                             return@forEach
                         }
                     }
-                    loadExtractor(decoded, mainUrl, subtitleCallback, callback)
+                    loadExtractor(decoded, "$mainUrl/", subtitleCallback, callback)
                 } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
