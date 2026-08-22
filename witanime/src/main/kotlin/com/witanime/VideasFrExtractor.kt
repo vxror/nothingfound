@@ -17,10 +17,10 @@ class VideasFrExtractor : ExtractorApi() {
         val found = LinkedHashSet<String>()
         val m3u8Rx = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
 
-        // L0: link is ALREADY a direct m3u8 (cdn.videas.fr/...playlist.m3u8 from download list)
+        // L0: already a direct m3u8
         if (url.contains(".m3u8")) { emit(url, url, callback); return }
 
-        // L1: embed page app.videas.fr/embed/media/{uuid} — find stream in page/JSON
+        // L1: embed page scan
         try {
             val raw = app.get(url, headers = headers, referer = referer).text
             val cleaned = raw.replace("\\/", "/").replace("\\\"", "\"")
@@ -29,7 +29,7 @@ class VideasFrExtractor : ExtractorApi() {
                 .forEach { found.add(it.groupValues[1]) }
         } catch (e: Exception) { println("WitAnimeDebug: VideasFr L1 fail: ${e.message}") }
 
-        // L2: player loads the playlist via XHR → WebView network intercept
+        // L2: WebView network intercept
         if (found.isEmpty()) {
             try {
                 val res = app.get(url, headers = headers, referer = referer,
@@ -42,8 +42,8 @@ class VideasFrExtractor : ExtractorApi() {
         found.filter { it.startsWith("http") }.forEach { emit(url, it, callback) }
     }
 
-    private fun emit(pageUrl: String, link: String, callback: (ExtractorLink) -> Unit) {
-        // /hlsv1/ = adaptive master playlist → Unknown, player picks quality
+    // ✅ FIX: suspend — newExtractorLink is suspend in this API version
+    private suspend fun emit(pageUrl: String, link: String, callback: (ExtractorLink) -> Unit) {
         val q = Regex("""(\d{3,4})p""").find(link)?.groupValues?.get(1)
         callback(
             newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
