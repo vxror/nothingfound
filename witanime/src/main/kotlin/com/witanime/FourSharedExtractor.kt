@@ -10,30 +10,19 @@ class FourSharedExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val html = app.get(url, referer = referer).text
-            
-            // Try to find direct download link
-            val link = Regex("""downloadUrl\s*[:=]\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                ?: Regex("""data-url=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                ?: Regex("""href=["']([^"']*download[^"']*)["']""").find(html)?.groupValues?.get(1)
+            val res = app.get(url, referer = referer, headers = mapOf("User-Agent" to EXTRACTOR_UA))
+            val html = res.text
+            val doc = res.document
+            val link = doc.selectFirst("video source[src]")?.attr("src")?.takeIf { it.startsWith("http") }
+                ?: Regex("""downloadUrl\s*[:=]\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                ?: Regex(""""(https?://[^"]+/(?:download|videoplay)[^"]*)"""").find(html)?.groupValues?.get(1)
                 ?: return
-            
-            val finalLink = if (link.startsWith("//")) "https:$link" else link
-            
-            callback(
-                newExtractorLink(name, name, finalLink, ExtractorLinkType.VIDEO) {
-                    this.referer = url
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-        } catch (e: Exception) {
-            println("WitAnimeDebug: 4Shared error: ${e.message}")
-        }
+            callback(newExtractorLink(name, name, link, ExtractorLinkType.VIDEO) {
+                this.referer = "$mainUrl/"
+            })
+        } catch (e: Exception) { println("WitAnimeDebug: 4Shared error: ${e.message}") }
     }
 }
