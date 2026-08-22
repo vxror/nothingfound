@@ -260,11 +260,12 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER — wildcard matching means new dood/wish/mega domains work without code changes */
+    /** ⚡ THE ROUTER — wildcard matching, videas.fr included */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         when {
             linkHost(link).contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
             linkHost(link).contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
+            linkHost(link).contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, callback)
             linkHost(link).contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
             isMegaLink(link) -> MegaExtractor().getUrl(link, referer, subtitleCallback, callback)
             isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, callback)
@@ -282,7 +283,7 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** Yonaplay = router: b64 players, iframes, mega hrefs ALL recurse into routeLink */
+    /** Yonaplay = router: b64 players, iframes, mega/4shared hrefs ALL recurse into routeLink */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val html = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent)).text
@@ -307,7 +308,7 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 2) go_to_player('b64') → decoded may be 4shared / mega / gdrive / mp4upload / anything
+            // 2) go_to_player('b64') → may decode to 4shared / mega / gdrive / mp4upload / anything
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { encoded ->
                 var fixed = encoded; val pad = encoded.length % 4; if (pad != 0) fixed += "=".repeat(4 - pad)
                 try {
@@ -320,17 +321,17 @@ class WitAnime : MainAPI() {
                             })
                         }
                     } else if (decoded.startsWith("http") && seen.add(decoded)) {
-                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)   // ← recursion handles mega/4shared/everything
+                        routeLink(decoded, yonaplayUrl, subtitleCallback, callback)
                     }
                 } catch (_: Exception) {}
             }
 
-            // 3) plain mega/4shared hrefs on the page
+            // 3) plain mega/4shared/mediafire hrefs on the page
             Regex("""https?://(?:mega\.nz|www\.4shared\.com|www\.mediafire\.com)/[^\s"'<>]+""").findAll(html).forEach {
                 if (seen.add(it.value)) routeLink(it.value, yonaplayUrl, subtitleCallback, callback)
             }
 
-            // 4) iframes → recurse once
+            // 4) iframes → recurse
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
