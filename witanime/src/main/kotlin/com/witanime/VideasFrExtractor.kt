@@ -1,24 +1,13 @@
 package com.witanime
 
-import android.net.Uri
-import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.jsoup.Jsoup
-import org.jsoup.parser.Parser
-import java.nio.charset.StandardCharsets
-import javax.crypto.Cipher
-import javax.crypto.spec.SecretKeySpec
-import kotlin.random.Random
+import com.lagradost.cloudstream3.network.WebViewResolver
 
-open class VideaExtractor : ExtractorApi() {
-    override val name: String = "Videa"
-    override val mainUrl: String = "https://videa.hu"
-    override val requiresReferer: Boolean = false
-
-    private val STUPID_KEY = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p"
+class VideasFrExtractor : ExtractorApi() {
+    override val name = "VideasFr"
+    override val mainUrl = "https://videas.fr"
+    override val requiresReferer = false
 
     override suspend fun getUrl(
         url: String,
@@ -27,132 +16,54 @@ open class VideaExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val iframeSrc = url.trim()
-            if (iframeSrc.isBlank()) return
-
-            val pageResp = app.get(iframeSrc).text
-            val nonceMatch = Regex("_xt\\s*=\\s*\"([^\"]+)\"").find(pageResp) ?: return
-            val nonce = nonceMatch.groupValues[1]
-
-            val paramL = if (nonce.length >= 32) nonce.substring(0, 32) else nonce.padEnd(32, 'a')
-            val paramSPart = if (nonce.length > 32) nonce.substring(32) else ""
-
-            val resultBuilder = StringBuilder()
-            for (i in 0 until 32) {
-                val ch = paramL.getOrNull(i) ?: 'a'
-                val idxInStupid = STUPID_KEY.indexOf(ch).takeIf { it >= 0 } ?: 0
-                val index = i - (idxInStupid - 31)
-                val safeIndex = when {
-                    paramSPart.isEmpty() -> 0
-                    index < 0 -> 0
-                    index >= paramSPart.length -> paramSPart.length - 1
-                    else -> index
-                }
-                resultBuilder.append(paramSPart.getOrNull(safeIndex) ?: 'a')
+            // Fetch the embed page (e.g., https://app.videas.fr/embed/media/...)
+            // Using WebViewResolver as a fallback in case they use Cloudflare or JS rendering
+            val html = try {
+                app.get(url, referer = referer, interceptor = WebViewResolver(Regex("videas\\.fr"))).text
+            } catch (e: Exception) {
+                app.get(url, referer = referer).text
             }
-            val result = resultBuilder.toString()
 
-            val seed = randomAlphaNumeric(8)
-            val paramT = if (result.length >= 16) result.substring(0, 16) else result.padEnd(16, '0')
-            val rc4KeyPart = if (result.length > 16) result.substring(16) else ""
-
-            val videoId = extractQueryParamV(iframeSrc) ?: return
-
-            val baseHost = when {
-                iframeSrc.contains("videas.fr") -> "https://videas.fr"
-                iframeSrc.contains("videa.fr") -> "https://videa.fr"
-                else -> "https://videa.hu"
-            }
+            val links = mutableSetOf<String>()
             
-            val xmlUrl = "$baseHost/player/xml?platform=desktop"
-            val params = mapOf("_s" to seed, "_t" to paramT, "v" to videoId)
-            val headers = mapOf("Referer" to iframeSrc, "Origin" to baseHost)
-
-            val xmlResponse = app.get(xmlUrl, params = params, headers = headers)
-            val body = xmlResponse.text
-            val xVideaXsHeader = xmlResponse.headers["x-videa-xs"] ?: ""
-
-            val finalDoc = if (body.trimStart().startsWith("<?xml")) {
-                val parsed = Jsoup.parse(body, "", Parser.xmlParser())
-                if (parsed.selectFirst("error") != null) return
-                parsed
-            } else {
-                try {
-                    val decoded = Base64.decode(body.trim(), Base64.DEFAULT)
-                    val finalRc4Key = rc4KeyPart + seed + xVideaXsHeader
-                    val decrypted = rc4Decrypt(decoded, finalRc4Key)
-                    Jsoup.parse(decrypted, "", Parser.xmlParser())
-                } catch (e: Exception) { return }
+            // 1. Hunt specifically for the cdn.videas.fr m3u8 playlist
+            Regex("""(https?://cdn\.videas\.fr/[^"'\s]+\.m3u8[^"'\s]*)""", RegexOption.IGNORE_CASE)
+                .findAll(html).forEach { links.add(it.groupValues[1].replace("\\/", "/")) }
+            
+            // 2. Fallback: Hunt for any generic m3u8 on the page
+            if (links.isEmpty()) {
+                Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""", RegexOption.IGNORE_CASE)
+                    .findAll(html).forEach { links.add(it.groupValues[1].replace("\\/", "/")) }
             }
 
-            val videoSources = finalDoc.select("video_source")
-            if (videoSources.isEmpty()) return
-
-            val collected = mutableListOf<Triple<Int, String, String>>()
-            for (src in videoSources) {
-                try {
-                    val sName = src.attr("name")
-                    val videoUrlPart = src.text().trim()
-                    val exp = src.attr("exp")
-                    val hashElem = finalDoc.getElementsByTag("hash_value_$sName").first()
-                    val md5 = hashElem?.text()?.trim() ?: continue
-                    val finalUrl = if (videoUrlPart.startsWith("http")) "$videoUrlPart?md5=$md5&expires=$exp" else "https:$videoUrlPart?md5=$md5&expires=$exp"
-                    val q = getQualityFromName(sName).takeIf { it > 0 } ?: Qualities.Unknown.value
-                    collected.add(Triple(q, sName, finalUrl))
-                } catch (_: Exception) {}
+            // 3. Fallback: Check JS player configs (file: "...", source: "...", src: "...")
+            if (links.isEmpty()) {
+                Regex("""(?:file|source|src|url)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+                    .findAll(html).forEach { links.add(it.groupValues[1].replace("\\/", "/")) }
             }
 
-            val sorted = collected.sortedByDescending { it.first }
-            withContext(Dispatchers.Main) {
-                for ((qualityVal, sName, finalUrl) in sorted) {
-                    try {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = this@VideaExtractor.name,
-                                name = "$sName (Videa)",
-                                url = finalUrl,
-                                type = if (finalUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = referer ?: iframeSrc
-                                this.quality = qualityVal
-                            }
-                        )
-                    } catch (_: Exception) {}
+            links.forEach { link ->
+                val quality = when {
+                    link.contains("1080", true) || link.contains("hlsv1", true) -> Qualities.P1080.value
+                    link.contains("720", true) -> Qualities.P720.value
+                    link.contains("480", true) -> Qualities.P480.value
+                    else -> Qualities.Unknown.value
                 }
+                
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "VideasFr",
+                        url = link,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = url
+                        this.quality = quality
+                    }
+                )
             }
-        } catch (_: Exception) {}
-    }
-
-    private fun randomAlphaNumeric(len: Int): String {
-        val allowed = "abcdefghijklmnopqrstuvwxyz0123456789"
-        return (1..len).map { allowed[Random.nextInt(allowed.length)] }.joinToString("")
-    }
-
-    private fun extractQueryParamV(url: String): String? {
-        return try {
-            Uri.parse(url).getQueryParameter("v")
         } catch (e: Exception) {
-            Regex("[?&]v=([^&]+)").find(url)?.groupValues?.get(1)
+            println("WitAnimeDebug: VideasFr error: ${e.message}")
         }
     }
-
-    private fun rc4Decrypt(data: ByteArray, key: String): String {
-        return try {
-            val spec = SecretKeySpec(key.toByteArray(StandardCharsets.UTF_8), "RC4")
-            val cipher = Cipher.getInstance("RC4")
-            cipher.init(Cipher.DECRYPT_MODE, spec)
-            val out = cipher.update(data) ?: cipher.doFinal(data)
-            String(out, StandardCharsets.UTF_8)
-        } catch (e: Exception) { "" }
-    }
-}
-
-class VideaFrExtractor : VideaExtractor() {
-    override val name = "VideaFr"
-    override val mainUrl = "https://videa.fr"
-}
-
-class VideasFrExtractor : VideaExtractor() {
-    override val name = "VideasFr"
-    override val mainUrl = "https://videas.fr"
 }
