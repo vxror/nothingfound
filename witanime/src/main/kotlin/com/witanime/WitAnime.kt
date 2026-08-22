@@ -22,6 +22,9 @@ class WitAnime : MainAPI() {
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
+    // ✅ from yh00.js: _m1+_m2+_m3+_m4 — the apiKey ROTATED, old hash was dead
+    private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
+
     private val userAgent = EXTRACTOR_UA
     private val cfKiller = CloudflareKiller()
     private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
@@ -123,8 +126,6 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val FRAMEWORK_HASH = "1c0f3441-e3c2-4023-9e8b-bee77ff59adf"
-
         fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
         fun b64Bytes(i: String?) = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
         fun bytesStr(b: ByteArray) = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
@@ -136,51 +137,9 @@ class WitAnime : MainAPI() {
             app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
         } catch (_: Exception) { "" }
 
-        fun decodeResource(raw: Any?, offset: Int): String {
-            var s: String? = null
-            when (raw) {
-                is String -> s = raw
-                is Map<*, *> -> s = (raw["r"] ?: raw["resource"] ?: raw["data"]) as? String
-                is JSONObject -> s = listOf("r", "resource", "data").firstNotNullOfOrNull { raw.optString(it, "") }?.takeIf { it.isNotBlank() }
-            }
-            if (s.isNullOrBlank()) return ""
-            val decoded = b64Bytes(cleanBase64Chars(s.reversed()))
-            val slice = if (offset in 1..decoded.size) decoded.copyOf(decoded.size - offset) else decoded
-            return trim(bytesStr(slice))
-        }
-
-        fun paramOffset(config: Any?): Int {
-            try {
-                when (config) {
-                    is Map<*, *> -> { val idx = bytesStr(b64Bytes(config["k"] as? String)).toIntOrNull() ?: return 0; val d = config["d"]; if (d is List<*>) return (d.getOrNull(idx) as? Number)?.toInt() ?: 0 }
-                    is JSONObject -> { val k = if (config.has("k")) config.optString("k", "") else ""; if (k.isBlank()) return 0; val idx = bytesStr(b64Bytes(k)).trim().toIntOrNull() ?: return 0; val d = if (config.has("d")) config.optJSONArray("d") else return 0 ?: return 0; if (d != null && idx < d.length()) return d.optInt(idx) }
-                }
-            } catch (_: Exception) {}
-            return 0
-        }
-
-        fun parsePx9(js: String): Triple<String?, List<String>, Map<String, List<String>>> {
-            val mVal = Regex("""var\s+_m\s*=\s*\{\s*\"r\"\s*:\s*\"([^\"]+)\"""").find(js)?.groupValues?.get(1)
-            val sList = Regex("""var\s+_s\s*=\s*\[(.*?)\]\s*;""", RegexOption.DOT_MATCHES_ALL).find(js)?.let { Regex("\"([^\"]*)\"").findAll(it.groupValues[1]).map { m -> m.groupValues[1] }.toList() } ?: emptyList()
-            val pMap = mutableMapOf<String, List<String>>()
-            Regex("""var\s+(_p\d+)\s*=\s*\[\s*(.*?)\s*\]\s*;""", RegexOption.DOT_MATCHES_ALL).findAll(js).forEach { m -> pMap[m.groupValues[1]] = Regex("\"([^\"]*)\"").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList() }
-            return Triple(mVal, sList, pMap)
-        }
-
-        fun chunk(hex: String?, secret: ByteArray) = trim(bytesStr(xor(hexBytes(hex), secret)))
-
-        fun decryptPx9(mr: String?, sList: List<String>, pDict: Map<String, List<String>>): List<String> {
-            if (mr.isNullOrBlank()) return emptyList()
-            val secret = b64Bytes(mr); val out = mutableListOf<String>()
-            for (i in 0 until maxOf(sList.size, pDict.size)) {
-                val chunks = pDict["_p$i"] ?: continue
-                val decrypted = chunks.map { chunk(it, secret) }
-                val seq = if (i < sList.size) try { val a = JSONArray(chunk(sList[i], secret)); IntArray(a.length()) { a.getInt(it) } } catch (_: Exception) { null } else null
-                out.add(if (seq != null && seq.size == decrypted.size) {
-                    val arr = Array(decrypted.size) { "" }; decrypted.indices.forEach { j -> if (seq[j] in arr.indices) arr[seq[j]] = decrypted[j] }; arr.joinToString("")
-                } else decrypted.joinToString(""))
-            }
-            return out.map { trim(it) }
+        fun sanitize(l: String): String {
+            val m = Regex("""https?://\S+""").find(l.trim()) ?: return ""
+            return m.value.trimEnd('"', '\'', ')', ';', ',')
         }
 
         fun findServers(html: String): List<Triple<String, String, String?>> {
@@ -195,20 +154,81 @@ class WitAnime : MainAPI() {
             return items
         }
 
-        fun lookup(reg: Any?, sid: String): Any? {
-            try {
-                when (reg) {
-                    is JSONObject -> return if (reg.has(sid)) reg.get(sid) else { val i = sid.toIntOrNull(); if (i != null && reg.has(i.toString())) reg.get(i.toString()) else null }
-                    is JSONArray -> { val i = sid.toIntOrNull(); if (i != null && i in 0 until reg.length()) return reg.get(i) }
-                    is Map<*, *> -> return reg[sid] ?: reg[sid.toIntOrNull()]
+        // ════ WATCH SERVERS — exact port of yh00.js ════
+        // renderModuleContent(): reverse → clean → atob → slice(0,-off); off = d[parseInt(atob(k))]
+        fun decodeWatch(raw: String, cfg: JSONObject?): String {
+            return try {
+                val cleaned = cleanBase64Chars(raw.reversed())
+                val decoded = b64Bytes(cleaned)
+                if (decoded.isEmpty()) return ""
+                var off = 0
+                if (cfg != null) {
+                    val kIdx = String(b64Bytes(cfg.optString("k", ""))).trim().toIntOrNull() ?: 0
+                    val d = cfg.optJSONArray("d")
+                    if (d != null && kIdx in 0 until d.length()) off = d.optInt(kIdx)
                 }
-            } catch (_: Exception) {}
-            return null
+                val sliced = if (off in 1 until decoded.size) decoded.copyOf(decoded.size - off) else decoded
+                trim(bytesStr(sliced))
+            } catch (_: Exception) { "" }
         }
 
-        fun sanitize(l: String): String {
-            val m = Regex("""https?://\S+""").find(l.trim()) ?: return ""
-            return m.value.trimEnd('"', '\'', ')', ';', ',')
+        // ════ DOWNLOAD LINKS — exact port of cx2.js ════
+        // secret=atob(_m.r); seq=JSON.parse(xor(_x[i],secret)); chunks=_pN xor'd; arranged[seq[j]]=dec[j]; count=_b.l
+        fun decryptDownloads(html: String): List<String> {
+            val out = mutableListOf<String>()
+            try {
+                val mR = Regex("""var\s+_m\s*=\s*\{\s*"r"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return emptyList()
+                val secret = b64Bytes(mR)
+                if (secret.isEmpty()) return emptyList()
+
+                // NEW scheme: _x + _b.l
+                val xBlock = Regex("""var\s+_x\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+                val xList = xBlock?.let { Regex(""""([^"]*)"""").findAll(it).map { m -> m.groupValues[1] }.toList() } ?: emptyList()
+                if (xList.isNotEmpty()) {
+                    val count = Regex(""""l"\s*:\s*(\d+)"""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: xList.size
+                    val pMap = mutableMapOf<Int, List<String>>()
+                    Regex("""var\s+_p(\d+)\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
+                        val n = m.groupValues[1].toIntOrNull() ?: return@forEach
+                        pMap[n] = Regex(""""([^"]*)"""").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
+                    }
+                    for (i in 0 until count) {
+                        val chunks = pMap[i] ?: continue
+                        val seqHex = xList.getOrNull(i) ?: continue
+                        val seqStr = trim(bytesStr(xor(hexBytes(seqHex), secret)))
+                        val seqArr = try { JSONArray(seqStr) } catch (_: Exception) { null } ?: continue
+                        val dec = chunks.map { trim(bytesStr(xor(hexBytes(it), secret))) }
+                        val arranged = Array(seqArr.length()) { "" }
+                        for (j in 0 until seqArr.length()) {
+                            val pos = seqArr.optInt(j)
+                            if (pos in arranged.indices) arranged[pos] = dec.getOrNull(j) ?: ""
+                        }
+                        out.add(arranged.joinToString(""))
+                    }
+                    return out
+                }
+
+                // LEGACY scheme: _s
+                val sBlock = Regex("""var\s+_s\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1) ?: return emptyList()
+                val sList = Regex("\"([^\"]*)\"").findAll(sBlock).map { it.groupValues[1] }.toList()
+                val pMap = mutableMapOf<Int, List<String>>()
+                Regex("""var\s+_p(\d+)\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
+                    val n = m.groupValues[1].toIntOrNull() ?: return@forEach
+                    pMap[n] = Regex("\"([^\"]*)\"").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
+                }
+                for (i in sList.indices) {
+                    val chunks = pMap[i] ?: continue
+                    val seqStr = trim(bytesStr(xor(hexBytes(sList[i]), secret)))
+                    val seqArr = try { JSONArray(seqStr) } catch (_: Exception) { null } ?: continue
+                    val dec = chunks.map { trim(bytesStr(xor(hexBytes(it), secret))) }
+                    val arranged = Array(seqArr.length()) { "" }
+                    for (j in 0 until seqArr.length()) {
+                        val pos = seqArr.optInt(j)
+                        if (pos in arranged.indices) arranged[pos] = dec.getOrNull(j) ?: ""
+                    }
+                    out.add(arranged.joinToString(""))
+                }
+            } catch (e: Exception) { println("WitAnimeDebug: dl error: ${e.message}") }
+            return out
         }
 
         return try {
@@ -216,92 +236,52 @@ class WitAnime : MainAPI() {
             if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
             println("WitAnimeDebug: html len=${html.length}")
 
-            // ════ NEW FORMAT (witanime.you, 2026): _zT = resource ARRAY, _zV = config ARRAY ════
+            // _zT/_zV registries
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
-            val resArr: JSONArray? = zT?.let { t -> try { JSONArray(String(Base64.decode(t, Base64.DEFAULT))) } catch (_: Exception) { null } }
-            val cfgArr: JSONArray? = zV?.let { v -> try { JSONArray(String(Base64.decode(v, Base64.DEFAULT))) } catch (_: Exception) { null } }
-            println("WitAnimeDebug: NEW-FORMAT zT=${zT != null} zV=${zV != null} resArr=${resArr?.length() ?: -1} cfgArr=${cfgArr?.length() ?: -1}")
-
-            // ════ LEGACY FORMAT: _zG/_zH object registries ════
-            val zRxG = Regex("""_zG\s*=\s*\"([^\"]+)\"""")
-            val zRxH = Regex("""_zH\s*=\s*\"([^\"]+)\"""")
-            var zG: String? = zRxG.find(html)?.groupValues?.get(1)
-            var zH: String? = zRxH.find(html)?.groupValues?.get(1)
-            fun toRegistry(b64: String?): Any? = try { val d = bytesStr(b64Bytes(b64)); try { JSONObject(d) } catch (_: Exception) { try { JSONArray(d) } catch (_: Exception) { null } } } catch (_: Exception) { null }
-            val resourceReg = toRegistry(zG); val configReg = toRegistry(zH)
-
-            // generic registry fallback
-            val genericRes = mutableMapOf<String, String>()
-            val genericCfg = mutableMapOf<String, Pair<String, String>>()
-            Regex(""""([^"]{1,40})"\s*:\s*\{\s*"r"\s*:\s*"([A-Za-z0-9+/=]{20,})"""").findAll(html).forEach { genericRes[it.groupValues[1]] = it.groupValues[2] }
+            val resArr = zT?.let { t -> try { JSONArray(String(b64Bytes(t))) } catch (_: Exception) { null } }
+            val cfgArr = zV?.let { v -> try { JSONArray(String(b64Bytes(v))) } catch (_: Exception) { null } }
+            println("WitAnimeDebug: zT=${zT != null} zV=${zV != null} resArr=${resArr?.length() ?: -1} cfgArr=${cfgArr?.length() ?: -1}")
 
             val servers = findServers(html)
             println("WitAnimeDebug: servers=${servers.size}")
 
             val semaphore = Semaphore(6)
 
-            suspend fun decodeAndRoute(sid: String, label: String, anchorHref: String?) {
+            suspend fun decodeAndRoute(sid: String, label: String) {
                 try {
                     var link = ""
-
-                    // ── PATH 1 (NEW): _zT/_zV arrays indexed by server id ──
-                    if (resArr != null) {
-                        val idx = sid.toIntOrNull() ?: -1
-                        if (idx in 0 until resArr.length()) {
-                            val raw = resArr.optString(idx)
-                            var off = 0
-                            val cfg = cfgArr?.optJSONObject(idx)
-                            if (cfg != null) {
-                                val kIdx = String(Base64.decode(cfg.optString("k", ""), Base64.DEFAULT)).trim().toIntOrNull() ?: 0
-                                val d = cfg.optJSONArray("d")
-                                if (d != null && kIdx in 0 until d.length()) off = d.optInt(kIdx)
-                            }
-                            link = sanitize(decodeResource(raw, off))
-                            if (link.isBlank()) link = sanitize(decodeResource(raw, 0))
-                            println("WitAnimeDebug: [$label] zT decode off=$off -> $link")
-                        }
+                    val idx = sid.toIntOrNull() ?: -1
+                    if (resArr != null && idx in 0 until resArr.length()) {
+                        val raw = resArr.optString(idx)
+                        val cfg = cfgArr?.optJSONObject(idx)
+                        link = decodeWatch(raw, cfg)
+                        println("WitAnimeDebug: [$label id=$idx] decode -> ${link.take(100)}")
                     }
-
-                    // ── PATH 2 (LEGACY): _zG/_zH registries ──
-                    if (link.isBlank()) {
-                        val res = lookup(resourceReg, sid)
-                        if (res != null) link = sanitize(decodeResource(res, paramOffset(lookup(configReg, sid))))
-                    }
-
-                    // ── PATH 3: generic registry ──
-                    if (link.isBlank() && genericRes.isNotEmpty()) {
-                        val raw = genericRes[sid] ?: genericRes[sid.toIntOrNull()?.toString() ?: ""]
-                        if (raw != null) link = sanitize(decodeResource(raw, 0))
-                    }
-
-                    // ── PATH 4: anchor href ──
-                    if (link.isBlank() && anchorHref != null && anchorHref.startsWith("http")) link = anchorHref
-
-                    println("WitAnimeDebug: server $sid [$label] -> $link")
                     if (link.isNotBlank()) {
-                        val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$"""))) "$link&apiKey=$FRAMEWORK_HASH" else link
+                        val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
+                            "$link&apiKey=$FRAMEWORK_HASH" else link
                         routeLink(finalLink, data, subtitleCallback, callback)
+                    } else {
+                        println("WitAnimeDebug: [$label id=$idx] EMPTY")
                     }
                 } catch (_: Exception) {}
             }
 
             supervisorScope {
-                servers.map { (sid, label, href) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label, href) } } }.awaitAll()
+                servers.map { (sid, label, _) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
             }
 
-            // ════ DOWNLOAD LINKS: _m/_p0..N (+ _x/_v new vars) — px9 scheme ════
-            var px_mr: String? = null; var px_s = listOf<String>(); val px_p = mutableMapOf<String, List<String>>()
-            Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).findAll(html).map { it.groupValues[1] }.forEach { s ->
-                if ("_m" in s && "_p0" in s) { val (m, sl, pm) = parsePx9(s); px_mr = m ?: px_mr; if (sl.isNotEmpty()) px_s = sl; px_p.putAll(pm) }
+            // download links
+            val dlLinks = decryptDownloads(html)
+            println("WitAnimeDebug: downloads=${dlLinks.size}")
+            dlLinks.forEach { l -> if (l.contains("http")) println("WitAnimeDebug: dl -> ${l.take(100)}") }
+            supervisorScope {
+                dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
+                    val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
+                    if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
+                } catch (_: Exception) {} } } }.awaitAll()
             }
-            val dlLinks = decryptPx9(px_mr, px_s, px_p)
-            println("WitAnimeDebug: px9 download links=${dlLinks.size}")
-            dlLinks.forEach { l -> if (l.contains("http")) println("WitAnimeDebug: px9 dl -> $l") }
-            supervisorScope { dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
-                val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                if (final.startsWith("http")) routeLink(final, data, subtitleCallback, callback)
-            } catch (_: Exception) {} } } }.awaitAll() }
             true
         } catch (e: Exception) { logError(e); false }
     }
@@ -320,10 +300,6 @@ class WitAnime : MainAPI() {
             linkHost(link).contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, callback)
             linkHost(link).contains("4shared") -> FourSharedExtractor().getUrl(link, referer, subtitleCallback, callback)
             linkHost(link).contains("mediafire") -> MediaFireExtractor().getUrl(link, referer, subtitleCallback, callback)
-            linkHost(link).contains("workupload") || linkHost(link).contains("gofile") -> {
-                val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
-                if (!ok) UniversalExtractor().getUrl(link, referer, subtitleCallback, callback)
-            }
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
                 if (!ok) {
