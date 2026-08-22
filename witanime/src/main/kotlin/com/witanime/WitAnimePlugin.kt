@@ -9,6 +9,7 @@ class WitAnimePlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(WitAnime())
         registerExtractorAPI(VideaExtractor())
+        registerExtractorAPI(VideasFrExtractor())
         registerExtractorAPI(MailruExtractor())
         registerExtractorAPI(StreamWishExtractor())
         registerExtractorAPI(Awish())
@@ -18,12 +19,8 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(DoodStreamExtractor())
         registerExtractorAPI(FourSharedExtractor())
         registerExtractorAPI(MegaProxyExtractor())
+        registerExtractorAPI(UniversalExtractor()) // 🎯 The Catch-All
         
-        // Start MegaProxy server
-        try {
-            MegaProxy.start()
-        } catch (e: Exception) {
-            println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
-        }
+        try { MegaProxy.start() } catch (e: Exception) { println("WitAnimeDebug: MegaProxy start failed: ${e.message}") }
     }
 }
