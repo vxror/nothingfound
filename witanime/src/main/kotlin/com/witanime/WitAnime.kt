@@ -17,7 +17,7 @@ import kotlinx.coroutines.sync.withPermit
 class WitAnime : MainAPI() {
 
     // ⚠️ PUT YOUR REAL WORKING DOMAIN HERE (https://..., no trailing slash)
-    override var mainUrl = "https://witanime.net"
+    override var mainUrl = "https://witanime.cyou"
     override var name = "WitAnime"
     override val hasMainPage = true
     override var lang = "ar"
