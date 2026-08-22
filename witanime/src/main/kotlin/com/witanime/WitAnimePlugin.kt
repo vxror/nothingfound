@@ -10,5 +10,8 @@ class WitAnimePlugin : Plugin() {
         registerMainAPI(WitAnime())
         registerExtractorAPI(VideaExtractor())
         registerExtractorAPI(MailruExtractor())
+        registerExtractorAPI(Awish())
+        registerExtractorAPI(Asnwish())
+        registerExtractorAPI(CdnwishCom())
     }
 }
