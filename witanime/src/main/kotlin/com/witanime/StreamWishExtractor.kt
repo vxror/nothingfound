@@ -17,15 +17,14 @@ open class StreamWishExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val res = app.get(url, referer = referer)
-        val unpacked = getAndUnpack(res.text)   // handles the p,a,c,k,e,d eval
+        val unpacked = getAndUnpack(res.text)
 
-        // video sources
-        Regex("""file\s*:\s*"(https?://[^"]+)"""").findAll(unpacked)
+        Regex("""file\s*:\s*["'](https?://[^"']+)["']""").findAll(unpacked)
             .map { it.groupValues[1] }.distinct()
             .forEach { link ->
                 if (link.contains(".m3u8", true)) {
                     callback(
-                        newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
+                        newExtractorLink(this.name, this.name, link, M3U8) {
                             this.referer = mainUrl
                             quality = getQualityFromName(Regex("""(\d{3,4})p""").find(link)?.groupValues?.get(1))
                         }
@@ -33,11 +32,9 @@ open class StreamWishExtractor : ExtractorApi() {
                 }
             }
 
-        // subtitles
-        Regex("""file\s*:\s*"([^"]+\.(?:vtt|srt))"[^}]*?label\s*:\s*"([^"]*)"""")
-            .findAll(unpacked).forEach {
-                subtitleCallback(SubtitleFile(it.groupValues[2).ifBlank { "Sub" }, it.groupValues[1]))
-            }
+        Regex("""file\s*:\s*["']([^"']+\.(?:vtt|srt))["']""").findAll(unpacked).forEach {
+            subtitleCallback(SubtitleFile("ar", it.groupValues[1]))
+        }
     }
 }
 
