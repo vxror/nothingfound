@@ -32,7 +32,6 @@ class AnimeWitcherProvider : MainAPI() {
     private var debugInfo = ""
     private var lastServerRaw = ""
 
-    // ⚡ SPEED: 30-min episode cache + instant LoadResponse cache
     private val episodesCache = HashMap<String, Pair<Long, List<EpisodeInfo>>>()
     private val EPISODE_CACHE_TTL_MS = 30 * 60 * 1000L
     private val loadCache = HashMap<String, Pair<Long, LoadResponse>>()
@@ -50,14 +49,11 @@ class AnimeWitcherProvider : MainAPI() {
     data class EpisodeInfo(val id: String, val name: String?, val number: Int, val imageUrl: String? = null)
     data class ServerModel(val name: String?, val link: String?, val quality: String?, val originalLink: String?, val openBrowser: Boolean, val directLink: Boolean = false)
 
-    // ==================== UTILITIES ====================
-
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
     private fun algoliaUrl(index: String) = "https://${algoliaAppId}-dsn.algolia.net/1/indexes/$index/query"
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-    // 🗓️ DYNAMIC SEASON CALCULATOR (3-month blocks)
     private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
         cal.add(java.util.Calendar.MONTH, seasonOffset * 3)
@@ -102,8 +98,6 @@ class AnimeWitcherProvider : MainAPI() {
         "Content-Type" to "application/json; charset=UTF-8"
     )
 
-    // ==================== FIREBASE AUTH ====================
-
     private suspend fun login(email: String, password: String): String? {
         return try {
             val body = JSONObject().put("email", email).put("password", password).put("returnSecureToken", true)
@@ -143,13 +137,9 @@ class AnimeWitcherProvider : MainAPI() {
 
     private suspend fun firestoreGet(url: String): String = fsGet(url).second
 
-    // ==================== 🛡️ MAIN PAGE (SINGLE ENTRY - NO DUPLICATES) ====================
-
-    // 🛡️ SINGLE ENTRY: Triggers getMainPage() exactly ONCE (prevents 9x duplication)
     override val mainPage = mainPageOf("" to "")
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
-        // 🛡️ PREVENT DUPLICATES: Only load on first call
         if (page > 1) {
             return@withContext newHomePageResponse(emptyList(), hasNext = false)
         }
@@ -176,8 +166,6 @@ class AnimeWitcherProvider : MainAPI() {
             HomePageList("يُعرض الآن", ongoing.await())
         ), hasNext = false)
     }
-
-    // ==================== ALGOLIA FETCHING ====================
 
     private suspend fun fetchAlgoliaList(indexName: String, query: String, facetFilters: String = "", excludeUnreleased: Boolean = false): List<SearchResponse> = withContext(Dispatchers.IO) {
         val attributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
@@ -215,23 +203,18 @@ class AnimeWitcherProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) { fetchAlgoliaList("series", query) }
 
-    // ==================== ⚡ FAST LOAD (Cache + Parallel) ====================
-
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val animeJson = try { JSONObject(URLDecoder.decode(url.substringAfter("?data=", ""), "utf-8")) } catch (e: Exception) { JSONObject() }
         var animeId = sanitizeId(idFrom(animeJson)); if (animeId.isEmpty()) animeId = sanitizeId(URLDecoder.decode(url.substringAfterLast('/').substringBefore('?'), "utf-8"))
 
-        // ⚡ INSTANT REOPEN: serve cached page (30 min)
         loadCache[animeId]?.let { (ts, resp) ->
             if (System.currentTimeMillis() - ts < LOAD_CACHE_TTL_MS) return@withContext resp
         }
 
-        // Pre-read safe values BEFORE parallel jobs
         val earlyDetails = animeJson.optJSONObject("details") ?: JSONObject()
         val isUnreleased = (earlyDetails.optString("state") ?: "").contains("لم يتم بثه")
         val epsNum = earlyDetails.optString("eps_num", "")
 
-        // 🚀 PARALLEL: Arabic metadata fill + episodes fetch at the SAME time
         val metaJob = async {
             if (animeJson.optString("story").isEmpty() && animeId.isNotEmpty()) {
                 try { withTimeoutOrNull(5000L) { fillMetadata(animeJson, animeId) } } catch (_: Exception) {}
@@ -259,7 +242,6 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext response
     }
 
-    // 🚀 Metadata fill (Arabic story) — isolated for parallel execution
     private suspend fun fillMetadata(animeJson: JSONObject, animeId: String) {
         val fullAttributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
         val filterQuery = enc("path:\"anime_list/$animeId\" OR objectID:\"$animeId\"")
@@ -287,8 +269,6 @@ class AnimeWitcherProvider : MainAPI() {
         if (episodes.isEmpty()) episodes = listOf(EpisodeInfo("000", "⚠ DEBUG: $debugInfo", 0, null))
         return episodes
     }
-
-    // ==================== FETCH EPISODES FROM FIRESTORE ====================
 
     private suspend fun fetchEpisodes(animeId: String): List<EpisodeInfo> = withContext(Dispatchers.IO) {
         val a = enc(animeId); val list = ArrayList<EpisodeInfo>(); var raw = ""
@@ -326,13 +306,10 @@ class AnimeWitcherProvider : MainAPI() {
         }
     }
 
-    // ==================== ⚡ PARALLEL SERVER FETCH ====================
-
     private suspend fun fetchServersForEpisode(animeId: String, episodeId: String): List<ServerModel> = withContext(Dispatchers.IO) {
         val a = enc(animeId)
         val candidates = LinkedHashSet<String>(); candidates.add(episodeId)
         episodeId.toIntOrNull()?.let { n -> candidates.add(String.format("%03d", n)); candidates.add(n.toString()) }
-        // 🚀 Try ALL id formats at the same time
         val results = candidates.map { e -> async { fetchServersAt(a, e) } }.awaitAll()
         results.firstOrNull { it.isNotEmpty() } ?: emptyList()
     }
@@ -357,8 +334,6 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext emptyList()
     }
 
-    // ==================== LOAD LINKS (PARALLEL EXTRACTION + DEDUPLICATION) ====================
-
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean = withContext(Dispatchers.IO) {
         val parts = data.split('|'); if (parts.size < 2) return@withContext false
         val animeId = sanitizeId(parts[0]); val episodeId = parts[1].trim(); if (episodeId == "000") return@withContext false
@@ -375,7 +350,6 @@ class AnimeWitcherProvider : MainAPI() {
             withTimeoutOrNull(20000L) { jobs.joinAll() }
         }
 
-        // 🧹 DEDUPLICATION (no lambda with sortedByDescending to avoid D8 warnings)
         val seen = mutableSetOf<String>()
         val deduplicated = mutableListOf<ExtractorLink>()
         val sorted = allLinks.sortedByDescending { it.quality }
@@ -389,8 +363,6 @@ class AnimeWitcherProvider : MainAPI() {
         return@withContext true
     }
 
-    // ==================== EXTRACT FROM SERVER ====================
-
     private suspend fun extractFromServer(server: ServerModel, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val rawServerName = server.name ?: "Server"
         val serverName = rawServerName.replace(Regex("""\b\d{3,4}p\b|\b4K\b|\b2160p\b|\bFHD\b|\bHD\b|\bSD\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""\s{2,}"""), " ").trim().ifEmpty { "Server" }
@@ -399,6 +371,19 @@ class AnimeWitcherProvider : MainAPI() {
         val finalName = serverName
         try {
             when {
+                // 🆕 FIESTREAM (SF) - Direct CDN links with proper referer
+                host.contains("firestream.to") || host.contains("fi-cdn") || host.contains("fr-cdn") || upperName == "SF" -> {
+                    val headers = mapOf(
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept" to "*/*",
+                        "Referer" to mainUrl
+                    )
+                    callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink, type = if (fixedLink.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                        referer = mainUrl
+                        quality = getQualityFromName(server.quality)
+                        this.headers = headers
+                    })
+                }
                 host.contains("pixeldrain") -> {
                     val id = fixedLink.substringAfterLast("/u/", fixedLink.substringAfterLast("/api/file/")).substringAfterLast("/file/")
                     if (id.isNotBlank() && !id.contains("/")) {
@@ -451,21 +436,48 @@ class AnimeWitcherProvider : MainAPI() {
                     if (ZenHeavyweightExtractors.tryExtract(host, fixedLink, mainUrl, finalName, getQualityFromName(server.quality), callback)) return
                     try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) {}
                     if (!ok) ok = ZenUniversalSniffer.deepScan(fixedLink, finalName, getQualityFromName(server.quality), callback)
-                    // 🚑 EMERGENCY RESCUE: If everything failed, deploy the Cloudflare Proxy
                     if (!ok) { ZenProxyRescue.rescue(fixedLink, finalName, getQualityFromName(server.quality), mainUrl, callback) }
                 }
             }
         } catch (e: Exception) { callback.invoke(newExtractorLink(source = name, name = serverName, url = link) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
     }
 
-    // ==================== STREAMTAPE & MEDIAFIRE HELPERS ====================
-
     private suspend fun extractStreamTape(url: String): String? {
         return try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language" to "en-US,en;q=0.5", "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1")
+            val headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.5",
+                "Sec-Fetch-Dest" to "document",
+                "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Site" to "none",
+                "Sec-Fetch-User" to "?1"
+            )
             val html = app.get(url, headers = headers).text
-            val patterns = listOf(Regex("""id=["']norobotlink["'][^>]*>([^<]+)<"""), Regex("""getElementById\(['"]norobotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]"""), Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)"""))
-            for (regex in patterns) { val match = regex.find(html); if (match != null) { var link = match.groupValues[1].trim(); if (link.startsWith("//")) link = "https:$link" else if (!link.startsWith("http")) link = "https://streamtape.com$link"; if (!link.contains("&stream=1")) link += "&stream=1"; return link } }
+            
+            // 🆕 Enhanced StreamTape patterns
+            val patterns = listOf(
+                // Pattern 1: robotlink method (most common)
+                Regex("""id=["']norobotlink["'][^>]*>([^<]+)<"""),
+                Regex("""getElementById\(['"]norobotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]"""),
+                // Pattern 2: get_video endpoint
+                Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)"""),
+                // Pattern 3: Direct MP4 in script
+                Regex("""['"]([^'']*\.mp4[^'']*streamtape[^'']*)['"]"""),
+                // Pattern 4: Alternative get_video pattern
+                Regex("""get_video[^'"]*['"]([^'"]+)['"]""")
+            )
+            
+            for (regex in patterns) {
+                val match = regex.find(html)
+                if (match != null) {
+                    var link = match.groupValues[1].trim()
+                    if (link.startsWith("//")) link = "https:$link"
+                    else if (!link.startsWith("http")) link = "https://streamtape.com$link"
+                    if (!link.contains("&stream=1")) link += "&stream=1"
+                    return link
+                }
+            }
             null
         } catch (e: Exception) { null }
     }
@@ -482,8 +494,6 @@ class AnimeWitcherProvider : MainAPI() {
             if (regexLink != null && regexLink.startsWith("http")) return regexLink; null
         } catch (e: Exception) { null }
     }
-
-    // ==================== QUALITY HELPER ====================
 
     private fun getQualityFromName(quality: String?): Int {
         return when {
