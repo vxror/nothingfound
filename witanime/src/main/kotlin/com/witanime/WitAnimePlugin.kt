@@ -12,15 +12,12 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(VideaExtractor())
         registerExtractorAPI(VideasFrExtractor())
         registerExtractorAPI(MailruExtractor())
+        registerExtractorAPI(OkRuExtractor())
+        registerExtractorAPI(MegaExtractor())
+        registerExtractorAPI(FourSharedExtractor())
+        registerExtractorAPI(FileMoonExtractor())
 
-        // StreamWish family
-        registerExtractorAPI(StreamWishExtractor())
-        registerExtractorAPI(Awish())
-        registerExtractorAPI(Asnwish())
-        registerExtractorAPI(CdnwishCom())
-        registerExtractorAPI(EmbedWish())
-
-        // Dood — known domains registered; unknown dood hosts caught by isDoodLink() in routeLink
+        // Dood family
         registerExtractorAPI(DoodExtractor())
         registerExtractorAPI(DoodToExtractor())
         registerExtractorAPI(DoodLaExtractor())
@@ -29,15 +26,37 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(Ds2PlayExtractor())
         registerExtractorAPI(D000dExtractor())
 
-        registerExtractorAPI(FileMoonExtractor())
-        registerExtractorAPI(FourSharedExtractor())
-        registerExtractorAPI(MediaFireExtractor())
-        registerExtractorAPI(MegaExtractor())
+        // StreamWish family — extends the app's BUILT-IN proven extractor
+        registerExtractorAPI(Mwish())
+        registerExtractorAPI(Dwish())
+        registerExtractorAPI(Ewish())
+        registerExtractorAPI(WishembedPro())
+        registerExtractorAPI(Kswplayer())
+        registerExtractorAPI(Wishfast())
+        registerExtractorAPI(Streamwish2())
+        registerExtractorAPI(SfastwishCom())
+        registerExtractorAPI(StrwishXyz())
+        registerExtractorAPI(StrwishCom())
+        registerExtractorAPI(FlaswishCom())
+        registerExtractorAPI(Awish())
+        registerExtractorAPI(Obeywish())
+        registerExtractorAPI(Jodwish())
+        registerExtractorAPI(Swhoi())
+        registerExtractorAPI(UqloadsXyz())
+        registerExtractorAPI(CdnwishCom())
+        registerExtractorAPI(Asnwish())
+        registerExtractorAPI(Nekowish())
+        registerExtractorAPI(Nekostream())
+        registerExtractorAPI(Swdyu())
+        registerExtractorAPI(Wishonly())
+        registerExtractorAPI(Playerwish())
+        registerExtractorAPI(StreamHLSTo())
+        registerExtractorAPI(HlsWish())
+        registerExtractorAPI(StreamWishCom())
+        registerExtractorAPI(StreamWishTop())
 
         try { MegaProxy.start() } catch (e: Exception) {
             println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
         }
-        // UniversalExtractor is invoked directly from routeLink — intentionally NOT registered,
-        // so it never shadows built-in extractors (mp4upload, uqload, streamtape, ...)
     }
 }
