@@ -9,6 +9,9 @@ class FourSharedExtractor : ExtractorApi() {
     override val mainUrl = "https://www.4shared.com"
     override val requiresReferer = false
 
+    /** set by the yonaplay router so HD/FHD links are distinguishable */
+    var linkLabel: String? = null
+
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
@@ -20,8 +23,9 @@ class FourSharedExtractor : ExtractorApi() {
                 ?: Regex("""downloadUrl\s*[:=]\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
                 ?: Regex(""""(https?://[^"]+/(?:download|videoplay)[^"]*)"""").find(html)?.groupValues?.get(1)
                 ?: return
-            callback(newExtractorLink(name, name, link, ExtractorLinkType.VIDEO) {
+            callback(newExtractorLink(name, name + (linkLabel?.let { " $it" } ?: ""), link, ExtractorLinkType.VIDEO) {
                 this.referer = "$mainUrl/"
+                quality = labelQuality(linkLabel)
             })
         } catch (e: Exception) { println("WitAnimeDebug: 4Shared error: ${e.message}") }
     }
