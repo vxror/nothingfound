@@ -147,7 +147,7 @@ class WitAnime : MainAPI() {
             return items
         }
 
-        // watch decode — exact port of yh00.js
+        // ════ WATCH SERVERS — exact port of yh00.js renderModuleContent() ════
         fun decodeWatch(raw: String, cfg: JSONObject?): String {
             return try {
                 val cleaned = cleanBase64Chars(raw.reversed())
@@ -164,7 +164,7 @@ class WitAnime : MainAPI() {
             } catch (_: Exception) { "" }
         }
 
-        // downloads — exact port of cx2.js
+        // ════ DOWNLOAD LINKS — exact port of cx2.js (new _x/_b.l + legacy _s) ════
         fun decryptDownloads(html: String): List<String> {
             val out = mutableListOf<String>()
             try {
@@ -201,6 +201,7 @@ class WitAnime : MainAPI() {
             val html = fetch(data)
             if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
 
+            // _zT (resources) + _zV (configs) — NEW format
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val resArr = zT?.let { t -> try { JSONArray(String(b64Bytes(t))) } catch (_: Exception) { null } }
@@ -333,7 +334,7 @@ class WitAnime : MainAPI() {
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
                     if (seen.add(cdn)) {
                         println("WitAnimeDebug: Yona CDN -> ${cdn.take(90)}")
-                        emitDirectCdn(cdn, callback)
+                        emitDirectCdn(cdn, callback = callback)   // ✅ FIXED: named argument
                     }
                 }
 
