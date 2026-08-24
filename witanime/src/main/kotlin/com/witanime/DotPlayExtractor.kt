@@ -1,8 +1,11 @@
 package com.witanime
 
+import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -11,120 +14,135 @@ class DotPlayExtractor : ExtractorApi() {
     override val mainUrl = "https://dotplay.net"
     override val requiresReferer = false
 
+    private val cfKiller = CloudflareKiller()
+
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         try {
             val code = url.substringAfter("/embed/").substringBefore("/").substringBefore("?")
-            if (code.isBlank()) { println("WitAnimeDebug: DotPlay no code in $url"); return }
+            if (code.isBlank()) { println("WitAnimeDebug: DotPlay no code"); return }
 
-            // ═══ 1) Visit embed page FIRST — establishes the PHPSESSID session
-            //        (exactly what the browser does before calling api.php) ═══
-            val embedHeaders = mapOf(
-                "User-Agent" to EXTRACTOR_UA,
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            )
-            val embedPage = app.get(url, headers = embedHeaders, referer = referer)
-            val embedHtml = embedPage.text
-            println("WitAnimeDebug: DotPlay embed OK len=${embedHtml.length}")
+            val headers = mapOf("User-Agent" to EXTRACTOR_UA)
 
-            // ═══ 2) Call api.php — same session, referer = the embed page ═══
-            val apiUrl = "$mainUrl/api.php?code=$code"
-            val apiHeaders = mapOf(
-                "User-Agent" to EXTRACTOR_UA,
-                "Accept" to "application/json",
-                "Referer" to url
-            )
-            val apiResp = app.get(apiUrl, headers = apiHeaders, referer = url)
-            val jsonStr = apiResp.text
-            println("WitAnimeDebug: DotPlay api RAW=${jsonStr.take(300)}")   // 📸 full response in logcat
+            // ═══ METHOD 1: embed page (session) → api.php → base64-decoded video_url ═══
+            try {
+                app.get(url, headers = headers, referer = referer, interceptor = cfKiller)
 
-            // ═══ 3) LEARNING-MACHINE STYLE: recursively grab EVERY http URL
-            //        anywhere in the JSON — field name doesn't matter ═══
-            val urls = extractUrlsFromJson(jsonStr).filter {
-                it.startsWith("http") && !it.contains("dotplay.net") && !it.endsWith(".jpg") && !it.endsWith(".png")
-            }
+                val apiUrl = "$mainUrl/api.php?code=$code"
+                val apiResp = app.get(apiUrl, headers = headers + mapOf("Accept" to "application/json"), referer = url, interceptor = cfKiller)
+                val jsonStr = apiResp.text
+                println("WitAnimeDebug: DotPlay api=${jsonStr.take(250)}")
 
-            if (urls.isNotEmpty()) {
-                urls.forEach { videoUrl ->
-                    val cleanUrl = videoUrl.trimEnd('#', '"')
-                    println("WitAnimeDebug: DotPlay found -> ${cleanUrl.take(100)}")
-                    when {
-                        // dropbox raw=1 → 302 → dropboxusercontent serves video/mp4 (no referer needed)
-                        cleanUrl.contains("dropbox") -> {
-                            callback(newExtractorLink(name, "DotPlay", cleanUrl, ExtractorLinkType.VIDEO) {
-                                quality = detectQuality(cleanUrl)
-                            })
-                        }
-                        // other known CDNs (archive.org, soraplay, okcdn)
-                        isDirectCdnLink(cleanUrl) -> emitDirectCdn(cleanUrl, callback = callback)
-                        // anything else — emit as direct video, let the player follow redirects
-                        else -> {
-                            callback(newExtractorLink(name, "DotPlay", cleanUrl,
-                                if (cleanUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                                this.referer = mainUrl
-                                quality = detectQuality(cleanUrl)
-                            })
+                val json = try { JSONObject(jsonStr) } catch (_: Exception) { null }
+
+                // 🎯 THE FIX: video_url is BASE64-ENCODED
+                val encodedUrl = json?.optString("video_url", "") ?: ""
+                var videoUrl = ""
+                if (encodedUrl.isNotBlank()) {
+                    try {
+                        var fixed = encodedUrl.trim()
+                        val pad = fixed.length % 4
+                        if (pad != 0) fixed += "=".repeat(4 - pad)
+                        videoUrl = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                    } catch (_: Exception) { videoUrl = encodedUrl }
+                }
+
+                // fallback: maybe plain URL or different field — recursive scan
+                if (!videoUrl.startsWith("http")) {
+                    val urls = extractUrlsFromJson(jsonStr).filter {
+                        it.startsWith("http") && !it.contains("dotplay.net") &&
+                        !it.endsWith(".jpg") && !it.endsWith(".png")
+                    }
+                    videoUrl = urls.firstOrNull() ?: ""
+
+                    // try decoding every long string in the JSON as base64 too
+                    if (!videoUrl.startsWith("http") && json != null) {
+                        val encodedCandidates = mutableListOf<String>()
+                        collectEncodedStrings(json, encodedCandidates)
+                        for (enc in encodedCandidates) {
+                            try {
+                                var fixed = enc.trim()
+                                val pad = fixed.length % 4
+                                if (pad != 0) fixed += "=".repeat(4 - pad)
+                                val decoded = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                                if (decoded.startsWith("http")) { videoUrl = decoded; break }
+                            } catch (_: Exception) {}
                         }
                     }
                 }
-                return
+
+                if (videoUrl.startsWith("http")) {
+                    emitVideo(videoUrl, callback)
+                    return
+                }
+            } catch (e: Exception) {
+                println("WitAnimeDebug: DotPlay method1 fail: ${e.message}")
             }
 
-            // ═══ 4) Fallback: scan the embed page HTML for direct links ═══
-            println("WitAnimeDebug: DotPlay: api gave nothing, scanning embed page")
-            val combined = "$embedHtml\n${unpackPackedJs(embedHtml) ?: ""}".replace("\\/", "/")
-            val candidates = mutableListOf<String>()
-            Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m3u8)[^\s"'<>\\]*)""").findAll(combined).forEach {
-                candidates.add(it.groupValues[1].trimEnd('#'))
-            }
-            Regex("""https?://(?:www\.dropbox\.com|dl\.dropboxusercontent\.com|soraplay\.[a-z]+|[^"'\s]*archive\.org)/[^\s"'<>]+""").findAll(embedHtml).forEach {
-                candidates.add(it.groupValues[1].trimEnd('#', '"', '\''))
-            }
-            candidates.distinct().filter { it.startsWith("http") }.forEach { link ->
-                println("WitAnimeDebug: DotPlay fallback -> ${link.take(100)}")
-                callback(newExtractorLink(name, "DotPlay", link, ExtractorLinkType.VIDEO) {
-                    quality = detectQuality(link)
-                })
-            }
+            // ═══ METHOD 2: embed page scan (base64 tokens in HTML too) ═══
+            try {
+                val embedHtml = app.get(url, headers = headers, referer = referer, interceptor = cfKiller).text
+                Regex("""[A-Za-z0-9+/=]{40,}""").findAll(embedHtml).map { it.value }.distinct().take(30).forEach { tok ->
+                    try {
+                        var fixed = tok
+                        val pad = fixed.length % 4
+                        if (pad != 0) fixed += "=".repeat(4 - pad)
+                        val d = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                        if (d.startsWith("http")) {
+                            println("WitAnimeDebug: DotPlay b64 -> ${d.take(100)}")
+                            emitVideo(d, callback)
+                            return
+                        }
+                    } catch (_: Exception) {}
+                }
+                val combined = "$embedHtml\n${unpackPackedJs(embedHtml) ?: ""}".replace("\\/", "/")
+                val found = Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m3u8)[^\s"'<>\\]*)""").findAll(combined)
+                    .map { it.groupValues[1].trimEnd('#') }.distinct().toList()
+                if (found.isNotEmpty()) {
+                    found.forEach { emitVideo(it, callback) }
+                    return
+                }
+            } catch (_: Exception) {}
 
-            // ═══ 5) Last resort: WebView on the embed page (JS may build the URL) ═══
-            if (candidates.isEmpty()) {
-                println("WitAnimeDebug: DotPlay: trying WebView intercept")
-                try {
-                    val resolver = com.lagradost.cloudstream3.network.WebViewResolver(
-                        interceptUrl = Regex("""\.mp4|\.m3u8|dropboxusercontent|soraplay"""),
-                        additionalUrls = listOf(Regex("""\.mp4|\.m3u8|dropboxusercontent|soraplay""")),
-                        useOkhttp = false,
-                        timeout = 15_000L
-                    )
-                    val intercepted = app.get(url, referer = referer, interceptor = resolver).url
-                    if (intercepted.isNotEmpty() && intercepted != url) {
-                        println("WitAnimeDebug: DotPlay WV -> ${intercepted.take(100)}")
-                        callback(newExtractorLink(name, "DotPlay", intercepted.trimEnd('#'),
-                            if (intercepted.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            quality = detectQuality(intercepted)
-                        })
-                    }
-                } catch (_: Exception) {}
+            // ═══ METHOD 3: WebView — full browser, JS runs, intercept video URL ═══
+            println("WitAnimeDebug: DotPlay trying WebView")
+            try {
+                val resolver = WebViewResolver(
+                    interceptUrl = Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8"""),
+                    additionalUrls = listOf(Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8""")),
+                    useOkhttp = false,
+                    timeout = 25_000L
+                )
+                val intercepted = app.get(url, referer = referer, interceptor = resolver).url
+                if (intercepted.isNotEmpty() && intercepted != url) {
+                    println("WitAnimeDebug: DotPlay WV -> ${intercepted.take(100)}")
+                    emitVideo(intercepted.trimEnd('#'), callback)
+                }
+            } catch (e: Exception) {
+                println("WitAnimeDebug: DotPlay WV fail: ${e.message}")
             }
         } catch (e: Exception) {
             println("WitAnimeDebug: DotPlay error: ${e.message}")
         }
     }
 
-    /** 🔍 recursively walk any JSON structure and collect all http strings */
+    private fun emitVideo(videoUrl: String, callback: (ExtractorLink) -> Unit) {
+        val cleanUrl = videoUrl.trimEnd('#', '"')
+        println("WitAnimeDebug: DotPlay emitting -> ${cleanUrl.take(100)}")
+        callback(newExtractorLink(name, "DotPlay", cleanUrl,
+            if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+            this.referer = mainUrl
+            quality = detectQuality(cleanUrl)
+        })
+    }
+
     private fun extractUrlsFromJson(jsonStr: String): List<String> {
         val urls = mutableListOf<String>()
-        try {
-            collectUrls(JSONObject(jsonStr), urls)
-        } catch (_: Exception) {
-            try {
-                collectUrls(JSONArray(jsonStr), urls)
-            } catch (_: Exception) {
-                // not valid JSON — regex the raw text
+        try { collectUrls(JSONObject(jsonStr), urls) } catch (_: Exception) {
+            try { collectUrls(JSONArray(jsonStr), urls) } catch (_: Exception) {
                 Regex("""https?://[^\s"',}\\]+""").findAll(jsonStr).forEach {
-                    urls.add(it.value.trimEnd('}', ']'))
+                    urls.add(it.value.trimEnd('}', ']', '"'))
                 }
             }
         }
@@ -136,6 +154,14 @@ class DotPlayExtractor : ExtractorApi() {
             is JSONObject -> for (key in any.keys()) collectUrls(any.opt(key), out)
             is JSONArray -> for (i in 0 until any.length()) collectUrls(any.opt(i), out)
             is String -> if (any.startsWith("http")) out.add(any)
+        }
+    }
+
+    private fun collectEncodedStrings(any: Any?, out: MutableList<String>) {
+        when (any) {
+            is JSONObject -> for (key in any.keys()) collectEncodedStrings(any.opt(key), out)
+            is JSONArray -> for (i in 0 until any.length()) collectEncodedStrings(any.opt(i), out)
+            is String -> if (any.length > 40 && any.matches(Regex("""[A-Za-z0-9+/=]+"""))) out.add(any)
         }
     }
 
