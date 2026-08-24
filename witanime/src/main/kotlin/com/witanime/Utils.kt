@@ -95,14 +95,15 @@ internal suspend fun emitDirectCdn(link: String, qLabel: String? = null, callbac
     val q = if (urlQ != Qualities.Unknown.value) urlQ else labelQuality(qLabel)
     val host = linkHost(link)
     val shortHost = if (host.length > 30) host.substringAfter(".") else host
-    callback(newExtractorLink("Direct", shortHost, link,
-        if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+    val cleanLink = link.trimEnd('#')
+    callback(newExtractorLink("Direct", shortHost, cleanLink,
+        if (cleanLink.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
         quality = q
     })
 }
 
 /**
- * ⚡ UNIVERSAL EMBED HANDLER — works for ANY embed page from witanime:
+ * ⚡ UNIVERSAL EMBED HANDLER — works for ANY embed page:
  *   1. Follows loading-page redirects (hgcloud.to → hanerix.com)
  *   2. JWPlayer + packed JS → JwPlayerHelper extraction
  *   3. Raw m3u8/mp4 in page → emit directly
@@ -123,70 +124,88 @@ internal suspend fun handleUnknownEmbed(
         var page = app.get(url, headers = headers, referer = referer)
         var html = page.text
         var currentUrl = page.url
+        val originalPath = try { java.net.URI(url).path ?: "" } catch (_: Exception) { "" }
 
-        // ═══ 1) LOADING PAGE DETECTION: follow redirect ═══
+        fun looksLikePlayer(h: String): Boolean =
+            h.contains("vplayer") || h.contains("jwplayer") || h.contains("sources:") || h.contains("file:")
+
+        // ═══ 1) LOADING PAGE: follow redirect ═══
         if (html.contains("Page is loading") || html.contains("please wait") ||
             (html.length < 3000 && html.contains("/main.js"))) {
-            println("WitAnimeDebug: UniversalEmbed: loading page detected")
+            println("WitAnimeDebug: UE: loading page detected (${linkHost(currentUrl)})")
 
-            val redirectTarget = Regex("""(?:location\.href|window\.location)\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            val redirectTarget = Regex("""(?:location\.href|location\.replace|window\.location)\s*\(?\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
                 ?: Regex("""http-equiv=["']refresh["'][^>]*url=([^"'>]+)""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
-                ?: Regex(""""(https?://[^"]+/e/[^"]+)"""").find(html)?.groupValues?.get(1)
 
             if (redirectTarget != null && redirectTarget.startsWith("http")) {
-                println("WitAnimeDebug: UniversalEmbed: redirect -> $redirectTarget")
-                page = app.get(redirectTarget, headers = headers, referer = currentUrl)
-                html = page.text
-                currentUrl = page.url
-            } else {
-                val mainJsUrl = "${hostOf(currentUrl)}/main.js"
-                val mainJs = try { app.get(mainJsUrl, headers = headers).text } catch (_: Exception) { "" }
-                val jsRedirect = Regex("""(?:location\.href|window\.location)\s*=\s*["']([^"']+)["']""").find(mainJs)?.groupValues?.get(1)
-                    ?: Regex(""""(https?://[^"]+)"""").find(mainJs)?.groupValues?.get(1)
+                println("WitAnimeDebug: UE: html redirect -> $redirectTarget")
+                try {
+                    page = app.get(redirectTarget, headers = headers, referer = currentUrl)
+                    html = page.text; currentUrl = page.url
+                } catch (_: Exception) {}
+            }
 
-                if (jsRedirect != null && jsRedirect.startsWith("http")) {
-                    println("WitAnimeDebug: UniversalEmbed: js redirect -> $jsRedirect")
-                    page = app.get(jsRedirect, headers = headers, referer = currentUrl)
-                    html = page.text
-                    currentUrl = page.url
+            // scan main.js for the real player domain (same path trick)
+            if (!looksLikePlayer(html)) {
+                val mainJsUrl = "${hostOf(currentUrl)}/main.js"
+                val mainJs = try { app.get(mainJsUrl, headers = headers, referer = currentUrl).text } catch (_: Exception) { "" }
+                val skip = listOf("google", "cloudflare", "yandex", "gstatic", "w3.org", "facebook",
+                    "doubleclick", "twitter", "jquery", "fontawesome", "bootstrap")
+                val candidates = Regex("""https?://([a-zA-Z0-9.-]+\.[a-z]{2,})""").findAll(mainJs)
+                    .map { it.groupValues[1] }.distinct()
+                    .filter { d -> skip.none { d.contains(it) } && d != linkHost(currentUrl) }
+                    .take(3).toList()
+                println("WitAnimeDebug: UE: main.js candidates=$candidates")
+
+                for (d in candidates) {
+                    val tryUrl = "https://$d$originalPath"
+                    try {
+                        val p2 = app.get(tryUrl, headers = headers, referer = currentUrl)
+                        if (looksLikePlayer(p2.text)) {
+                            println("WitAnimeDebug: UE: player found at $d")
+                            page = p2; html = p2.text; currentUrl = p2.url
+                            break
+                        }
+                    } catch (_: Exception) {}
                 }
             }
         }
 
-        println("WitAnimeDebug: UniversalEmbed: final host=${linkHost(currentUrl)} len=${html.length}")
+        println("WitAnimeDebug: UE: final host=${linkHost(currentUrl)} len=${html.length} player=${looksLikePlayer(html)}")
 
         val host = hostOf(currentUrl)
         val authHeaders = mapOf(
-            "Referer" to "$host/",
+            "Referer" to currentUrl,
             "Origin" to host,
             "User-Agent" to USER_AGENT
         )
         var found = false
 
         // ═══ 2) JWPLAYER + PACKED JS extraction ═══
-        val playerScriptData = when {
-            !getPacked(html).isNullOrEmpty() -> getAndUnpack(html)
-            html.contains("jwplayer(\"vplayer\").setup(") ->
-                html.substringAfter("jwplayer(\"vplayer\").setup(").substringBefore(");")
-            html.contains("jwplayer('vplayer').setup(") ->
-                html.substringAfter("jwplayer('vplayer').setup(").substringBefore(");")
-            else -> html
+        if (looksLikePlayer(html)) {
+            val playerScriptData = when {
+                !getPacked(html).isNullOrEmpty() -> getAndUnpack(html)
+                html.contains("jwplayer(\"vplayer\").setup(") ->
+                    html.substringAfter("jwplayer(\"vplayer\").setup(").substringBefore(");")
+                html.contains("jwplayer('vplayer').setup(") ->
+                    html.substringAfter("jwplayer('vplayer').setup(").substringBefore(");")
+                else -> html
+            }
+            if (JwPlayerHelper.extractStreamLinks(playerScriptData.orEmpty(), name, host, callback, subtitleCallback, authHeaders)) {
+                found = true
+                println("WitAnimeDebug: UE: JWPlayer extraction SUCCESS")
+            }
         }
 
-        if (JwPlayerHelper.extractStreamLinks(playerScriptData.orEmpty(), name, host, callback, subtitleCallback, authHeaders)) {
-            found = true
-            println("WitAnimeDebug: UniversalEmbed: JWPlayer extraction SUCCESS")
-        }
-
-        // ═══ 3) RAW m3u8 in page or unpacked JS ═══
+        // ═══ 3) RAW m3u8/mp4 ═══
         if (!found) {
             val combined = "$html\n${unpackPackedJs(html) ?: ""}".replace("\\/", "/").replace("\\\"", "\"")
             val m3u8Links = Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""").findAll(combined)
                 .map { it.groupValues[1] }.distinct().toList()
             if (m3u8Links.isNotEmpty()) {
                 m3u8Links.forEach { m3u8 ->
-                    println("WitAnimeDebug: UniversalEmbed: m3u8 -> ${m3u8.take(90)}")
-                    M3u8Helper.generateM3u8(name, m3u8, host, headers = authHeaders).forEach(callback)
+                    println("WitAnimeDebug: UE: m3u8 -> ${m3u8.take(90)}")
+                    M3u8Helper.generateM3u8(name, m3u8, currentUrl, headers = authHeaders).forEach(callback)
                 }
                 found = true
             }
@@ -196,40 +215,40 @@ internal suspend fun handleUnknownEmbed(
                 .map { it.groupValues[1] }.distinct().toList()
             if (mp4Links.isNotEmpty()) {
                 mp4Links.forEach { mp4 ->
-                    println("WitAnimeDebug: UniversalEmbed: mp4 -> ${mp4.take(90)}")
-                    callback(newExtractorLink(name, name, mp4, ExtractorLinkType.VIDEO) { this.referer = host })   // ✅ FIXED
+                    println("WitAnimeDebug: UE: mp4 -> ${mp4.take(90)}")
+                    callback(newExtractorLink(name, name, mp4.trimEnd('#'), ExtractorLinkType.VIDEO) { this.referer = host })
                 }
                 found = true
             }
         }
 
-        // ═══ 4) WEBVIEW fallback ═══
+        // ═══ 4) WEBVIEW fallback — intercepts master.txt/master.m3u8 ═══
         if (!found) {
-            println("WitAnimeDebug: UniversalEmbed: trying WebView intercept")
+            println("WitAnimeDebug: UE: trying WebView intercept")
             try {
                 val resolver = WebViewResolver(
-                    interceptUrl = Regex("""txt|m3u8|mp4"""),
-                    additionalUrls = listOf(Regex("""txt|m3u8|mp4""")),
+                    interceptUrl = Regex("""\.m3u8|\.txt|\.mp4"""),
+                    additionalUrls = listOf(Regex("""\.m3u8|\.txt|\.mp4""")),
                     useOkhttp = false,
-                    timeout = 15_000L
+                    timeout = 20_000L
                 )
                 val intercepted = app.get(url, referer = referer, interceptor = resolver).url
-                if (intercepted.isNotEmpty() && (intercepted.contains("m3u8") || intercepted.contains(".txt") || intercepted.contains(".mp4"))) {
-                    println("WitAnimeDebug: UniversalEmbed: WebView intercepted -> ${intercepted.take(90)}")
-                    if (intercepted.contains(".m3u8") || intercepted.contains(".txt")) {
-                        M3u8Helper.generateM3u8(name, intercepted, hostOf(url), headers = authHeaders).forEach(callback)
+                if (intercepted.isNotEmpty() && (intercepted.contains(".m3u8") || intercepted.contains(".txt") || intercepted.contains(".mp4"))) {
+                    println("WitAnimeDebug: UE: WebView intercepted -> ${intercepted.take(90)}")
+                    if (intercepted.contains(".mp4")) {
+                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.VIDEO) { this.referer = host })
                     } else {
-                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.VIDEO) { this.referer = hostOf(url) })   // ✅ FIXED
+                        M3u8Helper.generateM3u8(name, intercepted, currentUrl, headers = authHeaders).forEach(callback)
                     }
                     found = true
                 }
             } catch (_: Exception) {}
         }
 
-        if (!found) println("WitAnimeDebug: UniversalEmbed: nothing found for $url")
+        if (!found) println("WitAnimeDebug: UE: nothing found for $url")
         found
     } catch (e: Exception) {
-        println("WitAnimeDebug: UniversalEmbed error: ${e.message}")
+        println("WitAnimeDebug: UE error: ${e.message}")
         false
     }
 }
