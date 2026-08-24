@@ -371,7 +371,6 @@ class AnimeWitcherProvider : MainAPI() {
         val finalName = serverName
         try {
             when {
-                // 🆕 FIESTREAM (SF) - Direct CDN links with proper referer
                 host.contains("firestream.to") || host.contains("fi-cdn") || host.contains("fr-cdn") || upperName == "SF" -> {
                     val headers = mapOf(
                         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -412,10 +411,17 @@ class AnimeWitcherProvider : MainAPI() {
                     if (proxyUrl != null) { callback.invoke(newExtractorLink(source = name, name = serverName, url = proxyUrl) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
                     else { callback.invoke(newExtractorLink(source = name, name = serverName, url = fixedLink) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
                 }
-                host.contains("streamtape") || host.contains("stape.") || host.contains("shavetape") || host.contains("watchadsontape") -> {
-                    var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
+                host.contains("streamtape") || host.contains("stape.") || host.contains("shavetape") || host.contains("watchadsontape") || upperName == "ST" -> {
+                    val embedUrl = fixedLink.replace("/v/", "/e/").replace("/d/", "/e/")
+                    var ok = false
+                    try { ok = withTimeoutOrNull(10000L) { loadExtractor(embedUrl, mainUrl, subtitleCallback, callback) } ?: false } catch (_: Exception) {}
                     if (ok) return
-                    extractStreamTape(fixedLink)?.let { st -> callback.invoke(newExtractorLink(source = name, name = "$serverName ST", url = st) { referer = mainUrl; quality = getQualityFromName(server.quality) }) }
+                    extractStreamTape(embedUrl)?.let { st -> 
+                        callback.invoke(newExtractorLink(source = name, name = "$serverName ST", url = st, type = ExtractorLinkType.VIDEO) { 
+                            referer = mainUrl
+                            quality = getQualityFromName(server.quality) 
+                        }) 
+                    }
                 }
                 host.contains("mediafire") -> {
                     var ok = false; try { ok = withTimeoutOrNull(15000L) { loadExtractor(fixedLink, mainUrl, subtitleCallback, callback) } ?: false } catch (e: Exception) { }
@@ -445,39 +451,44 @@ class AnimeWitcherProvider : MainAPI() {
     private suspend fun extractStreamTape(url: String): String? {
         return try {
             val headers = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.5",
-                "Sec-Fetch-Dest" to "document",
-                "Sec-Fetch-Mode" to "navigate",
-                "Sec-Fetch-Site" to "none",
-                "Sec-Fetch-User" to "?1"
+                "Referer" to "https://streamtape.com/"
             )
             val html = app.get(url, headers = headers).text
             
-            // 🆕 Enhanced StreamTape patterns
-            val patterns = listOf(
-                // Pattern 1: robotlink method (most common)
-                Regex("""id=["']norobotlink["'][^>]*>([^<]+)<"""),
-                Regex("""getElementById\(['"]norobotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]"""),
-                // Pattern 2: get_video endpoint
-                Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)"""),
-                // Pattern 3: Direct MP4 in script
-                Regex("""['"]([^'']*\.mp4[^'']*streamtape[^'']*)['"]"""),
-                // Pattern 4: Alternative get_video pattern
-                Regex("""get_video[^'"]*['"]([^'"]+)['"]""")
-            )
-            
-            for (regex in patterns) {
-                val match = regex.find(html)
-                if (match != null) {
-                    var link = match.groupValues[1].trim()
-                    if (link.startsWith("//")) link = "https:$link"
-                    else if (!link.startsWith("http")) link = "https://streamtape.com$link"
-                    if (!link.contains("&stream=1")) link += "&stream=1"
-                    return link
-                }
+            Regex("""getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(['"]([^'"]+)['"]\)\.substring\((\d+)\)""").find(html)?.let { match ->
+                val baseUrl = match.groupValues[1]
+                val token = match.groupValues[2]
+                val subIndex = match.groupValues[3].toIntOrNull() ?: 1
+                val finalToken = if (subIndex < token.length) token.substring(subIndex) else ""
+                var link = baseUrl + finalToken
+                if (link.startsWith("//")) link = "https:$link"
+                if (!link.contains("&stream=1")) link += "&stream=1"
+                return link
             }
+
+            Regex("""id=["']robotlink["'][^>]*>([^<]+)<""").find(html)?.let { match ->
+                var link = match.groupValues[1].trim()
+                if (link.startsWith("//")) link = "https:$link"
+                if (!link.contains("&stream=1")) link += "&stream=1"
+                return link
+            }
+
+            Regex("""(https?://[^"'\s]*?/get_video\?[^"'\s]+)""").find(html)?.let { match ->
+                var link = match.groupValues[1].trim()
+                if (!link.contains("&stream=1")) link += "&stream=1"
+                return link
+            }
+
+            Regex("""id=["']norobotlink["'][^>]*>([^<]+)<""").find(html)?.let { match ->
+                var link = match.groupValues[1].trim()
+                if (link.startsWith("//")) link = "https:$link"
+                if (!link.contains("&stream=1")) link += "&stream=1"
+                return link
+            }
+            
             null
         } catch (e: Exception) { null }
     }
