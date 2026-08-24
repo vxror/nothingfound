@@ -197,7 +197,7 @@ internal suspend fun handleUnknownEmbed(
             if (mp4Links.isNotEmpty()) {
                 mp4Links.forEach { mp4 ->
                     println("WitAnimeDebug: UniversalEmbed: mp4 -> ${mp4.take(90)}")
-                    callback(newExtractorLink(name, name, mp4, ExtractorLinkType.VIDEO) { referer = host })
+                    callback(newExtractorLink(name, name, mp4, ExtractorLinkType.VIDEO) { this.referer = host })   // ✅ FIXED
                 }
                 found = true
             }
@@ -219,7 +219,7 @@ internal suspend fun handleUnknownEmbed(
                     if (intercepted.contains(".m3u8") || intercepted.contains(".txt")) {
                         M3u8Helper.generateM3u8(name, intercepted, hostOf(url), headers = authHeaders).forEach(callback)
                     } else {
-                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.VIDEO) { referer = hostOf(url) })
+                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.VIDEO) { this.referer = hostOf(url) })   // ✅ FIXED
                     }
                     found = true
                 }
