@@ -16,6 +16,8 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(MegaExtractor())
         registerExtractorAPI(FourSharedExtractor())
         registerExtractorAPI(FileMoonExtractor())
+        registerExtractorAPI(DotPlayExtractor())     // ← NEW
+        registerExtractorAPI(SoraplayExtractor())   // ← NEW
 
         // Dood family
         registerExtractorAPI(DoodExtractor())
