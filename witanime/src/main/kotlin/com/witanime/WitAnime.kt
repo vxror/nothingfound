@@ -240,7 +240,7 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER — quality labels flow to dotplay + soraplay + mega + 4shared */
+    /** ⚡ THE ROUTER */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         println("WitAnimeDebug: routing -> $link")
         val host = linkHost(link)
@@ -275,7 +275,6 @@ class WitAnime : MainAPI() {
 
             val seen = mutableSetOf<String>()
 
-            // 1) STRUCTURED parser — host + QUALITY label
             Regex(
                 """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
                 RegexOption.DOT_MATCHES_ALL
@@ -301,7 +300,6 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 2) bare go_to_player
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
@@ -312,12 +310,10 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 3) plain file-host hrefs (NO mediafire)
             Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
                 if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, callback) }
             }
 
-            // 4) iframes → recurse once
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
@@ -326,8 +322,24 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 5) DIRECT CDN links
             Regex("""https?://[^\s"'<>]+""").findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
                     if (seen.add(cdn)) {
-                        println("WitAnimeDebug: Yona CDN -> ${cdn.take(
+                        println("WitAnimeDebug: Yona CDN -> ${cdn.take(90)}")
+                        emitDirectCdn(cdn, callback = callback)
+                    }
+                }
+
+            Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
+                val url = m.groupValues[1]
+                if (!url.contains("googleapis") && !url.contains("drive.google") && !isDirectCdnLink(url) && seen.add(url)) {
+                    callback(newExtractorLink("Yonaplay", "Yonaplay Direct", url,
+                        if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                        referer = yonaplayUrl; quality = Qualities.Unknown.value
+                    })
+                }
+            }
+            println("WitAnimeDebug: Yona emitted=${seen.size}")
+        } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
+    }
+}
