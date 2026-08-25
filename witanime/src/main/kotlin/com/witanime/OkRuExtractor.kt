@@ -53,7 +53,6 @@ class OkRuExtractor : ExtractorApi() {
                 if (apiText.length > 100) {
                     val json = try { JSONObject(apiText) } catch (_: Exception) { null }
                     if (json != null) {
-                        // videos array — each entry is a quality variant
                         val videos = json.optJSONArray("videos")
                         if (videos != null && videos.length() > 0) {
                             for (i in 0 until videos.length()) {
@@ -73,7 +72,6 @@ class OkRuExtractor : ExtractorApi() {
                             }
                         }
 
-                        // fallback: hlsManifestUrl → master playlist → M3u8Helper splits into qualities
                         if (!emitted) {
                             val hls = json.optString("hlsManifestUrl")
                             if (hls.isNotBlank() && hls.startsWith("http")) {
@@ -84,7 +82,6 @@ class OkRuExtractor : ExtractorApi() {
                             }
                         }
 
-                        // fallback: movie > videos
                         if (!emitted) {
                             val movie = json.optJSONObject("movie")
                             val movieVideos = movie?.optJSONArray("videos")
@@ -127,7 +124,7 @@ class OkRuExtractor : ExtractorApi() {
                     interceptUrl = Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8"""),
                     additionalUrls = listOf(Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8""")),
                     useOkhttp = false,
-                    timeout = 18_000L
+                    timeout = 10_000L   // ⚡ REDUCED from 18s
                 )
                 val wvResp = app.get(url, referer = referer, interceptor = resolver)
                 val intercepted = wvResp.url
@@ -135,10 +132,8 @@ class OkRuExtractor : ExtractorApi() {
 
                 if (intercepted.isNotEmpty() && intercepted.contains("okcdn")) {
                     if (intercepted.contains("videoPlayerCdn") || intercepted.contains(".m3u8")) {
-                        // Master playlist → M3u8Helper parses all quality variants
                         M3u8Helper.generateM3u8(name, intercepted, "https://ok.ru/", headers = playbackHeaders).forEach(callback)
                     } else {
-                        // Quality variant URL — emit directly
                         callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.M3U8) {
                             this.referer = "https://ok.ru/"
                             this.headers = playbackHeaders
