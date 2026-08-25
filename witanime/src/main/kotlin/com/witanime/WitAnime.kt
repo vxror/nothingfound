@@ -241,26 +241,38 @@ class WitAnime : MainAPI() {
     }
 
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
+        // [!] GLOBAL FIX: strip duplicated quality tokens from every display name.
+        // "720p (Videa)" -> "Videa" | "4Shared HD" -> "4Shared" | "Mega (CF Bypass) FHD" -> "Mega (CF Bypass)"
+        // The quality badge (720p/1080p) is still shown by the player, so nothing is lost.
+        val emit: (ExtractorLink) -> Unit = { l ->
+            val cleaned = l.name
+                .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
+                .replace(Regex("""\(\s*\)"""), "")
+                .replace(Regex("""\s{2,}"""), " ")
+                .trim()
+            callback(if (cleaned.isBlank()) l else l.copy(name = cleaned))
+        }
+
         println("WitAnimeDebug: routing -> $link")
         val host = linkHost(link)
         when {
-            host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
-            host.contains("dotplay") -> DotPlayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
-            host.contains("soraplay") -> SoraplayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
-            isDirectCdnLink(link) -> emitDirectCdn(link, qLabel, callback)
-            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("ok.ru") || host.contains("odnoklassniki") -> OkRuExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, callback)
-            isMegaLink(link) -> MegaExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
-            isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, callback)
-            host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
+            host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, emit)
+            host.contains("dotplay") -> DotPlayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
+            host.contains("soraplay") -> SoraplayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
+            isDirectCdnLink(link) -> emitDirectCdn(link, qLabel, emit)
+            host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("ok.ru") || host.contains("odnoklassniki") -> OkRuExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, emit)
+            isMegaLink(link) -> MegaExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
+            isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
             host.contains("mediafire") -> { /* ❌ removed */ }
-            isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, callback)
+            isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
-                val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, callback)
-                if (!ok) handleUnknownEmbed(link, referer, "Stream", subtitleCallback, callback)
+                val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, emit)
+                if (!ok) handleUnknownEmbed(link, referer, "Stream", subtitleCallback, emit)
             }
         }
     }
