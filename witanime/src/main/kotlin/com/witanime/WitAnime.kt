@@ -228,7 +228,6 @@ class WitAnime : MainAPI() {
                 servers.map { (sid, label) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
             }
 
-            // ✅ mediafire filtered at the source
             val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
             println("WitAnimeDebug: downloads=${dlLinks.size} (mediafire filtered)")
             supervisorScope {
@@ -241,13 +240,13 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER */
+    /** ⚡ THE ROUTER — dotplay now gets quality labels too */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         println("WitAnimeDebug: routing -> $link")
         val host = linkHost(link)
         when {
             host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
-            host.contains("dotplay") -> DotPlayExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("dotplay") -> DotPlayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
             host.contains("soraplay") -> SoraplayExtractor().getUrl(link, referer, subtitleCallback, callback)
             isDirectCdnLink(link) -> emitDirectCdn(link, qLabel, callback)
             host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
@@ -267,7 +266,7 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** 🔓 YONAPLAY aggregator */
+    /** 🔓 YONAPLAY aggregator — quality labels flow to all children */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val res = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
@@ -276,7 +275,7 @@ class WitAnime : MainAPI() {
 
             val seen = mutableSetOf<String>()
 
-            // 1) STRUCTURED parser
+            // 1) STRUCTURED parser — extracts host + QUALITY label from <p> tag
             Regex(
                 """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
                 RegexOption.DOT_MATCHES_ALL
@@ -302,7 +301,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 2) bare go_to_player
+            // 2) bare go_to_player — tries to detect quality from URL itself
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
@@ -313,7 +312,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 3) plain file-host hrefs
+            // 3) plain file-host hrefs (NO mediafire)
             Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
                 if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, callback) }
             }
