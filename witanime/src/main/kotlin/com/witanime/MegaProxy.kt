@@ -26,12 +26,22 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private val seq = AtomicInteger(0)
     
-    // [!] Dedicated client with long read timeout for video streaming
+    // [!] Aggressive timeouts to ensure instant fallback to OkRu/StreamWish if Mega blocks us
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.MINUTES)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
         .build()
+
+    // [!] Premium-grade rotating User-Agents to bypass AI bot-fingerprinting
+    private val USER_AGENTS = listOf(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    )
 
     data class MegaFile(
         val dlUrl: String, 
@@ -46,7 +56,6 @@ object MegaProxy {
         try {
             val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
             serverSocket = server
-            println("WitAnimeDebug: MegaProxy listening on ${server.localPort}")
             Thread {
                 while (!server.isClosed) {
                     try {
@@ -57,7 +66,7 @@ object MegaProxy {
                         }.apply { isDaemon = true }.start()
                     } catch (e: Exception) { 
                         if (server.isClosed) break 
-                        Thread.sleep(100) // Prevent tight loop on error
+                        Thread.sleep(100)
                     }
                 }
             }.apply { isDaemon = true; name = "MegaProxy-Accept" }.start()
@@ -68,7 +77,6 @@ object MegaProxy {
 
     private fun ensureAlive() {
         if (serverSocket == null || serverSocket?.isClosed == true) {
-            println("WitAnimeDebug: MegaProxy server dead → restarting")
             serverSocket = null
             start()
         }
@@ -80,7 +88,7 @@ object MegaProxy {
         val iterator = files.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            // [!] Auto cleanup after 30 minutes to aggressively free RAM and save cache storage
+            // [!] 30-minute TTL to aggressively free RAM
             if (now - entry.value.createdAt > 1_800_000) {
                 iterator.remove()
             }
@@ -91,29 +99,21 @@ object MegaProxy {
         return try {
             ensureAlive()
 
-            // [!] Robust regex for both old (#!...!...) and new (/file/...#...) Mega URLs
             val m = Regex("""(?:[#!]|file/)([A-Za-z0-9_-]{8})[#!]([A-Za-z0-9_-]{20,})""").find(url)
                 ?: Regex("""([A-Za-z0-9_-]{8})[#!]([A-Za-z0-9_-]{20,})""").find(url)
                 ?: return null
                 
             val fileId = m.groupValues[1]
             
-            // [!] Robust Base64 decoding with proper padding handling for URL-safe keys
             var keyStr = m.groupValues[2].replace("-", "+").replace("_", "/")
             val pad = keyStr.length % 4
             if (pad != 0) keyStr += "=".repeat(4 - pad)
             
             val key = try {
                 Base64.decode(keyStr, Base64.DEFAULT)
-            } catch (e: Exception) { 
-                println("WitAnimeDebug: Mega base64 fail: ${e.message}")
-                return null 
-            }
+            } catch (e: Exception) { return null }
             
-            if (key.size != 32 && key.size != 16) {
-                println("WitAnimeDebug: Mega key size invalid: ${key.size}")
-                return null
-            }
+            if (key.size != 32 && key.size != 16) return null
 
             val aesKey: ByteArray
             val nonce: ByteArray
@@ -122,7 +122,7 @@ object MegaProxy {
                 nonce = key.copyOfRange(16, 24)
             } else {
                 aesKey = key.copyOf(16)
-                nonce = ByteArray(8) // Fallback for 128-bit keys
+                nonce = ByteArray(8)
             }
 
             val body = """[{"a":"g","g":1,"ssl":2,"p":"$fileId"}]"""
@@ -130,22 +130,16 @@ object MegaProxy {
                 
             val resp = app.post(
                 "https://g.api.mega.co.nz/cs?id=${seq.incrementAndGet()}",
-                headers = mapOf("User-Agent" to EXTRACTOR_UA),
+                headers = mapOf("User-Agent" to USER_AGENTS.random()),
                 requestBody = body
             ).text
             
-            if (resp.isBlank() || resp.startsWith("-")) {
-                println("WitAnimeDebug: Mega API error code: $resp")
-                return null
-            }
+            if (resp.isBlank() || resp.startsWith("-")) return null
 
             val arr = JSONArray(resp)
             if (arr.length() == 0) return null
             
-            val obj = arr.optJSONObject(0) ?: run {
-                println("WitAnimeDebug: Mega api err ${arr.opt(0)}")
-                return null
-            }
+            val obj = arr.optJSONObject(0) ?: return null
             
             val size = obj.optLong("s", -1)
             val dl = obj.optString("g")
@@ -154,7 +148,6 @@ object MegaProxy {
             val server = serverSocket ?: return null
             val token = "${System.currentTimeMillis()}_${seq.incrementAndGet()}"
             files[token] = MegaFile(dl, size, aesKey, nonce)
-            println("WitAnimeDebug: Mega resolved token=$token size=${size / 1048576}MB")
             "http://127.0.0.1:${server.localPort}/v/$token.mp4"
         } catch (e: Exception) {
             println("WitAnimeDebug: Mega resolve fail: ${e.message}")
@@ -164,7 +157,7 @@ object MegaProxy {
 
     private fun handleClient(socket: Socket) {
         try {
-            socket.soTimeout = 60_000
+            socket.soTimeout = 15_000 // Aggressive timeout
             val input = BufferedReader(InputStreamReader(socket.getInputStream()))
             val output = socket.getOutputStream()
             val requestLine = input.readLine() ?: return
@@ -206,47 +199,56 @@ object MegaProxy {
 
             val req = Request.Builder().url(file.dlUrl)
                 .header("Range", "bytes=$start-$end")
-                .header("User-Agent", EXTRACTOR_UA)
+                .header("User-Agent", USER_AGENTS.random())
+                .header("Accept", "*/*")
                 .build()
                 
-            httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
+            val resp = httpClient.newCall(req).execute()
+            
+            // [!] INSTANT FALLBACK TRIGGER: If Mega blocks us (509/403), kill the socket immediately.
+            // This forces ExoPlayer to throw an error and instantly load OkRu/StreamWish.
+            if (!resp.isSuccessful) {
+                if (resp.code == 509 || resp.code == 403) {
+                    println("WitAnimeDebug: 🚨 MEGA ${resp.code} LIMIT! Dropping connection instantly for Auto-Fallback.")
+                } else {
                     println("WitAnimeDebug: MegaProxy upstream failed: ${resp.code}")
-                    return
                 }
-                val body = resp.body?.byteStream() ?: return
-                
-                val iv = ByteBuffer.allocate(16)
-                iv.put(file.nonce)
-                iv.putLong(start / 16)
-                
-                val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(file.aesKey, "AES"), IvParameterSpec(iv.array()))
-                
-                val buf = ByteArray(64 * 1024)
-                var n: Int
-                // [!] Safe byte-skipping logic to prevent AES-CTR counter desync on Range requests
-                var bytesToSkip = (start % 16).toInt()
-                
-                while (body.read(buf).also { n = it } != -1) {
-                    val out = cipher.update(buf, 0, n) ?: continue
-                    if (bytesToSkip > 0) {
-                        if (out.size <= bytesToSkip) {
-                            bytesToSkip -= out.size
-                            continue
-                        } else {
-                            output.write(out, bytesToSkip, out.size - bytesToSkip)
-                            bytesToSkip = 0
-                        }
-                    } else {
-                        output.write(out)
-                    }
-                    output.flush()
-                }
-                try { cipher.doFinal()?.let { output.write(it) } } catch (_: Exception) {}
+                resp.close()
+                return 
             }
+
+            val body = resp.body?.byteStream() ?: run { resp.close(); return }
+            
+            val iv = ByteBuffer.allocate(16)
+            iv.put(file.nonce)
+            iv.putLong(start / 16)
+            
+            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(file.aesKey, "AES"), IvParameterSpec(iv.array()))
+            
+            val buf = ByteArray(64 * 1024)
+            var n: Int
+            var bytesToSkip = (start % 16).toInt()
+            
+            while (body.read(buf).also { n = it } != -1) {
+                val out = cipher.update(buf, 0, n) ?: continue
+                if (bytesToSkip > 0) {
+                    if (out.size <= bytesToSkip) {
+                        bytesToSkip -= out.size
+                        continue
+                    } else {
+                        output.write(out, bytesToSkip, out.size - bytesToSkip)
+                        bytesToSkip = 0
+                    }
+                } else {
+                    output.write(out)
+                }
+                output.flush()
+            }
+            try { cipher.doFinal()?.let { output.write(it) } } catch (_: Exception) {}
+            resp.close()
         } catch (e: SocketException) {
-            // Client disconnected or timeout, normal behavior when user pauses/stops video
+            // Client disconnected or timeout
         } catch (_: Exception) {
         } finally {
             try { socket.close() } catch (_: Exception) {}
