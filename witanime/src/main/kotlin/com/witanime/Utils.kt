@@ -280,7 +280,7 @@ internal suspend fun handleUnknownEmbed(
                     interceptUrl = Regex("""\.m3u8|\.txt|\.mp4"""),
                     additionalUrls = listOf(Regex("""\.m3u8|\.txt|\.mp4""")),
                     useOkhttp = false,
-                    timeout = 8_000L   // ⚡ REDUCED from 12s
+                    timeout = 12_000L   // ⚡ REDUCED from 12s
                 )
                 val intercepted = app.get(url, referer = referer, interceptor = resolver).url
                 if (intercepted.isNotEmpty() && (intercepted.contains(".m3u8") || intercepted.contains(".txt") || intercepted.contains(".mp4"))) {
