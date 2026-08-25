@@ -43,7 +43,7 @@ class OkRuExtractor : ExtractorApi() {
 
             // ═══ METHOD 1: Metadata API ═══
             try {
-                app.get(url, headers = headers)  // establish session
+                app.get(url, headers = headers)
 
                 val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
                 val apiResp = app.get(apiUrl, headers = headers)
@@ -117,14 +117,14 @@ class OkRuExtractor : ExtractorApi() {
                 }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView intercept ═══
+            // ═══ METHOD 3: WebView intercept — 15s (reverted from 10s) ═══
             println("WitAnimeDebug: OkRu: trying WebView")
             try {
                 val resolver = WebViewResolver(
                     interceptUrl = Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8"""),
                     additionalUrls = listOf(Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8""")),
                     useOkhttp = false,
-                    timeout = 10_000L   // ⚡ REDUCED from 18s
+                    timeout = 15_000L   // ⚡ REVERTED from 10s back to 15s
                 )
                 val wvResp = app.get(url, referer = referer, interceptor = resolver)
                 val intercepted = wvResp.url
