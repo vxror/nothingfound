@@ -10,6 +10,9 @@ class SoraplayExtractor : ExtractorApi() {
     override val mainUrl = "https://soraplay.xyz"
     override val requiresReferer = false
 
+    /** quality label (HD/FHD) from the parent server, set by routeLink */
+    var linkLabel: String? = null
+
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
@@ -20,31 +23,24 @@ class SoraplayExtractor : ExtractorApi() {
 
             var found = false
 
-            // 1) Direct mp4/m3u8 links
+            // 1) Direct mp4/m3u8 links — quality from URL (480p/720p/1080p in filename)
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val link = m.groupValues[1]
                 println("WitAnimeDebug: Sora direct -> ${link.take(90)}")
-                callback(newExtractorLink(name, name, link,
-                    if (link.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                    this.referer = mainUrl
-                    quality = detectQuality(link)
-                })
+                emitSora(link, callback)
                 found = true
             }
 
-            // 2) Relative paths starting with /
+            // 2) Relative paths
             if (!found) {
                 Regex("""["'](/[^"']*\.(?:mp4|m3u8)[^"']*)["']""").findAll(html).forEach { m ->
                     val link = m.groupValues[1]
-                    callback(newExtractorLink(name, name, "$mainUrl$link", ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                        quality = detectQuality(link)
-                    })
+                    emitSora("$mainUrl$link", callback)
                     found = true
                 }
             }
 
-            // 3) WebView intercept — JS constructs the URL
+            // 3) WebView intercept
             if (!found) {
                 println("WitAnimeDebug: Sora: trying WebView intercept")
                 try {
@@ -57,10 +53,7 @@ class SoraplayExtractor : ExtractorApi() {
                     val intercepted = app.get(url, referer = referer, interceptor = resolver).url
                     if (intercepted.isNotEmpty() && (intercepted.contains(".mp4") || intercepted.contains(".m3u8"))) {
                         println("WitAnimeDebug: Sora WV -> ${intercepted.take(90)}")
-                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.VIDEO) {
-                            this.referer = mainUrl
-                            quality = detectQuality(intercepted)
-                        })
+                        emitSora(intercepted, callback)
                         found = true
                     }
                 } catch (_: Exception) {}
@@ -72,11 +65,13 @@ class SoraplayExtractor : ExtractorApi() {
         }
     }
 
-    private fun detectQuality(url: String): Int = when {
-        url.contains("1080") || url.contains("FHD", true) || url.contains("source") -> Qualities.P1080.value
-        url.contains("720") || url.contains("HD", true) -> Qualities.P720.value
-        url.contains("480") -> Qualities.P480.value
-        url.contains("360") -> Qualities.P360.value
-        else -> Qualities.Unknown.value
+    private suspend fun emitSora(link: String, callback: (ExtractorLink) -> Unit) {
+        val cleanUrl = link.trimEnd('#')
+        val qName = qualityName(cleanUrl, linkLabel)
+        callback(newExtractorLink(name, name + (qName?.let { " $it" } ?: ""), cleanUrl,
+            if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+            this.referer = mainUrl
+            quality = bestQuality(cleanUrl, linkLabel)
+        })
     }
 }
