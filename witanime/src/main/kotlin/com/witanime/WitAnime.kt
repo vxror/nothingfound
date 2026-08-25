@@ -217,7 +217,7 @@ class WitAnime : MainAPI() {
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
                             "$link&apiKey=$FRAMEWORK_HASH" else link
-                        withTimeoutOrNull(25_000) {
+                        withTimeoutOrNull(15_000) {   // ⚡ REDUCED from 25s
                             routeLink(finalLink, data, subtitleCallback, callback)
                         } ?: println("WitAnimeDebug: [$label] TIMEOUT")
                     }
@@ -233,14 +233,13 @@ class WitAnime : MainAPI() {
             supervisorScope {
                 dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                     val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                    if (final.startsWith("http")) withTimeoutOrNull(25_000) { routeLink(final, data, subtitleCallback, callback) }
+                    if (final.startsWith("http")) withTimeoutOrNull(15_000) { routeLink(final, data, subtitleCallback, callback) }
                 } catch (_: Exception) {} } } }.awaitAll()
             }
             true
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         println("WitAnimeDebug: routing -> $link")
         val host = linkHost(link)
@@ -266,7 +265,6 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** 🔓 YONAPLAY aggregator */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val res = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
