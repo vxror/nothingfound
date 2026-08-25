@@ -128,7 +128,59 @@ internal suspend fun emitDirectCdn(link: String, qLabel: String? = null, callbac
 }
 
 /**
- * ⚡ UNIVERSAL EMBED HANDLER
+ * 🎯 Verify an m3u8 URL actually serves a manifest before emitting.
+ * Also extracts quality from the RESOLUTION line (Toonstream technique).
+ * Returns Pair(quality, isWorking) or null if unreachable.
+ */
+internal suspend fun verifyM3u8(url: String, referer: String? = null): Pair<Int, Boolean>? {
+    return try {
+        val body = app.get(url, headers = mapOf(
+            "User-Agent" to EXTRACTOR_UA,
+            "Referer" to (referer ?: url)
+        )).text
+        if (!body.contains("#EXTM3U")) return null
+
+        val quality = when {
+            body.contains("1920x1080") || body.contains("1920x1088") -> Qualities.P1080.value
+            body.contains("1280x720") -> Qualities.P720.value
+            body.contains("856x480") || body.contains("854x480") || body.contains("640x360") -> Qualities.P480.value
+            body.contains("3840x2160") || body.contains("2560x1440") -> Qualities.P2160.value
+            else -> Qualities.Unknown.value
+        }
+        quality to true
+    } catch (_: Exception) { null }
+}
+
+/**
+ * 🎯 Pick the first WORKING hls link from candidates
+ * (Toonstream/GDMirrorbot technique: try hls2, hls4, hls3, hls1 in order,
+ * verify manifest, fall back to best-guess if all fail)
+ */
+internal suspend fun pickWorkingHls(
+    candidates: Map<String, String>,
+    referer: String? = null
+): Pair<String, Int>? {
+    val ordered = listOf("hls2", "hls4", "hls3", "hls1")
+        .mapNotNull { candidates[it] }
+        .ifEmpty { candidates.values.toList() }
+
+    for (url in ordered) {
+        val result = verifyM3u8(url, referer)
+        if (result != null && result.second) {
+            println("WitAnimeDebug: verifyM3u8 OK quality=${result.first} -> ${url.take(80)}")
+            return url to result.first
+        }
+    }
+    // last resort: return first candidate unverified (better than nothing)
+    return ordered.firstOrNull()?.let { it to Qualities.Unknown.value }
+}
+
+/**
+ * ⚡ UNIVERSAL EMBED HANDLER — works for ANY embed page:
+ *   1. Follows loading-page redirects (hgcloud.to → hanerix.com)
+ *   2. JWPlayer + packed JS → JwPlayerHelper extraction
+ *   3. Raw m3u8/mp4 in page → verified + emit directly
+ *   4. WebView m3u8/txt/mp4 intercept fallback
  */
 internal suspend fun handleUnknownEmbed(
     url: String, referer: String?, name: String,
@@ -150,6 +202,7 @@ internal suspend fun handleUnknownEmbed(
         fun looksLikePlayer(h: String): Boolean =
             h.contains("vplayer") || h.contains("jwplayer") || h.contains("sources:") || h.contains("file:")
 
+        // ═══ 1) LOADING PAGE: follow redirect ═══
         if (html.contains("Page is loading") || html.contains("please wait") ||
             (html.length < 3000 && html.contains("/main.js"))) {
             println("WitAnimeDebug: UE: loading page detected (${linkHost(currentUrl)})")
@@ -165,6 +218,7 @@ internal suspend fun handleUnknownEmbed(
                 } catch (_: Exception) {}
             }
 
+            // scan main.js for the real player domain (same path trick)
             if (!looksLikePlayer(html)) {
                 val mainJsUrl = "${hostOf(currentUrl)}/main.js"
                 val mainJs = try { app.get(mainJsUrl, headers = headers, referer = currentUrl).text } catch (_: Exception) { "" }
@@ -200,6 +254,7 @@ internal suspend fun handleUnknownEmbed(
         )
         var found = false
 
+        // ═══ 2) JWPLAYER + PACKED JS extraction ═══
         if (looksLikePlayer(html)) {
             val playerScriptData = when {
                 !getPacked(html).isNullOrEmpty() -> getAndUnpack(html)
@@ -215,16 +270,21 @@ internal suspend fun handleUnknownEmbed(
             }
         }
 
+        // ═══ 3) RAW m3u8 — verified + quality from manifest (Toonstream technique) ═══
         if (!found) {
             val combined = "$html\n${unpackPackedJs(html) ?: ""}".replace("\\/", "/").replace("\\\"", "\"")
             val m3u8Links = Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""").findAll(combined)
                 .map { it.groupValues[1] }.distinct().toList()
             if (m3u8Links.isNotEmpty()) {
                 m3u8Links.forEach { m3u8 ->
-                    println("WitAnimeDebug: UE: m3u8 -> ${m3u8.take(90)}")
-                    M3u8Helper.generateM3u8(name, m3u8, currentUrl, headers = authHeaders).forEach(callback)
+                    println("WitAnimeDebug: UE: m3u8 candidate -> ${m3u8.take(90)}")
+                    val verified = verifyM3u8(m3u8, currentUrl)
+                    if (verified != null) {
+                        println("WitAnimeDebug: UE: m3u8 VERIFIED quality=${verified.first}")
+                        M3u8Helper.generateM3u8(name, m3u8, currentUrl, headers = authHeaders).forEach(callback)
+                        found = true
+                    }
                 }
-                found = true
             }
         }
         if (!found) {
@@ -239,6 +299,7 @@ internal suspend fun handleUnknownEmbed(
             }
         }
 
+        // ═══ 4) WEBVIEW fallback — intercepts master.txt/master.m3u8 ═══
         if (!found) {
             println("WitAnimeDebug: UE: trying WebView intercept")
             try {
