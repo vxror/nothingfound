@@ -127,7 +127,7 @@ class DotPlayExtractor : ExtractorApi() {
         }
     }
 
-    private fun emitVideo(videoUrl: String, callback: (ExtractorLink) -> Unit) {
+        private suspend fun emitVideo(videoUrl: String, callback: (ExtractorLink) -> Unit) {
         val cleanUrl = videoUrl.trimEnd('#', '"')
         println("WitAnimeDebug: DotPlay emitting -> ${cleanUrl.take(100)}")
         callback(newExtractorLink(name, "DotPlay", cleanUrl,
