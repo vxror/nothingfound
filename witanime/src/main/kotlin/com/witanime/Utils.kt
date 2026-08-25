@@ -230,6 +230,7 @@ internal suspend fun handleUnknownEmbed(
         )
         var found = false
 
+        // ═══ 2) PACKED JS + custom HLS extraction (correct quality labels) ═══
         if (looksLikePlayer(html)) {
             val playerScriptData = when {
                 !getPacked(html).isNullOrEmpty() -> getAndUnpack(html)
@@ -239,9 +240,31 @@ internal suspend fun handleUnknownEmbed(
                     html.substringAfter("jwplayer('vplayer').setup(").substringBefore(");")
                 else -> html
             }
-            if (JwPlayerHelper.extractStreamLinks(playerScriptData.orEmpty(), name, host, callback, subtitleCallback, authHeaders)) {
-                found = true
-                println("WitAnimeDebug: UE: JWPlayer extraction SUCCESS")
+
+            // ⚡ Try custom HLS extraction first (with verified quality from manifest)
+            val unpacked = unpackPackedJs(html) ?: html
+            val combined = "$html\n$unpacked".replace("\\/", "/").replace("\\\"", "\"")
+            val hlsUrls = Regex("""(?:file|sources|src)\s*[":]\s*["'](https?://[^"']+(?:\.m3u8|\.txt)[^"']*)["']""", RegexOption.IGNORE_CASE)
+                .findAll(combined).map { it.groupValues[1] }.distinct().toList()
+
+            if (hlsUrls.isNotEmpty()) {
+                for (m3u8Url in hlsUrls) {
+                    val verified = verifyM3u8(m3u8Url, currentUrl)
+                    if (verified != null) {
+                        println("WitAnimeDebug: UE: custom hls quality=${verified.first} -> ${m3u8Url.take(80)}")
+                        M3u8Helper.generateM3u8(name, m3u8Url, currentUrl, headers = authHeaders).forEach(callback)
+                        found = true
+                    } else {
+                        M3u8Helper.generateM3u8(name, m3u8Url, currentUrl, headers = authHeaders).forEach(callback)
+                        found = true
+                    }
+                }
+            } else {
+                // No direct hls links — fall back to JWPlayer helper
+                if (JwPlayerHelper.extractStreamLinks(playerScriptData.orEmpty(), name, host, callback, subtitleCallback, authHeaders)) {
+                    found = true
+                    println("WitAnimeDebug: UE: JWPlayer extraction SUCCESS")
+                }
             }
         }
 
@@ -280,7 +303,7 @@ internal suspend fun handleUnknownEmbed(
                     interceptUrl = Regex("""\.m3u8|\.txt|\.mp4"""),
                     additionalUrls = listOf(Regex("""\.m3u8|\.txt|\.mp4""")),
                     useOkhttp = false,
-                    timeout = 12_000L   // ⚡ REDUCED from 12s
+                    timeout = 12_000L
                 )
                 val intercepted = app.get(url, referer = referer, interceptor = resolver).url
                 if (intercepted.isNotEmpty() && (intercepted.contains(".m3u8") || intercepted.contains(".txt") || intercepted.contains(".mp4"))) {
