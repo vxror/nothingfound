@@ -18,31 +18,62 @@ class OkRuExtractor : ExtractorApi() {
         try {
             println("WitAnimeDebug: OkRu START url=$url")
 
-            // Extract video ID from both URL formats
             val videoId = url.substringAfter("/videoembed/").substringAfter("/video/")
                 .substringBefore("/").substringBefore("?").trim()
             if (videoId.isBlank()) { println("WitAnimeDebug: OkRu no ID"); return }
 
+            // 🍪 Cookie-sharing headers — the SAME session used for API and playback
             val headers = mapOf(
                 "User-Agent" to EXTRACTOR_UA,
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
                 "Referer" to (referer ?: "https://ok.ru/"),
+                "Sec-Fetch-Dest" to "iframe",
+                "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Site" to "cross-site",
             )
 
             var emitted = false
 
-            // ═══ METHOD 1: Metadata API — returns JSON with video URLs directly ═══
+            // ═══ METHOD 1: Metadata API with session cookies ═══
             try {
+                // First: visit the embed page to get PHPSESSID cookies
+                val embedResp = app.get(url, headers = headers)
+                println("WitAnimeDebug: OkRu embed visited, cookies established")
+
                 val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
                 val apiResp = app.get(apiUrl, headers = headers)
                 val apiText = apiResp.text
                 println("WitAnimeDebug: OkRu API len=${apiText.length}")
 
+                // Extract cookies from the response for playback
+                val cookieString = buildString {
+                    embedResp.headers.values("set-cookie").forEach { sc ->
+                        val name = sc.substringBefore("=")
+                        val value = sc.substringAfter("=").substringBefore(";")
+                        if (isNotEmpty()) append("; ")
+                        append("$name=$value")
+                    }
+                    apiResp.headers.values("set-cookie").forEach { sc ->
+                        val name = sc.substringBefore("=")
+                        val value = sc.substringAfter("=").substringBefore(";")
+                        if (isNotEmpty()) append("; ")
+                        append("$name=$value")
+                    }
+                }
+                println("WitAnimeDebug: OkRu cookies: ${cookieString.take(60)}...")
+
                 if (apiText.length > 100) {
                     val json = try { JSONObject(apiText) } catch (_: Exception) { null }
                     if (json != null) {
-                        // Try videos array (most common format)
+                        // Playback headers include the session cookies
+                        val playbackHeaders = mapOf(
+                            "User-Agent" to EXTRACTOR_UA,
+                            "Referer" to "https://ok.ru/",
+                            "Origin" to "https://ok.ru",
+                            "Cookie" to cookieString,
+                        )
+
                         val videos = json.optJSONArray("videos")
                         if (videos != null) {
                             for (i in 0 until videos.length()) {
@@ -56,24 +87,23 @@ class OkRuExtractor : ExtractorApi() {
                                 callback(newExtractorLink(name, "$name $vName", full,
                                     if (full.contains(".m3u8") || full.contains("type/")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                                     this.referer = "https://ok.ru/"
+                                    this.headers = playbackHeaders   // 🍪 cookies attached
                                     quality = okruQuality(vName)
                                 })
                                 emitted = true
                             }
                         }
 
-                        // Try hlsManifestUrl
                         if (!emitted) {
                             val hls = json.optString("hlsManifestUrl")
                             if (hls.isNotBlank() && hls.startsWith("http")) {
                                 println("WitAnimeDebug: OkRu API hls -> ${hls.take(90)}")
-                                M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = mapOf("Referer" to "https://ok.ru/")).forEach {
+                                M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach {
                                     callback(it); emitted = true
                                 }
                             }
                         }
 
-                        // Try movie > videos
                         if (!emitted) {
                             val movie = json.optJSONObject("movie")
                             val movieVideos = movie?.optJSONArray("videos")
@@ -84,9 +114,9 @@ class OkRuExtractor : ExtractorApi() {
                                     if (u.isBlank()) continue
                                     val full = if (u.startsWith("//")) "https:$u" else u
                                     val vName = v.optString("name")
-                                    println("WitAnimeDebug: OkRu API movie video [$vName] -> ${full.take(90)}")
                                     callback(newExtractorLink(name, "$name $vName", full, ExtractorLinkType.VIDEO) {
                                         this.referer = "https://ok.ru/"
+                                        this.headers = playbackHeaders
                                         quality = okruQuality(vName)
                                     })
                                     emitted = true
@@ -95,15 +125,14 @@ class OkRuExtractor : ExtractorApi() {
                         }
                     }
                 }
-                if (emitted) { println("WitAnimeDebug: OkRu: API SUCCESS"); return }
+                if (emitted) { println("WitAnimeDebug: OkRu: API SUCCESS with cookies"); return }
             } catch (e: Exception) {
                 println("WitAnimeDebug: OkRu API fail: ${e.message}")
             }
 
-            // ═══ METHOD 2: Scrape the embed page HTML ═══
+            // ═══ METHOD 2: Scrape embed page HTML (also with cookies) ═══
             try {
                 val html = app.get(url, headers = headers).text
-                println("WitAnimeDebug: OkRu HTML len=${html.length}")
                 if (html.length > 500) {
                     if (emitFromHtml(html, callback)) {
                         println("WitAnimeDebug: OkRu: HTML SUCCESS")
@@ -114,7 +143,7 @@ class OkRuExtractor : ExtractorApi() {
                 println("WitAnimeDebug: OkRu HTML fail: ${e.message}")
             }
 
-            // ═══ METHOD 3: WebView (15s timeout) ═══
+            // ═══ METHOD 3: WebView — as absolute last resort ═══
             println("WitAnimeDebug: OkRu: trying WebView (15s)")
             try {
                 val resolver = WebViewResolver(
@@ -134,13 +163,10 @@ class OkRuExtractor : ExtractorApi() {
                             this.referer = "https://ok.ru/"
                         })
                     }
-                    return
                 }
             } catch (e: Exception) {
                 println("WitAnimeDebug: OkRu WV fail: ${e.message}")
             }
-
-            println("WitAnimeDebug: OkRu: ALL METHODS FAILED")
         } catch (e: Exception) {
             println("WitAnimeDebug: OkRu error: ${e.message}")
         }
