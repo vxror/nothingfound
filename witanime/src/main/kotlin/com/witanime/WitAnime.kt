@@ -136,6 +136,17 @@ class WitAnime : MainAPI() {
             app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
         } catch (_: Exception) { "" }
 
+        fun findServers(html: String): List<Pair<String, String>> {
+            val items = mutableListOf<Pair<String, String>>()
+            Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
+                val tag = m.groupValues[1]
+                val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
+                val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
+                if (sid != null) items.add(sid to (label ?: "server-$sid"))
+            }
+            return items
+        }
+
         fun decodeWatch(raw: String, cfg: JSONObject?): String {
             return try {
                 val cleaned = cleanBase64Chars(raw.reversed())
@@ -165,6 +176,8 @@ class WitAnime : MainAPI() {
                 }
                 val seqList: List<String> = Regex("""var\s+_x\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
                     ?.let { Regex(""""([^"]*)"""").findAll(it).map { m -> m.groupValues[1] }.toList() }
+                    ?: Regex("""var\s+_s\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+                    ?.let { Regex("\"([^\"]*)\"").findAll(it).map { m -> m.groupValues[1] }.toList() }
                     ?: emptyList()
                 for (i in seqList.indices) {
                     val chunks = pMap[i] ?: continue
@@ -183,102 +196,46 @@ class WitAnime : MainAPI() {
         }
 
         return try {
-            val startTime = System.currentTimeMillis()
-
-            // ⚡ Check cache FIRST — before even fetching the page
-            val cachedServers = FastLoader.getCachedServers(data)
-            if (cachedServers != null) {
-                // ⚡ CACHE HIT — skip page fetch entirely, go straight to extraction
-                println("WitAnimeDebug: ⚡ CACHE HIT — skipping page fetch!")
-                val sorted = FastLoader.prioritizeServers(cachedServers)
-                val semaphore = Semaphore(6)
-                supervisorScope {
-                    sorted.map { server ->
-                        async(Dispatchers.IO) {
-                            semaphore.withPermit {
-                                try {
-                                    val link = server.url
-                                    val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
-                                        "$link&apiKey=$FRAMEWORK_HASH" else link
-                                    routeLink(finalLink, data, subtitleCallback, callback, server.quality)
-                                } catch (_: Exception) {}
-                            }
-                        }
-                    }.awaitAll()
-                }
-                println("WitAnimeDebug: ⚡ CACHE LOAD TIME: ${System.currentTimeMillis() - startTime}ms")
-                return true
-            }
-
-            // Normal flow — fetch page, parse, cache, extract
             val html = fetch(data)
             if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
 
-            // ⚡ Try FastLoader parsing (with caching)
-            val servers = FastLoader.parseEpisode(data, html, userAgent)
-            println("WitAnimeDebug: FastLoader parsed ${servers?.size ?: 0} servers in ${System.currentTimeMillis() - startTime}ms")
+            val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
+            val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
+            val resArr = zT?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
+            val cfgArr = zV?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
+            val servers = findServers(html)
+            println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size}")
 
             val semaphore = Semaphore(6)
 
-            if (servers != null && servers.isNotEmpty()) {
-                // ⚡ Sort by priority — best servers extracted first
-                val sorted = FastLoader.prioritizeServers(servers)
-                println("WitAnimeDebug: order: ${sorted.joinToString(", ") { it.label }}")
-
-                supervisorScope {
-                    sorted.map { server ->
-                        async(Dispatchers.IO) {
-                            semaphore.withPermit {
-                                try {
-                                    val link = server.url
-                                    val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
-                                        "$link&apiKey=$FRAMEWORK_HASH" else link
-                                    routeLink(finalLink, data, subtitleCallback, callback, server.quality)
-                                } catch (_: Exception) {}
-                            }
-                        }
-                    }.awaitAll()
-                }
-            } else {
-                // Fallback: old parsing method if FastLoader failed
-                println("WitAnimeDebug: FastLoader failed, using fallback")
-                val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
-                val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
-                val resArr = zT?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
-                val cfgArr = zV?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
-                val rawServers = mutableListOf<Pair<String, String>>()
-                Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
-                    val tag = m.groupValues[1]
-                    val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
-                    val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
-                    if (sid != null) rawServers.add(sid to (label ?: "server-$sid"))
-                }
-                supervisorScope {
-                    rawServers.map { (sid, label) -> async(Dispatchers.IO) { semaphore.withPermit {
-                        try {
-                            val idx = sid.toIntOrNull() ?: -1
-                            if (resArr == null || idx !in 0 until resArr.length()) return@withPermit
-                            val link = decodeWatch(resArr.optString(idx), cfgArr?.optJSONObject(idx))
-                            if (link.isNotBlank()) {
-                                val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
-                                    "$link&apiKey=$FRAMEWORK_HASH" else link
-                                withTimeoutOrNull(15_000) { routeLink(finalLink, data, subtitleCallback, callback) }
-                            }
-                        } catch (_: Exception) {}
-                    } } }.awaitAll()
-                }
+            suspend fun decodeAndRoute(sid: String, label: String) {
+                try {
+                    val idx = sid.toIntOrNull() ?: -1
+                    if (resArr == null || idx !in 0 until resArr.length()) { println("WitAnimeDebug: [$label] no registry"); return }
+                    val link = decodeWatch(resArr.optString(idx), cfgArr?.optJSONObject(idx))
+                    println("WitAnimeDebug: [$label] -> ${link.take(90)}")
+                    if (link.isNotBlank()) {
+                        val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
+                            "$link&apiKey=$FRAMEWORK_HASH" else link
+                        withTimeoutOrNull(20_000) {
+                            routeLink(finalLink, data, subtitleCallback, callback)
+                        } ?: println("WitAnimeDebug: [$label] TIMEOUT")
+                    }
+                } catch (_: Exception) {}
             }
 
-            // Downloads (filtered)
+            supervisorScope {
+                servers.map { (sid, label) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
+            }
+
             val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
+            println("WitAnimeDebug: downloads=${dlLinks.size} (mediafire filtered)")
             supervisorScope {
                 dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
                     val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                    if (final.startsWith("http")) withTimeoutOrNull(15_000) { routeLink(final, data, subtitleCallback, callback) }
+                    if (final.startsWith("http")) withTimeoutOrNull(20_000) { routeLink(final, data, subtitleCallback, callback) }
                 } catch (_: Exception) {} } } }.awaitAll()
             }
-
-            println("WitAnimeDebug: ⚡ TOTAL LOAD TIME: ${System.currentTimeMillis() - startTime}ms")
             true
         } catch (e: Exception) { logError(e); false }
     }
@@ -376,6 +333,7 @@ class WitAnime : MainAPI() {
                     })
                 }
             }
+            println("WitAnimeDebug: Yona emitted=${seen.size}")
         } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
     }
 }
