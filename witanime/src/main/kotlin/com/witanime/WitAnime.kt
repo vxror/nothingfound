@@ -240,14 +240,14 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /** ⚡ THE ROUTER — dotplay now gets quality labels too */
+    /** ⚡ THE ROUTER — quality labels flow to dotplay + soraplay + mega + 4shared */
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         println("WitAnimeDebug: routing -> $link")
         val host = linkHost(link)
         when {
             host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, callback)
             host.contains("dotplay") -> DotPlayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
-            host.contains("soraplay") -> SoraplayExtractor().getUrl(link, referer, subtitleCallback, callback)
+            host.contains("soraplay") -> SoraplayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, callback)
             isDirectCdnLink(link) -> emitDirectCdn(link, qLabel, callback)
             host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, callback)
             host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, callback)
@@ -266,7 +266,7 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** 🔓 YONAPLAY aggregator — quality labels flow to all children */
+    /** 🔓 YONAPLAY aggregator */
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val res = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
@@ -275,7 +275,7 @@ class WitAnime : MainAPI() {
 
             val seen = mutableSetOf<String>()
 
-            // 1) STRUCTURED parser — extracts host + QUALITY label from <p> tag
+            // 1) STRUCTURED parser — host + QUALITY label
             Regex(
                 """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
                 RegexOption.DOT_MATCHES_ALL
@@ -301,7 +301,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // 2) bare go_to_player — tries to detect quality from URL itself
+            // 2) bare go_to_player
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
@@ -326,26 +326,8 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // 5) DIRECT CDN links — archive.org / dropbox / soraplay / okcdn
+            // 5) DIRECT CDN links
             Regex("""https?://[^\s"'<>]+""").findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
                     if (seen.add(cdn)) {
-                        println("WitAnimeDebug: Yona CDN -> ${cdn.take(90)}")
-                        emitDirectCdn(cdn, callback = callback)
-                    }
-                }
-
-            // 6) direct mp4/m3u8 (non-CDN)
-            Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
-                val url = m.groupValues[1]
-                if (!url.contains("googleapis") && !url.contains("drive.google") && !isDirectCdnLink(url) && seen.add(url)) {
-                    callback(newExtractorLink("Yonaplay", "Yonaplay Direct", url,
-                        if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                        referer = yonaplayUrl; quality = Qualities.Unknown.value
-                    })
-                }
-            }
-            println("WitAnimeDebug: Yona emitted=${seen.size}")
-        } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
-    }
-}
+                        println("WitAnimeDebug: Yona CDN -> ${cdn.take(
