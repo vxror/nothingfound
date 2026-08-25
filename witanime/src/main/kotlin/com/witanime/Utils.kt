@@ -65,6 +65,7 @@ internal fun isMegaLink(link: String): Boolean {
     return h.contains("mega.nz") || h.contains("mega.co.nz")
 }
 
+/** quality value from a label like "HD", "FHD", "1080p" */
 internal fun labelQuality(label: String?): Int = when {
     label == null -> Qualities.Unknown.value
     label.contains("1080") || label.contains("FHD", true) -> Qualities.P1080.value
@@ -72,6 +73,37 @@ internal fun labelQuality(label: String?): Int = when {
     label.contains("480") -> Qualities.P480.value
     label.contains("360") -> Qualities.P360.value
     else -> Qualities.Unknown.value
+}
+
+/** quality value from URL text (filename/path often contains 1080p/720p/480p/FHD/HD) */
+internal fun urlQuality(url: String): Int = when {
+    Regex("""[._\- ]1080[._\- ]|[._\- ]2160[._\- ]|1080p|2160p|FHD""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> Qualities.P1080.value
+    Regex("""[._\- ]720[._\- ]|720p""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> Qualities.P720.value
+    Regex("""[._\- ]480[._\- ]|480p""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> Qualities.P480.value
+    Regex("""[._\- ]360[._\- ]|360p""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> Qualities.P360.value
+    else -> Qualities.Unknown.value
+}
+
+/** combined: URL pattern first (most specific), then label, then Unknown */
+internal fun bestQuality(url: String, label: String?): Int {
+    val uq = urlQuality(url)
+    if (uq != Qualities.Unknown.value) return uq
+    return labelQuality(label)
+}
+
+/** a short quality string for display: "HD", "FHD", "1080p" or null */
+internal fun qualityName(url: String, label: String?): String? {
+    val uq = urlQuality(url)
+    val fromUrl = when (uq) {
+        Qualities.P1080.value -> "1080p"
+        Qualities.P720.value -> "720p"
+        Qualities.P480.value -> "480p"
+        Qualities.P360.value -> "360p"
+        else -> null
+    }
+    if (fromUrl != null) return fromUrl
+    if (!label.isNullOrBlank()) return label.trim()
+    return null
 }
 
 internal fun isDirectCdnLink(link: String): Boolean {
@@ -85,29 +117,18 @@ internal fun isDirectCdnLink(link: String): Boolean {
 }
 
 internal suspend fun emitDirectCdn(link: String, qLabel: String? = null, callback: (ExtractorLink) -> Unit) {
-    val urlQ = when {
-        Regex("1080").containsMatchIn(link) -> Qualities.P1080.value
-        Regex("720").containsMatchIn(link) -> Qualities.P720.value
-        Regex("480").containsMatchIn(link) -> Qualities.P480.value
-        Regex("FHD", RegexOption.IGNORE_CASE).containsMatchIn(link) -> Qualities.P1080.value
-        else -> Qualities.Unknown.value
-    }
-    val q = if (urlQ != Qualities.Unknown.value) urlQ else labelQuality(qLabel)
+    val cleanLink = link.trimEnd('#')
     val host = linkHost(link)
     val shortHost = if (host.length > 30) host.substringAfter(".") else host
-    val cleanLink = link.trimEnd('#')
-    callback(newExtractorLink("Direct", shortHost, cleanLink,
+    val qName = qualityName(cleanLink, qLabel)
+    callback(newExtractorLink("Direct", shortHost + (qName?.let { " $it" } ?: ""), cleanLink,
         if (cleanLink.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-        quality = q
+        quality = bestQuality(cleanLink, qLabel)
     })
 }
 
 /**
- * ⚡ UNIVERSAL EMBED HANDLER — works for ANY embed page:
- *   1. Follows loading-page redirects (hgcloud.to → hanerix.com)
- *   2. JWPlayer + packed JS → JwPlayerHelper extraction
- *   3. Raw m3u8/mp4 in page → emit directly
- *   4. WebView m3u8/txt/mp4 intercept fallback
+ * ⚡ UNIVERSAL EMBED HANDLER
  */
 internal suspend fun handleUnknownEmbed(
     url: String, referer: String?, name: String,
@@ -129,7 +150,6 @@ internal suspend fun handleUnknownEmbed(
         fun looksLikePlayer(h: String): Boolean =
             h.contains("vplayer") || h.contains("jwplayer") || h.contains("sources:") || h.contains("file:")
 
-        // ═══ 1) LOADING PAGE: follow redirect ═══
         if (html.contains("Page is loading") || html.contains("please wait") ||
             (html.length < 3000 && html.contains("/main.js"))) {
             println("WitAnimeDebug: UE: loading page detected (${linkHost(currentUrl)})")
@@ -145,7 +165,6 @@ internal suspend fun handleUnknownEmbed(
                 } catch (_: Exception) {}
             }
 
-            // scan main.js for the real player domain (same path trick)
             if (!looksLikePlayer(html)) {
                 val mainJsUrl = "${hostOf(currentUrl)}/main.js"
                 val mainJs = try { app.get(mainJsUrl, headers = headers, referer = currentUrl).text } catch (_: Exception) { "" }
@@ -181,7 +200,6 @@ internal suspend fun handleUnknownEmbed(
         )
         var found = false
 
-        // ═══ 2) JWPLAYER + PACKED JS extraction ═══
         if (looksLikePlayer(html)) {
             val playerScriptData = when {
                 !getPacked(html).isNullOrEmpty() -> getAndUnpack(html)
@@ -197,7 +215,6 @@ internal suspend fun handleUnknownEmbed(
             }
         }
 
-        // ═══ 3) RAW m3u8/mp4 ═══
         if (!found) {
             val combined = "$html\n${unpackPackedJs(html) ?: ""}".replace("\\/", "/").replace("\\\"", "\"")
             val m3u8Links = Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""").findAll(combined)
@@ -222,7 +239,6 @@ internal suspend fun handleUnknownEmbed(
             }
         }
 
-        // ═══ 4) WEBVIEW fallback — intercepts master.txt/master.m3u8 ═══
         if (!found) {
             println("WitAnimeDebug: UE: trying WebView intercept")
             try {
