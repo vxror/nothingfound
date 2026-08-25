@@ -16,7 +16,7 @@ class DotPlayExtractor : ExtractorApi() {
 
     private val cfKiller = CloudflareKiller()
 
-    /** quality label from the parent server (HD/FHD), set by routeLink */
+    /** quality label (HD/FHD) from the parent server, set by routeLink */
     var linkLabel: String? = null
 
     override suspend fun getUrl(
@@ -28,7 +28,7 @@ class DotPlayExtractor : ExtractorApi() {
 
             val headers = mapOf("User-Agent" to EXTRACTOR_UA)
 
-            // ═══ METHOD 1: embed → api.php → base64 video_url ═══
+            // ═══ METHOD 1: embed page (session) → api.php → base64-decoded video_url ═══
             try {
                 app.get(url, headers = headers, referer = referer, interceptor = cfKiller)
 
@@ -39,7 +39,7 @@ class DotPlayExtractor : ExtractorApi() {
 
                 val json = try { JSONObject(jsonStr) } catch (_: Exception) { null }
 
-                // base64-decoded video_url
+                // video_url is BASE64-ENCODED
                 val encodedUrl = json?.optString("video_url", "") ?: ""
                 var videoUrl = ""
                 if (encodedUrl.isNotBlank()) {
@@ -51,7 +51,7 @@ class DotPlayExtractor : ExtractorApi() {
                     } catch (_: Exception) { videoUrl = encodedUrl }
                 }
 
-                // fallback: recursive scan + base64 decode every field
+                // fallback: recursive scan + base64 decode every long field
                 if (!videoUrl.startsWith("http")) {
                     val urls = extractUrlsFromJson(jsonStr).filter {
                         it.startsWith("http") && !it.contains("dotplay.net") &&
@@ -81,7 +81,7 @@ class DotPlayExtractor : ExtractorApi() {
                 println("WitAnimeDebug: DotPlay method1 fail: ${e.message}")
             }
 
-            // ═══ METHOD 2: embed page scan ═══
+            // ═══ METHOD 2: embed page scan (base64 tokens in HTML) ═══
             try {
                 val embedHtml = app.get(url, headers = headers, referer = referer, interceptor = cfKiller).text
                 Regex("""[A-Za-z0-9+/=]{40,}""").findAll(embedHtml).map { it.value }.distinct().take(30).forEach { tok ->
@@ -106,12 +106,12 @@ class DotPlayExtractor : ExtractorApi() {
                 }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView ═══
+            // ═══ METHOD 3: WebView (✅ paren fixed) ═══
             println("WitAnimeDebug: DotPlay trying WebView")
             try {
                 val resolver = WebViewResolver(
                     interceptUrl = Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8|previews\.dropbox"""),
-                    additionalUrls = listOf(Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8|previews\.dropbox"""),
+                    additionalUrls = listOf(Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8|previews\.dropbox""")),
                     useOkhttp = false,
                     timeout = 25_000L
                 )
@@ -129,31 +129,22 @@ class DotPlayExtractor : ExtractorApi() {
     }
 
     private suspend fun emitVideo(videoUrl: String, callback: (ExtractorLink) -> Unit) {
-        // 🎯 FIX: strip the |timestamp that dotplay appends (breaks Dropbox URLs)
+        // strip |timestamp, #, quotes
         val cleanUrl = videoUrl
             .trim()
-            .substringBefore('|')          // strip |1787634855
+            .substringBefore('|')
             .trimEnd('#', '"', '\'')
-            .replace(" ", "%20")           // encode spaces if any
+            .replace(" ", "%20")
 
         println("WitAnimeDebug: DotPlay emitting -> ${cleanUrl.take(100)}")
 
-        // determine quality: from URL pattern first, then from server label
-        val q = when {
-            cleanUrl.contains("1080") -> Qualities.P1080.value
-            cleanUrl.contains("720") -> Qualities.P720.value
-            cleanUrl.contains("480") -> Qualities.P480.value
-            linkLabel != null -> labelQuality(linkLabel)
-            else -> Qualities.Unknown.value
-        }
-
-        // label: "DotPlay HD" / "DotPlay FHD" / "DotPlay"
-        val displayLabel = "DotPlay" + (linkLabel?.let { " $it" } ?: "")
+        val qName = qualityName(cleanUrl, linkLabel)
+        val displayLabel = "DotPlay" + (qName?.let { " $it" } ?: "")
 
         callback(newExtractorLink(name, displayLabel, cleanUrl,
             if (cleanUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
             this.referer = mainUrl
-            quality = q
+            quality = bestQuality(cleanUrl, linkLabel)
         })
     }
 
