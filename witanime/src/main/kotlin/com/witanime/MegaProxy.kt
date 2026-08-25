@@ -6,6 +6,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import org.json.JSONArray
+import java.io.BufferedInputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
@@ -23,7 +24,7 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private val originalUrls = ConcurrentHashMap<String, String>()
     private val seq = AtomicInteger(0)
-    private val resolving = ConcurrentHashMap<String, Any>()  // prevent duplicate resolves
+    private val resolving = ConcurrentHashMap<String, Any>()
 
     data class MegaFile(val dlUrl: String, val size: Long, val aesKey: ByteArray, val nonce: ByteArray)
 
@@ -38,6 +39,8 @@ object MegaProxy {
                     try {
                         val socket = server.accept()
                         socket.keepAlive = true
+                        socket.soTimeout = 0
+                        socket.tcpNoDelay = true
                         Thread {
                             try { handleClient(socket) } catch (_: Exception) {}
                             finally { try { socket.close() } catch (_: Exception) {} }
@@ -93,7 +96,7 @@ object MegaProxy {
             val token = "${System.currentTimeMillis()}_${seq.incrementAndGet()}"
             files[token] = MegaFile(dl, size, aesKey, nonce)
             originalUrls[token] = url
-            println("WitAnimeDebug: Mega proxied OK token=$token size=$size")
+            println("WitAnimeDebug: Mega proxied OK token=$token size=${size / 1048576}MB")
             "http://127.0.0.1:${server.localPort}/v/$token.mp4"
         } catch (e: Exception) {
             println("WitAnimeDebug: Mega resolve fail: ${e.message}")
@@ -101,11 +104,9 @@ object MegaProxy {
         }
     }
 
-    /** 🔄 Re-resolve an expired token — returns fresh MegaFile or null */
     private suspend fun refreshToken(token: String): MegaFile? {
         val originalUrl = originalUrls[token] ?: return null
 
-        // Prevent multiple simultaneous resolves for same token
         if (resolving.putIfAbsent(token, Any()) != null) return files[token]
 
         return try {
@@ -137,8 +138,8 @@ object MegaProxy {
             if (size <= 0 || dl.isBlank()) return null
 
             val fresh = MegaFile(dl, size, aesKey, nonce)
-            files[token] = fresh  // 🔄 replace stale entry
-            println("WitAnimeDebug: MegaProxy refreshed OK size=$size")
+            files[token] = fresh
+            println("WitAnimeDebug: MegaProxy refreshed OK size=${size / 1048576}MB")
             fresh
         } catch (e: Exception) {
             println("WitAnimeDebug: MegaProxy refresh fail: ${e.message}")
@@ -150,7 +151,6 @@ object MegaProxy {
 
     private fun handleClient(socket: Socket) {
         try {
-            socket.soTimeout = 30_000
             val input = BufferedReader(InputStreamReader(socket.getInputStream()))
             val output = socket.getOutputStream()
             val requestLine = input.readLine() ?: return
@@ -188,7 +188,6 @@ object MegaProxy {
             output.flush()
             if (parts[0].equals("HEAD", true)) return
 
-            // Try upstream — if it fails, refresh the token and retry once
             var served = false
             for (attempt in 1..2) {
                 val currentFile = files[token] ?: break
@@ -203,6 +202,7 @@ object MegaProxy {
                         if (resp.isSuccessful) {
                             val body = resp.body?.byteStream()
                             if (body != null) {
+                                val buffered = BufferedInputStream(body, 256 * 1024)
                                 val iv = ByteBuffer.allocate(16)
                                 iv.put(currentFile.nonce)
                                 iv.putLong(start / 16)
@@ -210,14 +210,15 @@ object MegaProxy {
                                 cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(currentFile.aesKey, "AES"), IvParameterSpec(iv.array()))
                                 val skip = (start % 16).toInt()
                                 if (skip > 0) cipher.update(ByteArray(skip))
-                                val buf = ByteArray(64 * 1024)
+                                val buf = ByteArray(256 * 1024)
                                 var n: Int
-                                while (body.read(buf).also { n = it } != -1) {
+                                while (buffered.read(buf).also { n = it } != -1) {
                                     val out = cipher.update(buf, 0, n) ?: continue
                                     try { output.write(out); output.flush() } catch (_: Exception) { return }
                                 }
-                                try { cipher.doFinal()?.let { output.write(it) } } catch (_: Exception) {}
+                                try { cipher.doFinal()?.let { output.write(it); output.flush() } } catch (_: Exception) {}
                                 served = true
+                                println("WitAnimeDebug: MegaProxy served ${length / 1048576}MB for token=$token")
                             }
                         } else {
                             println("WitAnimeDebug: MegaProxy upstream attempt $attempt failed: ${resp.code}")
@@ -228,7 +229,6 @@ object MegaProxy {
                     println("WitAnimeDebug: MegaProxy upstream attempt $attempt error: ${e.message}")
                 }
 
-                // Upstream failed → refresh token and retry
                 if (!served && attempt == 1) {
                     println("WitAnimeDebug: MegaProxy refreshing expired token...")
                     kotlinx.coroutines.runBlocking {
