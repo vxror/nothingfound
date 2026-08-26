@@ -172,7 +172,18 @@ class WitAnime : MainAPI() {
                         episodes = eps.mapNotNull { ep ->
                             val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
                             val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
-                            newEpisode(epUrl) { this.name = epName }
+                            // [NEXT-EP] parse real episode number (handles 5, "5", 5.0, "5.0")
+                            // the app needs this to order episodes & enable next/prev + auto-next
+                            val epNum = when (val raw = ep["number"]) {
+                                is Int -> raw
+                                is Long -> raw.toInt()
+                                is Double -> raw.toInt()
+                                else -> raw?.toString()?.trim()?.toDoubleOrNull()?.toInt()
+                            }
+                            newEpisode(epUrl) {
+                                this.name = epName
+                                this.episode = epNum
+                            }
                         }
                     }
                 }
