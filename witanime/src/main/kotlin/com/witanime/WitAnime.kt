@@ -240,6 +240,7 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
+    @Suppress("DEPRECATION")
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         // [!] GLOBAL FIX: strip duplicated quality tokens from every display name.
         val emit: (ExtractorLink) -> Unit = { l ->
@@ -251,13 +252,18 @@ class WitAnime : MainAPI() {
             if (cleaned.isBlank()) {
                 callback(l)
             } else {
-                // [FIX] Use newExtractorLink instead of deprecated ExtractorLink constructor
-                callback(newExtractorLink(l.source, cleaned, l.url, l.type) {
-                    referer = l.referer
-                    quality = l.quality
-                    headers = l.headers
-                    extractorData = l.extractorData
-                })
+                // Use direct constructor (not suspend, no builder lambda)
+                // @Suppress("DEPRECATION") on the function handles the deprecation
+                callback(ExtractorLink(
+                    l.source,
+                    cleaned,
+                    l.url,
+                    l.referer ?: "",
+                    l.quality,
+                    l.type,
+                    l.headers,
+                    l.extractorData
+                ))
             }
         }
 
