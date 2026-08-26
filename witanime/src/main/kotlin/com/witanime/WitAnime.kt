@@ -10,8 +10,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.nio.charset.Charset
-import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -25,12 +23,6 @@ class WitAnime : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
-
-    // [SPEED] Time budgets — loadLinks NEVER takes longer than GLOBAL_DEADLINE total.
-    private val GLOBAL_DEADLINE = 25_000L   // hard cap for the whole loadLinks
-    private val PAGE_TIMEOUT = 15_000L      // fetching the episode page
-    private val LINK_TIMEOUT = 12_000L      // resolving each individual server/link
-    private val YONA_TIMEOUT = 10_000L      // each yonaplay sub-player
 
     private val userAgent = EXTRACTOR_UA
     private val cfKiller = CloudflareKiller()
@@ -208,19 +200,17 @@ class WitAnime : MainAPI() {
         }
 
         return try {
-            // [SPEED] episode page fetch is now bounded too
-            val html = withTimeoutOrNull(PAGE_TIMEOUT) { fetch(data) } ?: ""
-            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY/TIMEOUT"); return false }
+            val html = fetch(data)
+            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
 
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val resArr = zT?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
             val cfgArr = zV?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
             val servers = findServers(html)
-            val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
-            println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size} downloads=${dlLinks.size}")
+            println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size}")
 
-            val semaphore = Semaphore(8)
+            val semaphore = Semaphore(6)
 
             suspend fun decodeAndRoute(sid: String, label: String) {
                 try {
@@ -231,7 +221,7 @@ class WitAnime : MainAPI() {
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
                             "$link&apiKey=$FRAMEWORK_HASH" else link
-                        withTimeoutOrNull(LINK_TIMEOUT) {
+                        withTimeoutOrNull(20_000) {
                             routeLink(finalLink, data, subtitleCallback, callback)
                         } ?: println("WitAnimeDebug: [$label] TIMEOUT")
                     }
@@ -239,29 +229,16 @@ class WitAnime : MainAPI() {
             }
 
             supervisorScope {
-                val allJobs = mutableListOf<Deferred<Unit>>()
+                servers.map { (sid, label) -> async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } } }.awaitAll()
+            }
 
-                // [SPEED] servers AND downloads start together (was: downloads waited for ALL servers)
-                servers.forEach { (sid, label) ->
-                    allJobs += async(Dispatchers.IO) { semaphore.withPermit { decodeAndRoute(sid, label) } }
-                }
-                dlLinks.forEach { dl ->
-                    allJobs += async(Dispatchers.IO) {
-                        semaphore.withPermit {
-                            try {
-                                val idx = dl.indexOf("http")
-                                val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                                if (final.startsWith("http"))
-                                    withTimeoutOrNull(LINK_TIMEOUT) { routeLink(final, data, subtitleCallback, callback) }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-
-                // [SPEED] GLOBAL DEADLINE: return with whatever links arrived instead of
-                // hanging on the slowest dead server. Links already emitted are kept.
-                val done = withTimeoutOrNull(GLOBAL_DEADLINE) { allJobs.awaitAll() }
-                if (done == null) println("WitAnimeDebug: global ${GLOBAL_DEADLINE}ms deadline hit — returning collected links")
+            val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
+            println("WitAnimeDebug: downloads=${dlLinks.size} (mediafire filtered)")
+            supervisorScope {
+                dlLinks.map { dl -> async(Dispatchers.IO) { semaphore.withPermit { try {
+                    val idx = dl.indexOf("http"); val final = trim(if (idx >= 0) dl.substring(idx) else dl)
+                    if (final.startsWith("http")) withTimeoutOrNull(20_000) { routeLink(final, data, subtitleCallback, callback) }
+                } catch (_: Exception) {} } } }.awaitAll()
             }
             true
         } catch (e: Exception) { logError(e); false }
@@ -303,92 +280,58 @@ class WitAnime : MainAPI() {
 
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            // [SPEED] bounded fetch
-            val res = withTimeoutOrNull(PAGE_TIMEOUT) {
-                app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
-            } ?: run { println("WitAnimeDebug: Yona fetch TIMEOUT"); return }
+            val res = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
             val html = res.text
             println("WitAnimeDebug: Yona len=${html.length} final=${res.url}")
 
-            // [SPEED] thread-safe dedup set (links now resolved in parallel)
-            val seen = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+            val seen = mutableSetOf<String>()
 
-            coroutineScope {
-                val semaphore = Semaphore(6)
-                val jobs = mutableListOf<Deferred<Unit>>()
-
-                // [SPEED] all yonaplay players resolve IN PARALLEL (was: one-by-one, 15s each!)
-                Regex(
-                    """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
-                    RegexOption.DOT_MATCHES_ALL
-                ).findAll(html).forEach { m ->
-                    val b64 = m.groupValues[1]
-                    val hostLabel = m.groupValues[2].trim()
-                    val qLabel = m.groupValues[3].trim().trimEnd('-', ' ').trim()
-                    jobs += async(Dispatchers.IO) {
-                        semaphore.withPermit {
-                            try {
-                                val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
-                                if (decoded.startsWith("http") && seen.add(decoded)) {
-                                    println("WitAnimeDebug: Yona [$hostLabel | $qLabel] -> ${decoded.take(90)}")
-                                    if (decoded.contains("drive.google.com/file/d/")) {
-                                        Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
-                                            callback(newExtractorLink("Yonaplay", "Google Drive ($qLabel)",
-                                                "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
-                                                referer = "https://drive.google.com/"; quality = labelQuality(qLabel)
-                                            })
-                                        }
-                                    } else {
-                                        withTimeoutOrNull(YONA_TIMEOUT) { routeLink(decoded, yonaplayUrl, subtitleCallback, callback, qLabel) }
-                                    }
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-
-                // fallback: any remaining go_to_player payloads
-                Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
-                    jobs += async(Dispatchers.IO) {
-                        semaphore.withPermit {
-                            try {
-                                val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
-                                if (decoded.startsWith("http") && seen.add(decoded)) {
-                                    withTimeoutOrNull(YONA_TIMEOUT) { routeLink(decoded, yonaplayUrl, subtitleCallback, callback) }
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-
-                // known download hosts in the page
-                Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
-                    val url = it.value
-                    jobs += async(Dispatchers.IO) {
-                        semaphore.withPermit {
-                            if (seen.add(url)) withTimeoutOrNull(YONA_TIMEOUT) { routeLink(url, yonaplayUrl, subtitleCallback, callback) }
-                        }
-                    }
-                }
-
-                // iframes
-                Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
-                    var src = m.groupValues[1]
-                    if (src.startsWith("//")) src = "https:$src"
-                    if (src.startsWith("http") && !src.contains("yonaplay") && !src.contains("dotplay")) {
-                        val finalSrc = src
-                        jobs += async(Dispatchers.IO) {
-                            semaphore.withPermit {
-                                if (seen.add(finalSrc)) withTimeoutOrNull(YONA_TIMEOUT) { routeLink(finalSrc, yonaplayUrl, subtitleCallback, callback) }
+            Regex(
+                """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
+                RegexOption.DOT_MATCHES_ALL
+            ).findAll(html).forEach { m ->
+                val b64 = m.groupValues[1]
+                val hostLabel = m.groupValues[2].trim()
+                val qLabel = m.groupValues[3].trim().trimEnd('-', ' ').trim()
+                try {
+                    val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
+                    if (decoded.startsWith("http") && seen.add(decoded)) {
+                        println("WitAnimeDebug: Yona [$hostLabel | $qLabel] -> ${decoded.take(90)}")
+                        if (decoded.contains("drive.google.com/file/d/")) {
+                            Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
+                                callback(newExtractorLink("Yonaplay", "Google Drive ($qLabel)",
+                                    "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
+                                    referer = "https://drive.google.com/"; quality = labelQuality(qLabel)
+                                })
                             }
+                        } else {
+                            withTimeoutOrNull(15_000) { routeLink(decoded, yonaplayUrl, subtitleCallback, callback, qLabel) }
                         }
                     }
-                }
-
-                jobs.awaitAll()
+                } catch (_: Exception) {}
             }
 
-            // direct CDN / raw media files (pure regex, no network — instant)
+            Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
+                try {
+                    val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
+                    if (decoded.startsWith("http") && seen.add(decoded)) {
+                        withTimeoutOrNull(15_000) { routeLink(decoded, yonaplayUrl, subtitleCallback, callback) }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
+                if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, callback) }
+            }
+
+            Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
+                var src = m.groupValues[1]
+                if (src.startsWith("//")) src = "https:$src"
+                if (src.startsWith("http") && !src.contains("yonaplay") && !src.contains("dotplay") && seen.add(src)) {
+                    withTimeoutOrNull(15_000) { routeLink(src, yonaplayUrl, subtitleCallback, callback) }
+                }
+            }
+
             Regex("""https?://[^\s"'<>]+""").findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
                     if (seen.add(cdn)) emitDirectCdn(cdn, callback = callback)
