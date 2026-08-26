@@ -28,6 +28,13 @@ class WitAnime : MainAPI() {
     private val cfKiller = CloudflareKiller()
     private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
 
+    // [FIX v6] The ONLY proven-resolvable call (build 2 log shows this exact constructor
+    // signature). It is deprecated at ERROR level, so we suppress with the correct
+    // diagnostic name "DEPRECATION_ERROR" — "DEPRECATION" only silences warnings.
+    @Suppress("DEPRECATION_ERROR")
+    private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
+        ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
+
     private fun isChallenge(doc: Document): Boolean {
         val h = doc.html()
         return h.contains("Just a moment") || h.contains("challenge-platform") || h.contains("cf-chl")
@@ -241,16 +248,14 @@ class WitAnime : MainAPI() {
     }
 
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
-        // [FIX] Mutate name on the existing link — 'name' is a public var in ExtractorLink.
-        // No constructor (deprecated), no newExtractorLink (suspend), no .copy() (doesn't exist).
+        // Strip duplicated quality tokens from display names.
         val emit: (ExtractorLink) -> Unit = { l ->
             val cleaned = l.name
                 .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
                 .replace(Regex("""\(\s*\)"""), "")
                 .replace(Regex("""\s{2,}"""), " ")
                 .trim()
-            if (cleaned.isNotBlank()) l.name = cleaned
-            callback(l)
+            if (cleaned.isBlank() || cleaned == l.name) callback(l) else callback(renameLink(l, cleaned))
         }
 
         println("WitAnimeDebug: routing -> $link")
