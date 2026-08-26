@@ -242,8 +242,6 @@ class WitAnime : MainAPI() {
 
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
         // [!] GLOBAL FIX: strip duplicated quality tokens from every display name.
-        // "720p (Videa)" -> "Videa" | "4Shared HD" -> "4Shared" | "Mega (CF Bypass) FHD" -> "Mega (CF Bypass)"
-        // The quality badge (720p/1080p) is still shown by the player, so nothing is lost.
         val emit: (ExtractorLink) -> Unit = { l ->
             val cleaned = l.name
                 .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
@@ -253,16 +251,13 @@ class WitAnime : MainAPI() {
             if (cleaned.isBlank()) {
                 callback(l)
             } else {
-                callback(ExtractorLink(
-                    l.source,
-                    cleaned,
-                    l.url,
-                    l.referer,
-                    l.quality,
-                    l.type,
-                    l.headers,
-                    l.extractorData
-                ))
+                // [FIX] Use newExtractorLink instead of deprecated ExtractorLink constructor
+                callback(newExtractorLink(l.source, cleaned, l.url, l.type) {
+                    referer = l.referer
+                    quality = l.quality
+                    headers = l.headers
+                    extractorData = l.extractorData
+                })
             }
         }
 
