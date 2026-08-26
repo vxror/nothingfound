@@ -250,7 +250,20 @@ class WitAnime : MainAPI() {
                 .replace(Regex("""\(\s*\)"""), "")
                 .replace(Regex("""\s{2,}"""), " ")
                 .trim()
-            callback(if (cleaned.isBlank()) l else l.copy(name = cleaned))
+            if (cleaned.isBlank()) {
+                callback(l)
+            } else {
+                callback(ExtractorLink(
+                    l.source,
+                    cleaned,
+                    l.url,
+                    l.referer,
+                    l.quality,
+                    l.type,
+                    l.headers,
+                    l.extractorData
+                ))
+            }
         }
 
         println("WitAnimeDebug: routing -> $link")
