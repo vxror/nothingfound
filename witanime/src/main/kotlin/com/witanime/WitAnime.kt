@@ -240,31 +240,17 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    @Suppress("DEPRECATION")
     private suspend fun routeLink(link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, qLabel: String? = null) {
-        // [!] GLOBAL FIX: strip duplicated quality tokens from every display name.
+        // [FIX] Mutate name on the existing link — 'name' is a public var in ExtractorLink.
+        // No constructor (deprecated), no newExtractorLink (suspend), no .copy() (doesn't exist).
         val emit: (ExtractorLink) -> Unit = { l ->
             val cleaned = l.name
                 .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
                 .replace(Regex("""\(\s*\)"""), "")
                 .replace(Regex("""\s{2,}"""), " ")
                 .trim()
-            if (cleaned.isBlank()) {
-                callback(l)
-            } else {
-                // Use direct constructor (not suspend, no builder lambda)
-                // @Suppress("DEPRECATION") on the function handles the deprecation
-                callback(ExtractorLink(
-                    l.source,
-                    cleaned,
-                    l.url,
-                    l.referer ?: "",
-                    l.quality,
-                    l.type,
-                    l.headers,
-                    l.extractorData
-                ))
-            }
+            if (cleaned.isNotBlank()) l.name = cleaned
+            callback(l)
         }
 
         println("WitAnimeDebug: routing -> $link")
@@ -282,7 +268,7 @@ class WitAnime : MainAPI() {
             isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
-            host.contains("mediafire") -> { /* ❌ removed */ }
+            host.contains("mediafire") -> { /* removed */ }
             isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, emit)
