@@ -27,7 +27,6 @@ jobs:
           rm -f build/Animewitcher.cs3 build/witanime.cs3 build/vxrux.cs3
           cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
           cp witanime/build/*.cs3 build/witanime.cs3 2>/dev/null || true
-          cp vxrux/build/*.cs3 build/vxrux.cs3 2>/dev/null || true
           ls -la build/
       - name: Push
         continue-on-error: true
