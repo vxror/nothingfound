@@ -42,7 +42,12 @@ subprojects {
     cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/Witch") }
 
     android {
-        namespace = if (project.name == "Animewitcher") "com.animewitcher" else "com.witanime"
+        namespace = when (project.name.lowercase()) {
+            "animewitcher" -> "com.animewitcher"
+            "witanime" -> "com.witanime"
+            "vxrux" -> "com.vxrux"
+            else -> "com.witanime"
+        }
         defaultConfig {
             minSdk = 21
             compileSdkVersion(35)
