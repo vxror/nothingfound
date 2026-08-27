@@ -9,6 +9,8 @@ buildscript {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
+        // [FIX 1] Added serialization plugin classpath
+        classpath("org.jetbrains.kotlin:kotlin-serialization:2.1.0")
     }
     
     configurations.classpath {
@@ -37,6 +39,8 @@ fun Project.android(configuration: BaseExtension.() -> Unit) = extensions.getByN
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
+    // [FIX 1] Apply the serialization plugin
+    apply(plugin = "kotlinx-serialization")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     cloudstream { setRepo(System.getenv("GITHUB_REPOSITORY") ?: "vxror/Witch") }
@@ -66,7 +70,9 @@ subprojects {
                 "-Xno-call-assertions",
                 "-Xno-param-assertions",
                 "-Xno-receiver-assertions",
-                "-Xskip-metadata-version-check"
+                "-Xskip-metadata-version-check",
+                // [FIX 3] Opt-in to Prerelease APIs to prevent compilation errors
+                "-opt-in=com.lagradost.cloudstream3.Prerelease"
             )
         }
     }
@@ -74,7 +80,16 @@ subprojects {
     dependencies {
         val implementation by configurations
         val cloudstream by configurations
+        val compileOnly by configurations
+
         cloudstream("com.lagradost:cloudstream3:pre-release")
+        
+        // [FIX 2] Add missing transitive dependencies required for compilation
+        compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+        compileOnly("io.ktor:ktor-http:3.0.3")
+        compileOnly("dev.whyoleg.cryptography:cryptography-core:0.4.0")
+        compileOnly("com.fleeksoft.ksoup:ksoup:0.2.2")
+
         implementation(kotlin("stdlib"))
         implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
