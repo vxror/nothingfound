@@ -55,7 +55,10 @@ class SmartCfKiller : Interceptor {
         private val resumed = AtomicReference<WeakReference<Activity>?>(null)
         private val tracked = AtomicBoolean(false)
 
-        internal fun appContext(): Context? {
+        // [FIX] Return type is Application? (was Context?) — the static type was
+        // Context, and Context has no registerActivityLifecycleCallbacks(). That
+        // was the "Unresolved reference" error.
+        internal fun appContext(): Application? {
             return runCatching {
                 val at = Class.forName("android.app.ActivityThread")
                 val current = at.getMethod("currentActivityThread").invoke(null) ?: return@runCatching null
