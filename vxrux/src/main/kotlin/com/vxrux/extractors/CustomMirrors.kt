@@ -1,10 +1,18 @@
 package com.vxrux.extractors
 
-// ============================================
-// DOOD VARIANTS — extend CloudStream's built-in DoodLaExtractor
-// ============================================
+import android.util.Base64
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.USER_AGENT
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.extractors.DoodLaExtractor
+import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import com.lagradost.cloudstream3.extractors.FilemoonV2
+import com.lagradost.cloudstream3.extractors.VidHidePro
 
+// ============================================
+// DOOD VARIANTS — extend built-in DoodLaExtractor
+// ============================================
 class Doodspro : DoodLaExtractor() { override var mainUrl = "https://doods.pro" }
 class Dsvplay : DoodLaExtractor() { override var mainUrl = "https://dsvplay.com" }
 class D0000d : DoodLaExtractor() { override var mainUrl = "https://d0000d.com" }
@@ -27,10 +35,8 @@ class DoodYt : DoodLaExtractor() { override var mainUrl = "https://dood.yt" }
 class DoodTo : DoodLaExtractor() { override var mainUrl = "https://dood.to" }
 
 // ============================================
-// STREAMWISH VARIANTS — extend CloudStream's built-in StreamWishExtractor
+// STREAMWISH VARIANTS — extend built-in StreamWishExtractor
 // ============================================
-import com.lagradost.cloudstream3.extractors.StreamWishExtractor
-
 class Mwish : StreamWishExtractor() { override val name = "Mwish"; override val mainUrl = "https://mwish.pro" }
 class Dwish : StreamWishExtractor() { override val name = "Dwish"; override val mainUrl = "https://dwish.pro" }
 class Ewish : StreamWishExtractor() { override val name = "Embedwish"; override val mainUrl = "https://embedwish.com" }
@@ -58,19 +64,15 @@ class StreamHLS : StreamWishExtractor() { override val name = "StreamHLS"; overr
 class HlsWish : StreamWishExtractor() { override val name = "HlsWish"; override val mainUrl = "https://hlswish.com" }
 
 // ============================================
-// FILEMOON VARIANTS — extend CloudStream's built-in FilemoonV2
+// FILEMOON VARIANTS — extend built-in FilemoonV2
 // ============================================
-import com.lagradost.cloudstream3.extractors.FilemoonV2
-
 class FileMoonIn : FilemoonV2() { override var mainUrl = "https://filemoon.in"; override var name = "FileMoon" }
 class FileMoonSx : FilemoonV2() { override var mainUrl = "https://filemoon.sx"; override var name = "FileMoonSx" }
 class FileMoonTo : FilemoonV2() { override var mainUrl = "https://filemoon.to"; override var name = "FileMoon" }
 
 // ============================================
-// CINEMM / VIDHIDE PRO MIRRORS — extend CloudStream's built-in VidHidePro
+// CINEMM / VIDHIDE PRO MIRRORS — extend built-in VidHidePro
 // ============================================
-import com.lagradost.cloudstream3.extractors.VidHidePro
-
 class HgplayCDN : VidHidePro() { override val name = "CineMM"; override val mainUrl = "https://hgplaycdn.com" }
 class Habetar : VidHidePro() { override val name = "CineMM"; override val mainUrl = "https://habetar.com" }
 class Yuguaab : VidHidePro() { override val name = "CineMM"; override val mainUrl = "https://yuguaab.com" }
@@ -84,14 +86,7 @@ class Uasopt : VidHidePro() { override val name = "CineMM"; override val mainUrl
 
 // ============================================
 // CLOUDMAILRU — custom extractor (not built into CloudStream)
-// Uses only app.get() and Regex — no forbidden libraries
 // ============================================
-import android.util.Base64
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.USER_AGENT
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.*
-
 class CloudMailRu : ExtractorApi() {
     override val name = "CloudMailRu"
     override val mainUrl = "https://cloud.mail.ru"
