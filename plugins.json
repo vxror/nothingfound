@@ -24,5 +24,18 @@
     "internalName": "WitAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/witanime.cs3",
     "name": "WitAnime"
+  },
+  {
+    "iconUrl": "https://raw.githubusercontent.com/recloudstream/cloudstream/master/app/src/main/ic_launcher-web.png",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/vxror/nothingfound",
+    "status": 1,
+    "language": "universal",
+    "authors": ["vxror"],
+    "tvTypes": [],
+    "version": 1,
+    "internalName": "VxruxExtractors",
+    "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/vxrux.cs3",
+    "name": "Vxrux Extractors"
   }
 ]
