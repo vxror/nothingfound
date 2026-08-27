@@ -1,7 +1,11 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.serialization") // FIXED: Correct plugin ID
+    
+    // CRITICAL FIX: Explicitly declare the serialization plugin with a version.
+    // If Gradle throws a "Kotlin version mismatch" error during the next build, 
+    // change "2.0.20" below to match the exact Kotlin version defined in your ROOT build.gradle.kts.
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.0.20"
 }
 
 android {
