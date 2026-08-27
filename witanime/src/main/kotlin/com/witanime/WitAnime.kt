@@ -2,7 +2,6 @@ package com.witanime
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mvvm.logError
@@ -25,7 +24,7 @@ class WitAnime : MainAPI() {
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
     private val userAgent = EXTRACTOR_UA
-    private val cfKiller = CloudflareKiller()
+    private val cfKiller = SmartCfKiller()   // [UPGRADE] was CloudflareKiller()
     private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
 
     @Suppress("DEPRECATION_ERROR")
@@ -71,7 +70,11 @@ class WitAnime : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?search_param=animes&s=" + URLEncoder.encode(query, "UTF-8")
-        val document = try { fetchDoc(url) } catch (e: Exception) { return emptyList() }
+        // [UPGRADE] don't pop the solver WebView during background searches
+        val document = try {
+            SmartCfKiller.inSearch = true
+            try { fetchDoc(url) } finally { SmartCfKiller.inSearch = false }
+        } catch (e: Exception) { return emptyList() }
         return document.select("div.anime-list-content div.anime-card-container").mapNotNull {
             val href = it.selectFirst("div.anime-card-poster a")?.attr("href") ?: return@mapNotNull null
             val title = it.selectFirst("div.anime-card-title h3 a")?.text() ?: return@mapNotNull null
