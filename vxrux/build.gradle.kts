@@ -1,8 +1,7 @@
-version = 1
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    id("kotlinx-serialization")
+    id("org.jetbrains.kotlin.plugin.serialization") // FIXED: Correct plugin ID
 }
 
 android {
