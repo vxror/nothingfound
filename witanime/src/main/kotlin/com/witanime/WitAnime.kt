@@ -29,28 +29,48 @@ class WitAnime : MainAPI() {
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
         ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
 
-    private fun isChallenge(doc: Document): Boolean {
-        val h = doc.html()
-        return h.contains("Just a moment") || h.contains("challenge-platform") || h.contains("cf-chl")
+    /**
+     * [FIX] Smart fetch:
+     * - Plain request, retried once on network error.
+     * - WebView (hidden or dialog) ONLY when the response body contains real
+     *   Cloudflare challenge markers. Timeouts/blank responses are network
+     *   failures — they now produce a clean error, never a WebView popup.
+     */
+    private suspend fun smartFetch(url: String, referer: String? = null): String? {
+        for (attempt in 1..2) {
+            val body = try {
+                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+            } catch (e: Exception) {
+                if (attempt == 1) { delay(400); continue } else return null
+            }
+            if (WitaWeb.looksChallenge(body)) {
+                println("WitAnimeDebug: [$url] challenge CONFIRMED → WebView render")
+                return WitaWeb.fetchHtml(url)
+            }
+            if (body.isNotBlank()) return body
+            if (attempt == 1) delay(400)
+        }
+        return null // network failure — no WebView for these
+    }
+
+    private suspend fun fetchDoc(url: String): Document {
+        val body = smartFetch(url)
+            ?: throw ErrorLoadingException("فشل تحميل الموقع — تحقق من الاتصال")
+        return Jsoup.parse(body, url)
     }
 
     /**
-     * Plain request first (real IP: instant, no UI).
-     * Challenged -> render the page INSIDE our own WebView dialog (WitaWeb).
-     * No CloudflareKiller: under WARP it pops its own WebView, blocks ~60s, and
-     * its cookie gets rejected on replay anyway (TLS fingerprint mismatch).
+     * [FIX] Posters under WARP: the APP loads cover images itself (outside our
+     * WebView), and Cloudflare blocks those requests. When a challenge has been
+     * confirmed this session, route posters through the wsrv.nl image proxy
+     * (it fetches from its own clean IP). Real IP: direct, zero overhead.
      */
-    private suspend fun fetchDoc(url: String): Document {
-        val fast = try {
-            val d = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
-            if (!isChallenge(d)) d else null
-        } catch (e: Exception) { null }
-        if (fast != null) return fast
-
-        println("WitAnimeDebug: [$url] challenged → WebView render")
-        val html = WitaWeb.fetchHtml(url)
-            ?: throw ErrorLoadingException("فشل التحقق من Cloudflare — حاول مرة أخرى")
-        return Jsoup.parse(html, url)
+    private fun smartPoster(raw: String?): String? {
+        val fixed = fixUrlNull(raw) ?: return null
+        if (!WitaWeb.wasChallenged) return fixed
+        return try {
+            "https://wsrv.nl/?url=" + URLEncoder.encode(fixed, "UTF-8")
+        } catch (_: Exception) { fixed }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -70,7 +90,7 @@ class WitAnime : MainAPI() {
                 val img = it.selectFirst("img")
                 val itemPoster = img?.attr("src")?.ifBlank { img.attr("data-src") }
                 val finalTitle = if (isEpisodeList) "$itemName - ${it.selectFirst(".episodes-card-title a")?.text() ?: ""}" else itemName
-                newAnimeSearchResponse(finalTitle, itemUrl, TvType.Anime) { posterUrl = fixUrlNull(itemPoster) }
+                newAnimeSearchResponse(finalTitle, itemUrl, TvType.Anime) { posterUrl = smartPoster(itemPoster) }
             }
             if (items.isNotEmpty()) homePageList.add(HomePageList(title, items))
         }
@@ -84,7 +104,7 @@ class WitAnime : MainAPI() {
             val href = it.selectFirst("div.anime-card-poster a")?.attr("href") ?: return@mapNotNull null
             val title = it.selectFirst("div.anime-card-title h3 a")?.text() ?: return@mapNotNull null
             newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
-                posterUrl = fixUrlNull(it.selectFirst("img.img-responsive")?.attr("src"))
+                posterUrl = smartPoster(it.selectFirst("img.img-responsive")?.attr("src"))
             }
         }
     }
@@ -137,7 +157,7 @@ class WitAnime : MainAPI() {
         println("WitAnimeDebug: loaded '$title' episodes=${episodes.size}")
 
         return newAnimeLoadResponse(title, url, tvType) {
-            this.posterUrl = fixUrlNull(poster)
+            this.posterUrl = smartPoster(poster)
             this.plot = description
             this.tags = genres
             this.showStatus = status
@@ -153,14 +173,7 @@ class WitAnime : MainAPI() {
         fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
-        suspend fun fetch(u: String): String {
-            val fast = try {
-                app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data).text
-            } catch (_: Exception) { "" }
-            if (!WitaWeb.looksChallenge(fast)) return fast
-            println("WitAnimeDebug: [$u] challenged → WebView render")
-            return WitaWeb.fetchHtml(u) ?: ""
-        }
+        suspend fun fetch(u: String): String = smartFetch(u, referer = data) ?: ""
 
         fun findServers(html: String): List<Pair<String, String>> {
             val items = mutableListOf<Pair<String, String>>()
@@ -302,13 +315,9 @@ class WitAnime : MainAPI() {
 
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val fastHtml = try {
-                val r = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent))
-                if (WitaWeb.looksChallenge(r.text)) null else r.text
-            } catch (_: Exception) { null }
-            val html = fastHtml ?: (WitaWeb.fetchHtml(yonaplayUrl) ?: run {
+            val html = smartFetch(yonaplayUrl, referer = "$mainUrl/") ?: run {
                 println("WitAnimeDebug: Yona fetch failed"); return
-            })
+            }
             println("WitAnimeDebug: Yona len=${html.length}")
 
             val seen = mutableSetOf<String>()
