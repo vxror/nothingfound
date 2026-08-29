@@ -42,8 +42,20 @@ object WitaWeb {
 
     private val renderMutex = Mutex()
 
+    /**
+     * True once a CONFIRMED Cloudflare challenge body was seen this session.
+     * WitAnime uses this to decide whether poster URLs should be routed through
+     * an image proxy (the app's own image loader gets blocked under WARP).
+     * Never set by mere network errors — only by real challenge markers.
+     */
+    @Volatile var wasChallenged: Boolean = false
+
+    /**
+     * [FIX] blank/null body = NOT a challenge (it's a network failure).
+     * Previously blank → true, which popped the WebView on every timeout.
+     */
     fun looksChallenge(html: String?): Boolean {
-        if (html.isNullOrBlank()) return true
+        if (html.isNullOrBlank()) return false
         val l = html.lowercase()
         if (CHALLENGE_TITLES.any { l.contains(it) }) return true
         return l.contains("challenge-platform") && l.contains("cloudflare")
@@ -61,9 +73,12 @@ object WitaWeb {
      *    no UI shown at all.
      * 2) Only when no clearance exists (or it expired and the hidden render got
      *    re-challenged) fall back to the visible dialog so a human can solve.
+     *
+     * Callers must only invoke this when looksChallenge() confirmed a challenge.
      */
     suspend fun fetchHtml(url: String, timeoutMs: Long = 120_000L): String? =
         renderMutex.withLock {
+            wasChallenged = true // a real challenge was confirmed by the caller
             val host = try { Uri.parse(url).host ?: "" } catch (_: Exception) { "" }
             val hasClearance = withContext(Dispatchers.Main) {
                 runCatching {
@@ -114,11 +129,16 @@ private fun WebView.configForCf() {
  * Invisible renderer: 1x1 WebView attached to the window (attached = it loads
  * and executes JS; 1x1 = nobody sees it). Works whenever the clearance cookie
  * is still valid — the server returns the page directly, no challenge runs.
+ *
+ * [FIX] waits SETTLE_MS after the page title is clean before extracting the
+ * HTML, so JS-hydrated sections finish rendering (no more half-loaded pages).
  */
 private object HiddenRender {
     private const val POLL_MS = 400L
-    private const val CHALLENGE_GRACE_MS = 6_000L  // auto-solve grace if challenged anyway
-    private const val HARD_TIMEOUT_MS = 15_000L
+    private const val SETTLE_MS = 1_000L       // let the page finish rendering
+    private const val CHALLENGE_GRACE_MS = 6_000L
+    private const val HARD_TIMEOUT_MS = 20_000L
+    private const val MIN_HTML_LEN = 2_000
 
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = CommonActivity.activity
@@ -146,6 +166,18 @@ private object HiddenRender {
                 if (cont.isActive) cont.resume(html)
             }
 
+            fun extractNow() {
+                val wv2 = webView ?: return
+                wv2.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
+                    if (done.get()) return@evaluateJavascript
+                    val html = unwrapJs(jsHtml)
+                    if (html != null && html.length > MIN_HTML_LEN && !WitaWeb.looksChallenge(html)) {
+                        finish(html)
+                    }
+                    // else: keep polling — page not settled yet
+                }
+            }
+
             try {
                 val wv = WebView(activity)
                 webView = wv
@@ -165,27 +197,23 @@ private object HiddenRender {
                     override fun run() {
                         if (done.get()) return
                         val elapsed = SystemClock.uptimeMillis() - startedAt
-                        val wv2 = webView ?: return
+                        if (webView == null) return
                         if (elapsed > HARD_TIMEOUT_MS) { finish(null); return }
-                        wv2.evaluateJavascript("document.title") { jsTitle ->
+                        webView?.evaluateJavascript("document.title") { jsTitle ->
                             if (done.get()) return@evaluateJavascript
                             val title = unwrapJs(jsTitle).orEmpty()
                             if (WitaWeb.isChallengeTitle(title)) {
-                                // challenge active — an invisible WebView cannot complete
-                                // interactive ones; after a short grace, give up quietly
+                                // challenge active — invisible WebView can't complete
+                                // interactive ones; after grace, give up quietly
                                 if (elapsed > CHALLENGE_GRACE_MS) finish(null)
                                 else handler.postDelayed(this, POLL_MS)
                                 return@evaluateJavascript
                             }
-                            wv2.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
-                                if (done.get()) return@evaluateJavascript
-                                val html = unwrapJs(jsHtml)
-                                if (html != null && html.length > 300 && !WitaWeb.looksChallenge(html)) {
-                                    finish(html)
-                                } else {
-                                    handler.postDelayed(this, POLL_MS)
-                                }
-                            }
+                            // real page title — settle, THEN extract
+                            handler.postDelayed({
+                                if (!done.get()) extractNow()
+                                if (!done.get()) handler.postDelayed(this, POLL_MS)
+                            }, SETTLE_MS)
                         }
                     }
                 }
@@ -235,6 +263,8 @@ private class WitaRenderDialog(
     companion object {
         private const val POLL_MS = 600L
         private const val REVEAL_AFTER_MS = 4_000L
+        private const val SETTLE_MS = 1_000L
+        private const val MIN_HTML_LEN = 2_000
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -268,6 +298,18 @@ private class WitaRenderDialog(
 
     fun cancel() = finish(null)
 
+    private fun extractNow() {
+        val wv = webView ?: return
+        wv.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
+            if (done.get()) return@evaluateJavascript
+            val html = unwrapJs(jsHtml)
+            if (html != null && html.length > MIN_HTML_LEN && !WitaWeb.looksChallenge(html)) {
+                status("Loaded ✓")
+                finish(html)
+            }
+        }
+    }
+
     private val poll: Runnable = object : Runnable {
         override fun run() {
             if (done.get()) return
@@ -292,17 +334,14 @@ private class WitaRenderDialog(
                     handler.postDelayed(poll, POLL_MS)
                     return@evaluateJavascript
                 }
-                wv.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
-                    if (done.get()) return@evaluateJavascript
-                    val html = unwrapJs(jsHtml)
-                    if (html != null && html.length > 300 && !WitaWeb.looksChallenge(html)) {
-                        status("Loaded ✓")
-                        finish(html)
-                    } else {
-                        status("Loading… (${elapsed / 1000}s)")
-                        handler.postDelayed(poll, POLL_MS)
+                status("Loading… (${elapsed / 1000}s)")
+                // settle, THEN extract
+                handler.postDelayed({
+                    if (!done.get()) {
+                        extractNow()
+                        if (!done.get()) handler.postDelayed(poll, POLL_MS)
                     }
-                }
+                }, SETTLE_MS)
             }
         }
     }
