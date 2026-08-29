@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -13,7 +14,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.webkit.CookieManager
-import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -26,6 +26,8 @@ import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,7 +40,8 @@ object WitaWeb {
         "verify you are human", "one more step", "ddos-guard"
     )
 
-    /** fast-path check: does this raw HTML look like a CF challenge? */
+    private val renderMutex = Mutex()
+
     fun looksChallenge(html: String?): Boolean {
         if (html.isNullOrBlank()) return true
         val l = html.lowercase()
@@ -52,32 +55,173 @@ object WitaWeb {
     }
 
     /**
-     * Loads [url] in a REAL visible WebView and returns the page's HTML.
-     * Everything — including the Cloudflare challenge — happens inside the
-     * browser: JS challenges auto-solve, interactive captchas are shown for
-     * the user to tap. HTML is extracted from the browser itself, so nothing
-     * is replayed through OkHttp (which CF rejects under WARP due to TLS
-     * fingerprint mismatch).
+     * Hidden-first strategy:
+     * 1) If the browser already holds cf_clearance for this host, render in an
+     *    INVISIBLE 1x1 WebView — page loads with the browser's own fingerprint,
+     *    no UI shown at all.
+     * 2) Only when no clearance exists (or it expired and the hidden render got
+     *    re-challenged) fall back to the visible dialog so a human can solve.
      */
-    suspend fun fetchHtml(url: String, timeoutMs: Long = 120_000L): String? {
-        return withContext(Dispatchers.Main) {
-            val activity: Activity? = CommonActivity.activity
-            if (activity == null || activity.isFinishing || activity.isDestroyed) {
-                println("WitaCF: no activity for WebView render")
-                return@withContext null
+    suspend fun fetchHtml(url: String, timeoutMs: Long = 120_000L): String? =
+        renderMutex.withLock {
+            val host = try { Uri.parse(url).host ?: "" } catch (_: Exception) { "" }
+            val hasClearance = withContext(Dispatchers.Main) {
+                runCatching {
+                    CookieManager.getInstance().getCookie("https://$host")
+                }.getOrNull()?.contains("cf_clearance") == true
             }
-            suspendCancellableCoroutine { cont ->
-                val dlg = WitaRenderDialog(activity, url, timeoutMs) { html ->
-                    if (cont.isActive) cont.resume(html)
+
+            if (hasClearance) {
+                val hidden = HiddenRender.fetch(url)
+                if (hidden != null) {
+                    println("WitaCF: hidden render OK — no UI shown")
+                    return@withLock hidden
                 }
-                try {
-                    dlg.show()
-                } catch (e: Exception) {
-                    println("WitaCF: dialog error ${e.message}")
-                    if (cont.isActive) cont.resume(null)
-                }
-                cont.invokeOnCancellation { dlg.cancel() }
+                println("WitaCF: clearance stale (re-challenged) → visible dialog")
+            } else {
+                println("WitaCF: no clearance yet → visible dialog (solve once)")
             }
+            VisibleRender.fetch(url, timeoutMs)
+        }
+}
+
+private fun unwrapJs(result: String?): String? {
+    if (result == null || result == "null") return null
+    return try {
+        JSONArray("[$result]").optString(0)
+    } catch (e: Exception) {
+        result
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+private fun WebView.configForCf() {
+    isFocusable = true
+    isFocusableInTouchMode = true
+    settings.javaScriptEnabled = true
+    settings.domStorageEnabled = true
+    settings.databaseEnabled = true
+    settings.loadsImagesAutomatically = true
+    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+    settings.mediaPlaybackRequiresUserGesture = false
+    // strip WebView tells — CF refuses clearance to flagged UAs
+    settings.userAgentString = settings.userAgentString
+        .replace("; wv", "")
+        .replace(Regex("Version/\\d+\\.\\d+ "), "")
+}
+
+/**
+ * Invisible renderer: 1x1 WebView attached to the window (attached = it loads
+ * and executes JS; 1x1 = nobody sees it). Works whenever the clearance cookie
+ * is still valid — the server returns the page directly, no challenge runs.
+ */
+private object HiddenRender {
+    private const val POLL_MS = 400L
+    private const val CHALLENGE_GRACE_MS = 6_000L  // auto-solve grace if challenged anyway
+    private const val HARD_TIMEOUT_MS = 15_000L
+
+    suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
+        val activity: Activity? = CommonActivity.activity
+        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+            return@withContext null
+        }
+        suspendCancellableCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            val done = AtomicBoolean(false)
+            var webView: WebView? = null
+            val startedAt = SystemClock.uptimeMillis()
+
+            fun cleanup() {
+                handler.removeCallbacksAndMessages(null)
+                val wv = webView ?: return
+                try { (wv.parent as? ViewGroup)?.removeView(wv) } catch (_: Exception) {}
+                try { wv.stopLoading() } catch (_: Exception) {}
+                try { wv.destroy() } catch (_: Exception) {}
+                webView = null
+            }
+
+            fun finish(html: String?) {
+                if (!done.compareAndSet(false, true)) return
+                cleanup()
+                if (cont.isActive) cont.resume(html)
+            }
+
+            try {
+                val wv = WebView(activity)
+                webView = wv
+                wv.configForCf()
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
+                }
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(wv, true)
+                }
+                // attached (so it renders & runs JS) but 1x1 pixel = invisible
+                activity.addContentView(wv, ViewGroup.LayoutParams(1, 1))
+                wv.loadUrl(url)
+
+                val poll = object : Runnable {
+                    override fun run() {
+                        if (done.get()) return
+                        val elapsed = SystemClock.uptimeMillis() - startedAt
+                        val wv2 = webView ?: return
+                        if (elapsed > HARD_TIMEOUT_MS) { finish(null); return }
+                        wv2.evaluateJavascript("document.title") { jsTitle ->
+                            if (done.get()) return@evaluateJavascript
+                            val title = unwrapJs(jsTitle).orEmpty()
+                            if (WitaWeb.isChallengeTitle(title)) {
+                                // challenge active — an invisible WebView cannot complete
+                                // interactive ones; after a short grace, give up quietly
+                                if (elapsed > CHALLENGE_GRACE_MS) finish(null)
+                                else handler.postDelayed(this, POLL_MS)
+                                return@evaluateJavascript
+                            }
+                            wv2.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
+                                if (done.get()) return@evaluateJavascript
+                                val html = unwrapJs(jsHtml)
+                                if (html != null && html.length > 300 && !WitaWeb.looksChallenge(html)) {
+                                    finish(html)
+                                } else {
+                                    handler.postDelayed(this, POLL_MS)
+                                }
+                            }
+                        }
+                    }
+                }
+                handler.postDelayed(poll, POLL_MS)
+            } catch (e: Exception) {
+                println("WitaCF: hidden render error ${e.message}")
+                finish(null)
+            }
+
+            cont.invokeOnCancellation {
+                if (done.compareAndSet(false, true)) {
+                    handler.post { cleanup() }
+                }
+            }
+        }
+    }
+}
+
+/** Visible dialog renderer — only shown when a challenge needs a human. */
+private object VisibleRender {
+    suspend fun fetch(url: String, timeoutMs: Long): String? = withContext(Dispatchers.Main) {
+        val activity: Activity? = CommonActivity.activity
+        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+            return@withContext null
+        }
+        suspendCancellableCoroutine { cont ->
+            val dlg = WitaRenderDialog(activity, url, timeoutMs) { html ->
+                if (cont.isActive) cont.resume(html)
+            }
+            try {
+                dlg.show()
+            } catch (e: Exception) {
+                println("WitaCF: dialog error ${e.message}")
+                if (cont.isActive) cont.resume(null)
+            }
+            cont.invokeOnCancellation { dlg.cancel() }
         }
     }
 }
@@ -101,20 +245,8 @@ private class WitaRenderDialog(
     private var overlay: View? = null
     private val startedAt = SystemClock.uptimeMillis()
 
-    private fun unwrapJs(result: String?): String? {
-        if (result == null || result == "null") return null
-        return try {
-            JSONArray("[$result]").optString(0)
-        } catch (e: Exception) {
-            result
-        }
-    }
+    private fun status(msg: String) { statusText?.text = msg }
 
-    private fun status(msg: String) {
-        statusText?.text = msg
-    }
-
-    /** after 4s unsolved the challenge is interactive — lift the cover so the user can tap it */
     private fun liftOverlay() {
         overlay?.let { ov ->
             (ov.parent as? ViewGroup)?.removeView(ov)
@@ -160,7 +292,6 @@ private class WitaRenderDialog(
                     handler.postDelayed(poll, POLL_MS)
                     return@evaluateJavascript
                 }
-                // real page title — extract the HTML from inside the browser
                 wv.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
                     if (done.get()) return@evaluateJavascript
                     val html = unwrapJs(jsHtml)
@@ -211,29 +342,14 @@ private class WitaRenderDialog(
         root.addView(progress, LinearLayout.LayoutParams(-1, dp(4)).also { it.bottomMargin = dp(10) })
 
         val holder = FrameLayout(activity)
-        val wv = WebView(activity).apply {
-            isFocusable = true
-            isFocusableInTouchMode = true
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.databaseEnabled = true
-            settings.loadsImagesAutomatically = true
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            settings.mediaPlaybackRequiresUserGesture = false
-            // strip WebView tells — CF refuses clearance to flagged UAs
-            settings.userAgentString = settings.userAgentString
-                .replace("; wv", "")
-                .replace(Regex("Version/\\d+\\.\\d+ "), "")
-            webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
-            }
-            webChromeClient = object : WebChromeClient() {}
-        }
+        val wv = WebView(activity)
         webView = wv
+        wv.configForCf()
+        wv.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
+        }
         holder.addView(wv, FrameLayout.LayoutParams(-1, -1))
 
-        // cover the raw challenge page with a clean "Verifying…" screen;
-        // lifts automatically after 4s if a human needs to tap the checkbox
         val cover = FrameLayout(activity).apply {
             setBackgroundColor(0xFF0B0B0F.toInt())
             isClickable = true
