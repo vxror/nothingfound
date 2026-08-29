@@ -23,6 +23,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.USER_AGENT
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -47,17 +48,15 @@ object WitaWeb {
     private const val CACHE_TTL = 30_000L
     private const val REPLAY_TTL = 10 * 60_000L
 
-    /** true only once OkHttp+clearance replay has FAILED → WARP-like scenario.
-     *  WitAnime uses this to decide if posters need the DDG proxy. */
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent (clearance cookies are bound to it) */
+    /** the WebView user-agent — now the APP UA, so the clearance cookie it earns
+     *  is valid for the app's image loader (Coil) requests too (v135 behavior) */
     @Volatile var webUa: String? = null
 
     @Volatile private var replayWorks: Boolean? = null
     @Volatile private var replayCheckedAt = 0L
 
-    /** [FIX] blank/null = network failure, NOT a challenge */
     fun looksChallenge(html: String?): Boolean {
         if (html.isNullOrBlank()) return false
         val l = html.lowercase()
@@ -70,7 +69,6 @@ object WitaWeb {
         return CHALLENGE_TITLES.any { l.contains(it) }
     }
 
-    /** null = unknown/expired, true = OkHttp replay works (real IP), false = WARP */
     fun replayWorks(): Boolean? =
         if (System.currentTimeMillis() - replayCheckedAt < REPLAY_TTL) replayWorks else null
 
@@ -79,7 +77,6 @@ object WitaWeb {
         replayCheckedAt = System.currentTimeMillis()
     }
 
-    /** a hidden render succeeded in the last 2 min → worth retrying OkHttp replay */
     fun renderedRecently(): Boolean =
         HiddenRender.lastSuccessAt > 0 && System.currentTimeMillis() - HiddenRender.lastSuccessAt < 120_000L
 
@@ -88,12 +85,6 @@ object WitaWeb {
             ?.takeIf { it.contains("cf_clearance") }
     }
 
-    /**
-     * [FIX v140] HIDDEN RENDER FIRST, ALWAYS.
-     * The site challenges every OkHttp request (even real IPs) but the WebView
-     * auto-passes in ~2s — that now happens in an invisible 1x1 WebView.
-     * The visible dialog appears ONLY when the challenge needs a human tap.
-     */
     suspend fun fetchHtml(url: String): String? {
         htmlCache[url]?.let { e ->
             if (System.currentTimeMillis() - e.ts < CACHE_TTL) return e.html
@@ -138,20 +129,18 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
-    // strip WebView tells — CF refuses clearance to flagged UAs
-    settings.userAgentString = settings.userAgentString
-        .replace("; wv", "")
-        .replace(Regex("Version/\\d+\\.\\d+ "), "")
+    // [v142 — THE FIX] Use the APP's User-Agent, NOT the system WebView UA.
+    // cf_clearance is bound to the UA that earned it. The app's image loader
+    // (Coil) sends the app UA, so a cookie earned under the app UA is valid for
+    // image requests too — this is exactly why v135 showed images under WARP
+    // (CloudStream's WebViewResolver uses this same UA by default).
+    settings.userAgentString = USER_AGENT
 }
 
-/**
- * Invisible renderer: 1x1 WebView attached to the window (attached = loads &
- * runs JS; 1x1 = invisible). The site's JS challenge auto-solves here (~2s).
- */
 private object HiddenRender {
     private const val POLL_MS = 400L
     private const val SETTLE_MS = 1_000L
-    private const val CHALLENGE_GRACE_MS = 8_000L   // time for a JS challenge to auto-solve
+    private const val CHALLENGE_GRACE_MS = 8_000L
     private const val HARD_TIMEOUT_MS = 20_000L
     private const val MIN_HTML_LEN = 2_000
 
@@ -225,13 +214,10 @@ private object HiddenRender {
                             if (done.get()) return@evaluateJavascript
                             val title = unwrapJs(jsTitle).orEmpty()
                             if (WitaWeb.isChallengeTitle(title)) {
-                                // JS challenge running — give it grace to auto-solve;
-                                // interactive ones cannot be solved invisibly
                                 if (elapsed > CHALLENGE_GRACE_MS) finish(null)
                                 else handler.postDelayed(this, POLL_MS)
                                 return@evaluateJavascript
                             }
-                            // real page — settle, then extract
                             handler.postDelayed({
                                 if (!done.get()) {
                                     extractNow()
@@ -256,7 +242,6 @@ private object HiddenRender {
     }
 }
 
-/** Visible dialog renderer — ONLY when a challenge needs a human. */
 private object VisibleRender {
     suspend fun fetch(url: String, timeoutMs: Long): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = CommonActivity.activity
@@ -316,8 +301,6 @@ private class WitaRenderDialog(
             try { CookieManager.getInstance().flush() } catch (_: Exception) {}
             webView?.settings?.userAgentString?.takeIf { it.isNotBlank() }?.let { WitaWeb.webUa = it }
         }
-        // [FIX] dismiss the dialog FIRST, then detach+destroy the WebView
-        // (log showed "WebView.destroy() called while still attached")
         try { dialog?.dismiss() } catch (_: Exception) {}
         dialog = null
         val wv = webView
