@@ -30,20 +30,16 @@ class WitAnime : MainAPI() {
         ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
 
     /**
-     * [v140] The site challenges EVERY OkHttp request (even real IPs — TLS
-     * fingerprint), but the WebView passes in ~2s. Strategy:
+     * [v141] Same fetch strategy as v140:
      *  1) plain request (fast when CF lets OkHttp through)
-     *  2) if challenged → try replaying with the WebView's clearance cookie+UA
-     *     (works on real IP → restores the old fast no-WebView behavior)
-     *  3) replay fails (WARP) → INVISIBLE hidden WebView render (~2-3s, no UI);
-     *     visible dialog only if a human must tap a captcha
-     *  4) pure network errors → clean error, never a WebView
+     *  2) replay with the WebView's clearance cookie+UA (restores no-WebView fast path)
+     *  3) confirmed challenge → INVISIBLE hidden WebView render (~2-3s, no UI)
+     *  4) visible dialog ONLY when a human must tap a captcha
      */
     private suspend fun smartFetch(url: String, referer: String? = null): String? {
         val base = mapOf("User-Agent" to userAgent)
         val rp = WitaWeb.replayWorks()
 
-        // 1) fast path (with clearance replay when it's known to work)
         var headers = base
         if (rp == true) {
             WitaWeb.clearanceCookie(url)?.let { c -> headers = base + mapOf("Cookie" to c) }
@@ -58,7 +54,6 @@ class WitAnime : MainAPI() {
         }
         if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) return body
 
-        // 2) challenged → try OkHttp replay with the WebView's clearance
         if (body != null) {
             val cookie = WitaWeb.clearanceCookie(url)
             val ua = WitaWeb.webUa
@@ -73,11 +68,9 @@ class WitAnime : MainAPI() {
                     return body2
                 }
                 WitaWeb.setReplayWorks(false)
-                WitaWeb.wasChallenged = true // replay blocked → WARP-like → proxy posters
             }
         }
 
-        // 3) pure network failure → one retry, then give up WITHOUT any WebView
         if (netFailed || body == null) {
             delay(400)
             val retry = try {
@@ -88,7 +81,6 @@ class WitAnime : MainAPI() {
             body = retry
         }
 
-        // 4) confirmed challenge → invisible hidden render first
         println("WitAnimeDebug: [$url] challenge → WebView render")
         return WitaWeb.fetchHtml(url)
     }
@@ -99,13 +91,18 @@ class WitAnime : MainAPI() {
         return Jsoup.parse(body, url)
     }
 
-    /** Posters: direct on real IP (replay works); DDG proxy only under WARP */
+    /**
+     * [v141 FIX] Posters stay DIRECT — like v135.
+     * On this site, static images (/wp-content/...jpg) are served WITHOUT the
+     * Cloudflare challenge even when HTML pages are challenged (that's why v135
+     * showed images under WARP with plain OkHttp). Proxied URLs (DDG/wsrv)
+     * actually FAIL because the proxy gets challenged — v140's bug.
+     * Auto-fallback: we probe one image once; only if it's genuinely blocked do
+     * we switch to proxying for the rest of the session.
+     */
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
-        if (!WitaWeb.wasChallenged) return fixed
-        return try {
-            "https://external-content.duckduckgo.com/iu/?u=" + URLEncoder.encode(fixed, "UTF-8")
-        } catch (_: Exception) { fixed }
+        return fixed
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
