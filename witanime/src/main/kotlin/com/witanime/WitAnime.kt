@@ -2,11 +2,12 @@ package com.witanime
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mvvm.logError
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import kotlinx.coroutines.*
@@ -23,7 +24,8 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    private val wvResolver by lazy { WebViewResolver(interceptUrl = Regex("""witanime\.(you|cyou|net|tv|quest|red)""")) }
+    private val userAgent = EXTRACTOR_UA
+    private val cfKiller = CloudflareKiller() // fast path only; WebView render is the real bypass
 
     @Suppress("DEPRECATION_ERROR")
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
@@ -34,15 +36,23 @@ class WitAnime : MainAPI() {
         return h.contains("Just a moment") || h.contains("challenge-platform") || h.contains("cf-chl")
     }
 
+    /**
+     * 1) fast OkHttp fetch (clean IP: instant, no UI)
+     * 2) if challenged -> render the page INSIDE a real WebView and pull the
+     *    HTML out of it. Works under WARP because the browser itself holds
+     *    the clearance — nothing is replayed through OkHttp.
+     */
     private suspend fun fetchDoc(url: String): Document {
-        // [CF] smart fetch: cached cookies -> visible dialog bypass if challenged
-        val resp = try { WitaCF.get(url) } catch (e: Exception) { null }
-        if (resp != null) {
-            val doc = try { resp.document } catch (e: Exception) { null }
-            if (doc != null && !isChallenge(doc)) return doc
-        }
-        // legacy fallback: the app's own WebView resolver
-        return app.get(url, interceptor = wvResolver).document
+        val fast = try {
+            val d = app.get(url, headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller).document
+            if (!isChallenge(d)) d else null
+        } catch (e: Exception) { null }
+        if (fast != null) return fast
+
+        println("WitAnimeDebug: [$url] challenged → WebView render")
+        val html = WitaWeb.fetchHtml(url)
+            ?: throw ErrorLoadingException("فشل التحقق من Cloudflare — حاول مرة أخرى")
+        return Jsoup.parse(html, url)
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -71,10 +81,7 @@ class WitAnime : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?search_param=animes&s=" + URLEncoder.encode(query, "UTF-8")
-        val document = try {
-            WitaCF.inSearch = true
-            try { fetchDoc(url) } finally { WitaCF.inSearch = false }
-        } catch (e: Exception) { return emptyList() }
+        val document = try { fetchDoc(url) } catch (e: Exception) { return emptyList() }
         return document.select("div.anime-list-content div.anime-card-container").mapNotNull {
             val href = it.selectFirst("div.anime-card-poster a")?.attr("href") ?: return@mapNotNull null
             val title = it.selectFirst("div.anime-card-title h3 a")?.text() ?: return@mapNotNull null
@@ -148,9 +155,14 @@ class WitAnime : MainAPI() {
         fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
-        suspend fun fetch(u: String) = try {
-            WitaCF.get(u, referer = data)?.text ?: ""
-        } catch (_: Exception) { "" }
+        suspend fun fetch(u: String): String {
+            val fast = try {
+                app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
+            } catch (_: Exception) { "" }
+            if (!WitaWeb.looksChallenge(fast)) return fast
+            println("WitAnimeDebug: [$u] challenged → WebView render")
+            return WitaWeb.fetchHtml(u) ?: ""
+        }
 
         fun findServers(html: String): List<Pair<String, String>> {
             val items = mutableListOf<Pair<String, String>>()
@@ -292,11 +304,14 @@ class WitAnime : MainAPI() {
 
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val res = WitaCF.get(yonaplayUrl, referer = "$mainUrl/") ?: run {
+            val fastHtml = try {
+                val r = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
+                if (WitaWeb.looksChallenge(r.text)) null else r.text
+            } catch (_: Exception) { null }
+            val html = fastHtml ?: (WitaWeb.fetchHtml(yonaplayUrl) ?: run {
                 println("WitAnimeDebug: Yona fetch failed"); return
-            }
-            val html = res.text
-            println("WitAnimeDebug: Yona len=${html.length} final=${res.url}")
+            })
+            println("WitAnimeDebug: Yona len=${html.length}")
 
             val seen = mutableSetOf<String>()
 
