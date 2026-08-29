@@ -2,7 +2,6 @@ package com.witanime
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mvvm.logError
 import org.json.JSONArray
@@ -25,7 +24,6 @@ class WitAnime : MainAPI() {
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
     private val userAgent = EXTRACTOR_UA
-    private val cfKiller = CloudflareKiller() // fast path only; WebView render is the real bypass
 
     @Suppress("DEPRECATION_ERROR")
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
@@ -37,14 +35,14 @@ class WitAnime : MainAPI() {
     }
 
     /**
-     * 1) fast OkHttp fetch (clean IP: instant, no UI)
-     * 2) if challenged -> render the page INSIDE a real WebView and pull the
-     *    HTML out of it. Works under WARP because the browser itself holds
-     *    the clearance — nothing is replayed through OkHttp.
+     * Plain request first (real IP: instant, no UI).
+     * Challenged -> render the page INSIDE our own WebView dialog (WitaWeb).
+     * No CloudflareKiller: under WARP it pops its own WebView, blocks ~60s, and
+     * its cookie gets rejected on replay anyway (TLS fingerprint mismatch).
      */
     private suspend fun fetchDoc(url: String): Document {
         val fast = try {
-            val d = app.get(url, headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller).document
+            val d = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
             if (!isChallenge(d)) d else null
         } catch (e: Exception) { null }
         if (fast != null) return fast
@@ -157,7 +155,7 @@ class WitAnime : MainAPI() {
 
         suspend fun fetch(u: String): String {
             val fast = try {
-                app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data, interceptor = cfKiller).text
+                app.get(u, headers = mapOf("User-Agent" to userAgent), referer = data).text
             } catch (_: Exception) { "" }
             if (!WitaWeb.looksChallenge(fast)) return fast
             println("WitAnimeDebug: [$u] challenged → WebView render")
@@ -305,7 +303,7 @@ class WitAnime : MainAPI() {
     private suspend fun decodeYonaplayAndLoad(yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
             val fastHtml = try {
-                val r = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent), interceptor = cfKiller)
+                val r = app.get(yonaplayUrl, referer = "$mainUrl/", headers = mapOf("User-Agent" to userAgent))
                 if (WitaWeb.looksChallenge(r.text)) null else r.text
             } catch (_: Exception) { null }
             val html = fastHtml ?: (WitaWeb.fetchHtml(yonaplayUrl) ?: run {
