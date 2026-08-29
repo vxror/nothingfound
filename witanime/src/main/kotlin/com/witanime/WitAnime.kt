@@ -23,9 +23,7 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    // [v142] app UA — must MATCH the WebView UA so the cf_clearance cookie the
-    // WebView earns is valid for our OkHttp requests (and Coil's image requests)
-    private val userAgent = USER_AGENT
+    private val userAgent = EXTRACTOR_UA
 
     @Suppress("DEPRECATION_ERROR")
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
@@ -77,7 +75,23 @@ class WitAnime : MainAPI() {
         }
 
         println("WitAnimeDebug: [$url] challenge → WebView render")
-        return WitaWeb.fetchHtml(url)
+        val html = WitaWeb.fetchHtml(url)
+
+        // [v143] after the FIRST successful render, probe once whether OkHttp can
+        // now replay with the fresh clearance — this decides poster routing
+        // (real IP → direct URLs, WARP → local image proxy) before posters are built
+        if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
+            val cookie = WitaWeb.clearanceCookie(url)
+            val ua = WitaWeb.webUa
+            if (cookie != null && ua != null) {
+                val probe = try {
+                    app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
+                } catch (e: Exception) { null }
+                WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
+                println("WitAnimeDebug: replay probe = ${WitaWeb.replayWorks()}")
+            }
+        }
+        return html
     }
 
     private suspend fun fetchDoc(url: String): Document {
@@ -86,11 +100,16 @@ class WitAnime : MainAPI() {
         return Jsoup.parse(body, url)
     }
 
-    /** posters stay DIRECT — the app's image loader handles them, and with the
-     *  WebView now using the app UA, its clearance cookie covers image requests
-     *  too (the v135 behavior that made images work under WARP) */
+    /**
+     * [v143] Posters:
+     * - real IP (replay works) → DIRECT url (proven working)
+     * - WARP (replay blocked) → local image proxy that fetches with the
+     *   cookie + UA the clearance was earned with (the v135 working path)
+     */
     private fun smartPoster(raw: String?): String? {
-        return fixUrlNull(raw)
+        val fixed = fixUrlNull(raw) ?: return null
+        if (WitaWeb.replayWorks() != false) return fixed
+        return WitaImgProxy.proxyUrl(fixed) ?: fixed
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
