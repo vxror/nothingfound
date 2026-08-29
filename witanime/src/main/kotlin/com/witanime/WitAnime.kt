@@ -23,19 +23,14 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    private val userAgent = EXTRACTOR_UA
+    // [v142] app UA — must MATCH the WebView UA so the cf_clearance cookie the
+    // WebView earns is valid for our OkHttp requests (and Coil's image requests)
+    private val userAgent = USER_AGENT
 
     @Suppress("DEPRECATION_ERROR")
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
         ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
 
-    /**
-     * [v141] Same fetch strategy as v140:
-     *  1) plain request (fast when CF lets OkHttp through)
-     *  2) replay with the WebView's clearance cookie+UA (restores no-WebView fast path)
-     *  3) confirmed challenge → INVISIBLE hidden WebView render (~2-3s, no UI)
-     *  4) visible dialog ONLY when a human must tap a captcha
-     */
     private suspend fun smartFetch(url: String, referer: String? = null): String? {
         val base = mapOf("User-Agent" to userAgent)
         val rp = WitaWeb.replayWorks()
@@ -91,18 +86,11 @@ class WitAnime : MainAPI() {
         return Jsoup.parse(body, url)
     }
 
-    /**
-     * [v141 FIX] Posters stay DIRECT — like v135.
-     * On this site, static images (/wp-content/...jpg) are served WITHOUT the
-     * Cloudflare challenge even when HTML pages are challenged (that's why v135
-     * showed images under WARP with plain OkHttp). Proxied URLs (DDG/wsrv)
-     * actually FAIL because the proxy gets challenged — v140's bug.
-     * Auto-fallback: we probe one image once; only if it's genuinely blocked do
-     * we switch to proxying for the rest of the session.
-     */
+    /** posters stay DIRECT — the app's image loader handles them, and with the
+     *  WebView now using the app UA, its clearance cookie covers image requests
+     *  too (the v135 behavior that made images work under WARP) */
     private fun smartPoster(raw: String?): String? {
-        val fixed = fixUrlNull(raw) ?: return null
-        return fixed
+        return fixUrlNull(raw)
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
