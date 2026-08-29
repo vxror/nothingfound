@@ -30,27 +30,67 @@ class WitAnime : MainAPI() {
         ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
 
     /**
-     * [FIX] Smart fetch:
-     * - Plain request, retried once on network error.
-     * - WebView (hidden or dialog) ONLY when the response body contains real
-     *   Cloudflare challenge markers. Timeouts/blank responses are network
-     *   failures — they now produce a clean error, never a WebView popup.
+     * [v140] The site challenges EVERY OkHttp request (even real IPs — TLS
+     * fingerprint), but the WebView passes in ~2s. Strategy:
+     *  1) plain request (fast when CF lets OkHttp through)
+     *  2) if challenged → try replaying with the WebView's clearance cookie+UA
+     *     (works on real IP → restores the old fast no-WebView behavior)
+     *  3) replay fails (WARP) → INVISIBLE hidden WebView render (~2-3s, no UI);
+     *     visible dialog only if a human must tap a captcha
+     *  4) pure network errors → clean error, never a WebView
      */
     private suspend fun smartFetch(url: String, referer: String? = null): String? {
-        for (attempt in 1..2) {
-            val body = try {
-                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-            } catch (e: Exception) {
-                if (attempt == 1) { delay(400); continue } else return null
-            }
-            if (WitaWeb.looksChallenge(body)) {
-                println("WitAnimeDebug: [$url] challenge CONFIRMED → WebView render")
-                return WitaWeb.fetchHtml(url)
-            }
-            if (body.isNotBlank()) return body
-            if (attempt == 1) delay(400)
+        val base = mapOf("User-Agent" to userAgent)
+        val rp = WitaWeb.replayWorks()
+
+        // 1) fast path (with clearance replay when it's known to work)
+        var headers = base
+        if (rp == true) {
+            WitaWeb.clearanceCookie(url)?.let { c -> headers = base + mapOf("Cookie" to c) }
+            WitaWeb.webUa?.let { ua -> headers = headers + mapOf("User-Agent" to ua) }
         }
-        return null // network failure — no WebView for these
+        var body: String? = null
+        var netFailed = false
+        try {
+            body = app.get(url, headers = headers, referer = referer).text
+        } catch (e: Exception) {
+            netFailed = true
+        }
+        if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) return body
+
+        // 2) challenged → try OkHttp replay with the WebView's clearance
+        if (body != null) {
+            val cookie = WitaWeb.clearanceCookie(url)
+            val ua = WitaWeb.webUa
+            if (cookie != null && ua != null && (rp != false || WitaWeb.renderedRecently())) {
+                val h2 = mapOf("User-Agent" to ua, "Cookie" to cookie)
+                val body2 = try {
+                    app.get(url, headers = h2, referer = referer).text
+                } catch (e: Exception) { null }
+                if (body2 != null && !WitaWeb.looksChallenge(body2) && body2.isNotBlank()) {
+                    WitaWeb.setReplayWorks(true)
+                    println("WitAnimeDebug: OkHttp replay OK (fast path restored)")
+                    return body2
+                }
+                WitaWeb.setReplayWorks(false)
+                WitaWeb.wasChallenged = true // replay blocked → WARP-like → proxy posters
+            }
+        }
+
+        // 3) pure network failure → one retry, then give up WITHOUT any WebView
+        if (netFailed || body == null) {
+            delay(400)
+            val retry = try {
+                app.get(url, headers = base, referer = referer).text
+            } catch (e: Exception) { null }
+            if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
+            if (retry == null) return null
+            body = retry
+        }
+
+        // 4) confirmed challenge → invisible hidden render first
+        println("WitAnimeDebug: [$url] challenge → WebView render")
+        return WitaWeb.fetchHtml(url)
     }
 
     private suspend fun fetchDoc(url: String): Document {
@@ -59,17 +99,12 @@ class WitAnime : MainAPI() {
         return Jsoup.parse(body, url)
     }
 
-    /**
-     * [FIX] Posters under WARP: the APP loads cover images itself (outside our
-     * WebView), and Cloudflare blocks those requests. When a challenge has been
-     * confirmed this session, route posters through the wsrv.nl image proxy
-     * (it fetches from its own clean IP). Real IP: direct, zero overhead.
-     */
+    /** Posters: direct on real IP (replay works); DDG proxy only under WARP */
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
         if (!WitaWeb.wasChallenged) return fixed
         return try {
-            "https://wsrv.nl/?url=" + URLEncoder.encode(fixed, "UTF-8")
+            "https://external-content.duckduckgo.com/iu/?u=" + URLEncoder.encode(fixed, "UTF-8")
         } catch (_: Exception) { fixed }
     }
 
