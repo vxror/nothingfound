@@ -25,24 +25,40 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    // ══════════ [v148] INSTANT NEXT EPISODE: link cache + prefetch ══════════
+    // ══════════ INSTANT NEXT EPISODE: link cache + prefetch ══════════
     companion object {
-        private const val LINK_CACHE_TTL = 15 * 60_000L   // 15 min — tokens stay valid
-        private const val LINK_CACHE_MAX = 8              // up to 8 episodes in RAM
+        private const val LINK_CACHE_TTL = 15 * 60_000L
+        private const val LINK_CACHE_MAX = 8
 
         private class CachedLinks(val links: List<ExtractorLink>, val subs: List<SubtitleFile>, val ts: Long)
 
         private val linkCache = ConcurrentHashMap<String, CachedLinks>()
-        private val inFlight = ConcurrentHashMap<String, Job>()          // prefetch jobs
-        private val nextEpMap = ConcurrentHashMap<String, String>()      // epUrl -> next epUrl
+        private val inFlight = ConcurrentHashMap<String, Job>()
+        private val nextEpMap = ConcurrentHashMap<String, String>()
 
-        // survives after loadLinks returns — prefetch keeps running while you watch
         private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
         private fun trimCache() {
             while (linkCache.size > LINK_CACHE_MAX) {
                 linkCache.entries.minByOrNull { it.value.ts }?.let { linkCache.remove(it.key) } ?: break
             }
+        }
+
+        /** [v149] deliver cached links — returns false when stale/absent */
+        private fun deliverCached(
+            url: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit
+        ): Boolean {
+            val c = linkCache[url] ?: return false
+            if (System.currentTimeMillis() - c.ts > LINK_CACHE_TTL) {
+                linkCache.remove(url)
+                return false
+            }
+            println("WitAnimeDebug: CACHE HIT — ${c.links.size} links instantly")
+            c.subs.forEach(subtitleCallback)
+            c.links.forEach(callback)
+            return true
         }
     }
 
@@ -201,7 +217,6 @@ class WitAnime : MainAPI() {
                     for (i in p1.indices) sb.append((p1[i].code xor p2[i % p2.length].code).toChar())
                     val eps = AppUtils.parseJson(sb.toString()) as? List<Map<String, Any>>
                     if (eps != null) {
-                        // [v148] remember episode order so we know what to prefetch next
                         val epUrls = eps.mapNotNull { it["url"]?.toString() }
                         for (i in epUrls.indices) {
                             epUrls.getOrNull(i + 1)?.let { nextEpMap[epUrls[i]] = it }
@@ -238,31 +253,26 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        // ── 1) fresh cache → INSTANT (also means no page fetch → no Cloudflare box) ──
-        val cached = linkCache[data]
-        if (cached != null && System.currentTimeMillis() - cached.ts < LINK_CACHE_TTL) {
-            println("WitAnimeDebug: CACHE HIT — ${cached.links.size} links instantly")
-            cached.subs.forEach(subtitleCallback)
-            cached.links.forEach(callback)
+        // ── 1) fresh cache → INSTANT ──
+        if (deliverCached(data, subtitleCallback, callback)) {
             schedulePrefetch(data)
             return true
         }
 
-        // ── 2) prefetch already running for this episode? wait for it instead
-        //      of double-loading (double-load = same-host bursts = missing links) ──
+        // ── 2) [v149 FIXED] in-flight prefetch: wait, but if it produced
+        //      nothing, fall through to a REAL load (dialog allowed) instead
+        //      of returning empty ──
         val pending = inFlight[data]
         if (pending != null && pending.isActive) {
             println("WitAnimeDebug: prefetch in-flight — waiting")
             withTimeoutOrNull(15_000) { pending.join() }
-            val c = linkCache[data]
-            if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) {
-                println("WitAnimeDebug: prefetch delivered ${c.links.size} links")
-                c.subs.forEach(subtitleCallback)
-                c.links.forEach(callback)
+            if (deliverCached(data, subtitleCallback, callback)) {
                 schedulePrefetch(data)
                 return true
             }
-            // prefetch failed (e.g. silent challenge) → normal load below
+            println("WitAnimeDebug: prefetch produced nothing → full load (dialog allowed)")
+            // clear the marker so schedulePrefetch below can retry cleanly
+            inFlight.remove(data)
         }
 
         // ── 3) normal extraction ──
@@ -275,16 +285,17 @@ class WitAnime : MainAPI() {
             linkCache[data] = CachedLinks(links, capturedSubs.toList(), System.currentTimeMillis())
             trimCache()
             schedulePrefetch(data)
+            return true
         }
-        return links.isNotEmpty()
+        return false
     }
 
-    /** [v148] background prefetch of the NEXT episode — silent (no dialogs) */
+    /** [v149] background prefetch of the NEXT episode — silent (no dialogs) */
     private fun schedulePrefetch(currentUrl: String) {
         if (inFlight.size > 4) return
         val next = nextEpMap[currentUrl] ?: return
         val c = linkCache[next]
-        if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return  // already cached
+        if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return
         if (inFlight.containsKey(next)) return
         println("WitAnimeDebug: prefetch START $next")
         val job = bgScope.launch {
@@ -295,8 +306,11 @@ class WitAnime : MainAPI() {
                     linkCache[next] = CachedLinks(links, subs.toList(), System.currentTimeMillis())
                     trimCache()
                     println("WitAnimeDebug: prefetched ${links.size} links for next episode")
+                } else {
+                    println("WitAnimeDebug: prefetch EMPTY (challenge?) — will full-load on open")
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                println("WitAnimeDebug: prefetch error: ${e.message}")
             } finally {
                 inFlight.remove(next)
             }
@@ -304,11 +318,6 @@ class WitAnime : MainAPI() {
         inFlight[next] = job
     }
 
-    /**
-     * [v148] The full extraction pipeline (previously the body of loadLinks).
-     * Emits sorted+deduped links via [callback] and returns them for caching.
-     * silent=true → background prefetch mode: no Cloudflare dialogs.
-     */
     private suspend fun extractLinks(
         data: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -420,7 +429,6 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // ── phase 1: servers, staggered parallel ──
             supervisorScope {
                 servers.mapIndexed { i, (sid, label) ->
                     async(Dispatchers.IO) {
@@ -430,7 +438,6 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 2: sequential retry for servers that produced ZERO links ──
             run {
                 val produced = HashMap<Int, Int>()
                 synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
@@ -444,7 +451,6 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // ── phase 3: download links ──
             supervisorScope {
                 dlLinks.mapIndexed { i, dl ->
                     async(Dispatchers.IO) {
@@ -462,7 +468,6 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 4: dedupe + sort + emit ──
             val seenUrls = HashSet<String>()
             val ordered = synchronized(collected) { collected.toList() }
                 .filter { seenUrls.add(it.link.url) }
