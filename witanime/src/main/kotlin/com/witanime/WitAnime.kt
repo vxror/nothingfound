@@ -61,11 +61,14 @@ class WitAnime : MainAPI() {
             .put("t", l.type?.name ?: "").put("x", l.extractorData ?: "")
 
         @Suppress("DEPRECATION_ERROR")
-        private fun linkFromJson(o: JSONObject): ExtractorLink = ExtractorLink(
-            o.optString("s"), o.optString("n"), o.optString("u"), o.optString("r"),
-            o.optInt("q"), try { ExtractorLinkType.valueOf(o.optString("t")) } catch (_: Exception) { null },
-            mapOf(), o.optString("x").ifBlank { null }
-        )
+        private fun linkFromJson(o: JSONObject): ExtractorLink {
+            val type = try { ExtractorLinkType.valueOf(o.optString("t")) } catch (_: Exception) { null }
+            return ExtractorLink(
+                o.optString("s"), o.optString("n"), o.optString("u"), o.optString("r"),
+                o.optInt("q"), type,
+                mapOf(), o.optString("x").ifBlank { null }
+            )
+        }
 
         private fun subToJson(s: SubtitleFile): JSONObject = JSONObject()
             .put("l", s.lang).put("u", s.url)
@@ -113,7 +116,7 @@ class WitAnime : MainAPI() {
                         .put("ts", c.ts)
                         .put("l", JSONArray(c.links.map { linkToJson(it) }))
                         .put("s", JSONArray(c.subs.map { subToJson(it) }))
-                }
+                )
                 val eps = JSONObject()
                 nextEpMap.forEach { (k, v) -> eps.put(k, v) }
                 val root = JSONObject().put("links", links).put("eps", eps)
@@ -335,7 +338,7 @@ class WitAnime : MainAPI() {
                         // [v150] prefetch the FIRST episode as soon as the anime opens
                         epUrls.firstOrNull()?.let { first ->
                             if (linkCache[first] == null && !inFlight.containsKey(first)) {
-                                schedulePrefetch(epUrls.getOrNull(0) ?: return@let, forceFirst = first)
+                                schedulePrefetch(first, forceFirst = first)
                             }
                         }
                     }
