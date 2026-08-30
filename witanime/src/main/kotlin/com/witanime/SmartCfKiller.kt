@@ -45,12 +45,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
-/**
- * Fork-proof current-Activity resolution:
- *  1) CommonActivity.activity (mainline & most forks)
- *  2) lifecycle tracking — registered AT PLUGIN-LOAD TIME (warmup)
- *  3) reflection scan of ActivityThread's live activity records
- */
 private object ActivityResolver {
     private val resumed = AtomicReference<WeakReference<Activity>?>(null)
     private val registered = AtomicBoolean(false)
@@ -131,14 +125,11 @@ object WitaWeb {
 
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent the clearance was earned with (its REAL UA,
-     *  cleaned of WebView tells — NOT the app UA; CF rejects mismatched UAs) */
     @Volatile var webUa: String? = null
 
     @Volatile private var replayWorks: Boolean? = null
     @Volatile private var replayCheckedAt = 0L
 
-    /** register lifecycle hooks early — call from WitAnime.init */
     fun warmup() = ActivityResolver.warmup()
 
     fun looksChallenge(html: String?): Boolean {
@@ -169,7 +160,12 @@ object WitaWeb {
             ?.takeIf { it.contains("cf_clearance") }
     }
 
-    suspend fun fetchHtml(url: String): String? {
+    /**
+     * [v148] silent=true is used by background prefetch: never shows the
+     * visible dialog (a human isn't looking). If the challenge needs a human,
+     * returns null and the caller falls back gracefully.
+     */
+    suspend fun fetchHtml(url: String, silent: Boolean = false): String? {
         htmlCache[url]?.let { e ->
             if (System.currentTimeMillis() - e.ts < CACHE_TTL) return e.html
             htmlCache.remove(url)
@@ -183,6 +179,10 @@ object WitaWeb {
             if (hidden != null) {
                 println("WitaCF: hidden render OK — no UI shown")
                 return@withLock hidden
+            }
+            if (silent) {
+                println("WitaCF: silent mode (background prefetch) — dialog suppressed")
+                return@withLock null
             }
             println("WitaCF: challenge needs a human → visible dialog")
             val html = VisibleRender.fetch(url, 120_000L)
@@ -213,8 +213,6 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
-    // the WebView must keep its REAL UA (only WebView tells removed) — CF
-    // refuses clearance when the UA string doesn't match the fingerprint
     settings.userAgentString = settings.userAgentString
         .replace("; wv", "")
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
@@ -348,12 +346,6 @@ private object VisibleRender {
     }
 }
 
-/**
- * Local image proxy. The app's image loader sends the app UA, but the clearance
- * cookie is bound to the WebView's UA — Cloudflare rejects the mismatch. So
- * under WARP posters point at this localhost server, which fetches each image
- * with the EXACT UA + cookie the clearance was earned with.
- */
 object WitaImgProxy {
 
     private var serverSocket: ServerSocket? = null
