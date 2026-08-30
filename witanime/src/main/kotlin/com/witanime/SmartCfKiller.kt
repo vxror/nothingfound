@@ -46,27 +46,33 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 /**
- * [v144] Fork-proof current-Activity lookup.
- * Mainline CloudStream exposes the foreground Activity via CommonActivity.activity,
- * but forks (Zangetsu, …) may not populate it — and the entire WebView render path
- * silently dies without an Activity (which is exactly the "Couldn't load WitAnime"
- * error under WARP in forks while real IP works). So: try CommonActivity first,
- * then fall back to generic lifecycle tracking via ActivityThread reflection.
+ * Fork-proof current-Activity resolution:
+ *  1) CommonActivity.activity (mainline & most forks)
+ *  2) lifecycle tracking — registered AT PLUGIN-LOAD TIME (warmup)
+ *  3) reflection scan of ActivityThread's live activity records
  */
 private object ActivityResolver {
     private val resumed = AtomicReference<WeakReference<Activity>?>(null)
     private val registered = AtomicBoolean(false)
 
+    fun warmup() {
+        runCatching {
+            val a = CommonActivity.activity
+            if (a != null && !a.isFinishing && !a.isDestroyed) resumed.set(WeakReference(a))
+        }
+        ensureRegistered()
+    }
+
     fun current(): Activity? {
-        // 1) mainline CloudStream (and forks that keep it populated)
         runCatching {
             val a = CommonActivity.activity
             if (a != null && !a.isFinishing && !a.isDestroyed) return a
         }
-        // 2) generic fallback for forks
         ensureRegistered()
-        val a = resumed.get()?.get()
-        return a?.takeIf { !it.isFinishing && !it.isDestroyed }
+        resumed.get()?.get()?.let { a ->
+            if (!a.isFinishing && !a.isDestroyed) return a
+        }
+        return scanActivityRecords()
     }
 
     private fun application(): Application? = runCatching {
@@ -89,6 +95,24 @@ private object ActivityResolver {
             override fun onActivityDestroyed(a: Activity) {}
         })
     }
+
+    private fun scanActivityRecords(): Activity? = runCatching {
+        val at = Class.forName("android.app.ActivityThread")
+        val current = at.getMethod("currentActivityThread").invoke(null) ?: return@runCatching null
+        val recordsField = at.getDeclaredField("mActivities")
+        recordsField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val records = recordsField.get(current) as? Map<Any, Any> ?: return@runCatching null
+        for (record in records.values) {
+            val act = runCatching {
+                val f = record.javaClass.getDeclaredField("activity")
+                f.isAccessible = true
+                f.get(record) as? Activity
+            }.getOrNull() ?: continue
+            if (!act.isFinishing && !act.isDestroyed) return@runCatching act
+        }
+        null
+    }.getOrNull()
 }
 
 object WitaWeb {
@@ -107,12 +131,12 @@ object WitaWeb {
 
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent the clearance was earned with (its REAL UA,
-     *  cleaned of WebView tells — NOT the app UA; CF rejects mismatched UAs) */
     @Volatile var webUa: String? = null
 
     @Volatile private var replayWorks: Boolean? = null
     @Volatile private var replayCheckedAt = 0L
+
+    fun warmup() = ActivityResolver.warmup()
 
     fun looksChallenge(html: String?): Boolean {
         if (html.isNullOrBlank()) return false
@@ -186,8 +210,6 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
-    // the WebView must keep its REAL UA (only WebView tells removed) — CF
-    // refuses clearance when the UA string doesn't match the fingerprint
     settings.userAgentString = settings.userAgentString
         .replace("; wv", "")
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
@@ -321,12 +343,6 @@ private object VisibleRender {
     }
 }
 
-/**
- * Local image proxy. The app's image loader sends the app UA, but the clearance
- * cookie is bound to the WebView's UA — Cloudflare rejects the mismatch. So
- * under WARP posters point at this localhost server, which fetches each image
- * with the EXACT UA + cookie the clearance was earned with.
- */
 object WitaImgProxy {
 
     private var serverSocket: ServerSocket? = null
@@ -407,7 +423,7 @@ object WitaImgProxy {
         app.baseClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) { write404(output); return }
             val contentType = resp.header("Content-Type") ?: ""
-            if (!contentType.startsWith("image/")) { write404(output); return } // challenged/garbage
+            if (!contentType.startsWith("image/")) { write404(output); return }
             val bytes = resp.body?.bytes() ?: run { write404(output); return }
             if (bytes.isEmpty() || bytes.size > 24 * 1024 * 1024) { write404(output); return }
             synchronized(cache) { cache[target] = bytes }
