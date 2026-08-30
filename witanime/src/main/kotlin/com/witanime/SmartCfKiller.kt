@@ -2,10 +2,12 @@ package com.witanime
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Application
 import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -34,12 +36,60 @@ import okhttp3.Request
 import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.lang.ref.WeakReference
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
+
+/**
+ * [v144] Fork-proof current-Activity lookup.
+ * Mainline CloudStream exposes the foreground Activity via CommonActivity.activity,
+ * but forks (Zangetsu, …) may not populate it — and the entire WebView render path
+ * silently dies without an Activity (which is exactly the "Couldn't load WitAnime"
+ * error under WARP in forks while real IP works). So: try CommonActivity first,
+ * then fall back to generic lifecycle tracking via ActivityThread reflection.
+ */
+private object ActivityResolver {
+    private val resumed = AtomicReference<WeakReference<Activity>?>(null)
+    private val registered = AtomicBoolean(false)
+
+    fun current(): Activity? {
+        // 1) mainline CloudStream (and forks that keep it populated)
+        runCatching {
+            val a = CommonActivity.activity
+            if (a != null && !a.isFinishing && !a.isDestroyed) return a
+        }
+        // 2) generic fallback for forks
+        ensureRegistered()
+        val a = resumed.get()?.get()
+        return a?.takeIf { !it.isFinishing && !it.isDestroyed }
+    }
+
+    private fun application(): Application? = runCatching {
+        val at = Class.forName("android.app.ActivityThread")
+        val current = at.getMethod("currentActivityThread").invoke(null) ?: return@runCatching null
+        at.getMethod("getApplication").invoke(current) as? Application
+    }.getOrNull()
+
+    private fun ensureRegistered() {
+        if (registered.get()) return
+        val app = application() ?: return
+        if (!registered.compareAndSet(false, true)) return
+        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(a: Activity) { resumed.set(WeakReference(a)) }
+            override fun onActivityCreated(a: Activity, b: Bundle?) {}
+            override fun onActivityStarted(a: Activity) {}
+            override fun onActivityPaused(a: Activity) {}
+            override fun onActivityStopped(a: Activity) {}
+            override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+            override fun onActivityDestroyed(a: Activity) {}
+        })
+    }
+}
 
 object WitaWeb {
 
@@ -136,10 +186,8 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
-    // [v143 — REVERTED] the WebView must keep its REAL UA (only the WebView
-    // tells removed). v142 forced the app UA and CF refused to issue clearance
-    // because the UA string didn't match the browser's actual fingerprint —
-    // the challenge then never completes, even in the visible dialog.
+    // the WebView must keep its REAL UA (only WebView tells removed) — CF
+    // refuses clearance when the UA string doesn't match the fingerprint
     settings.userAgentString = settings.userAgentString
         .replace("; wv", "")
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
@@ -155,8 +203,9 @@ private object HiddenRender {
     @Volatile var lastSuccessAt: Long = 0L
 
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
-        val activity: Activity? = CommonActivity.activity
-        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+        val activity: Activity? = ActivityResolver.current()
+        if (activity == null) {
+            println("WitaCF: no activity available (fork?) — hidden render skipped")
             return@withContext null
         }
         suspendCancellableCoroutine { cont ->
@@ -252,8 +301,9 @@ private object HiddenRender {
 
 private object VisibleRender {
     suspend fun fetch(url: String, timeoutMs: Long): String? = withContext(Dispatchers.Main) {
-        val activity: Activity? = CommonActivity.activity
-        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+        val activity: Activity? = ActivityResolver.current()
+        if (activity == null) {
+            println("WitaCF: no activity available (fork?) — dialog skipped")
             return@withContext null
         }
         suspendCancellableCoroutine { cont ->
@@ -272,17 +322,15 @@ private object VisibleRender {
 }
 
 /**
- * [v143 NEW] Local image proxy. The app's image loader (Coil) sends the app UA,
- * but the clearance cookie is bound to the WebView's UA — Cloudflare rejects the
- * mismatch. We can't change Coil's UA, so instead posters under WARP point at
- * this localhost server, which fetches each image with the EXACT UA + cookie
- * the clearance was earned with. This reproduces the v135 working image path.
+ * Local image proxy. The app's image loader sends the app UA, but the clearance
+ * cookie is bound to the WebView's UA — Cloudflare rejects the mismatch. So
+ * under WARP posters point at this localhost server, which fetches each image
+ * with the EXACT UA + cookie the clearance was earned with.
  */
 object WitaImgProxy {
 
     private var serverSocket: ServerSocket? = null
 
-    // small LRU so scrolling doesn't re-fetch
     private val cache = object : LinkedHashMap<String, ByteArray>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>): Boolean {
             return values.sumOf { it.size } > 24 * 1024 * 1024
@@ -332,7 +380,6 @@ object WitaImgProxy {
         val target = Uri.parse("http://localhost" + parts[1]).getQueryParameter("u")
         if (target.isNullOrBlank() || !target.startsWith("http")) { write404(output); return }
 
-        // drain headers
         while (true) {
             val l = input.readLine() ?: break
             if (l.isEmpty()) break
