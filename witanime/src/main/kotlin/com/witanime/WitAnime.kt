@@ -27,7 +27,6 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    // ══════════ INSTANT NEXT EPISODE: persistent cache + prefetch ══════════
     companion object {
         private const val LINK_CACHE_TTL = 15 * 60_000L
         private const val LINK_CACHE_MAX = 8
@@ -54,7 +53,6 @@ class WitAnime : MainAPI() {
             return c
         }
 
-        // ---- link (de)serialization ----
         private fun linkToJson(l: ExtractorLink): JSONObject = JSONObject()
             .put("s", l.source).put("n", l.name).put("u", l.url)
             .put("r", l.referer ?: "").put("q", l.quality)
@@ -62,11 +60,28 @@ class WitAnime : MainAPI() {
 
         @Suppress("DEPRECATION_ERROR")
         private fun linkFromJson(o: JSONObject): ExtractorLink {
-            val type = try { ExtractorLinkType.valueOf(o.optString("t")) } catch (_: Exception) { null }
+            // bulletproof: no try/catch expressions at all
+            val typeStr = o.optString("t")
+            var type: ExtractorLinkType? = null
+            if (typeStr.isNotBlank()) {
+                val all = ExtractorLinkType.values()
+                for (t in all) {
+                    if (t.name == typeStr) {
+                        type = t
+                        break
+                    }
+                }
+            }
+            val extra = o.optString("x")
             return ExtractorLink(
-                o.optString("s"), o.optString("n"), o.optString("u"), o.optString("r"),
-                o.optInt("q"), type,
-                mapOf(), o.optString("x").ifBlank { null }
+                o.optString("s"),
+                o.optString("n"),
+                o.optString("u"),
+                o.optString("r"),
+                o.optInt("q"),
+                type,
+                mapOf(),
+                if (extra.isBlank()) null else extra
             )
         }
 
@@ -75,7 +90,6 @@ class WitAnime : MainAPI() {
 
         private fun subFromJson(o: JSONObject) = SubtitleFile(o.optString("l"), o.optString("u"))
 
-        /** [v150] load persisted cache+map from disk (once per process) */
         private fun ensureStoreLoaded() {
             if (storeLoaded) return
             synchronized(this) {
@@ -103,11 +117,12 @@ class WitAnime : MainAPI() {
                         if (ls.isNotEmpty()) linkCache[epUrl] = CachedLinks(ls, ss, ts)
                     }
                     println("WitAnimeDebug: restored ${linkCache.size} cached episodes from disk")
-                } catch (e: Exception) { println("WitAnimeDebug: store load fail ${e.message}") }
+                } catch (e: Exception) {
+                    println("WitAnimeDebug: store load fail ${e.message}")
+                }
             }
         }
 
-        /** [v150] persist cache+map to disk */
         private fun persistStore() {
             try {
                 val links = JSONObject()
@@ -116,12 +131,15 @@ class WitAnime : MainAPI() {
                         .put("ts", c.ts)
                         .put("l", JSONArray(c.links.map { linkToJson(it) }))
                         .put("s", JSONArray(c.subs.map { subToJson(it) }))
-                )
+                    )
+                }
                 val eps = JSONObject()
                 nextEpMap.forEach { (k, v) -> eps.put(k, v) }
                 val root = JSONObject().put("links", links).put("eps", eps)
                 ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
-            } catch (e: Exception) { println("WitAnimeDebug: store persist fail ${e.message}") }
+            } catch (e: Exception) {
+                println("WitAnimeDebug: store persist fail ${e.message}")
+            }
         }
 
         private fun trimCache() {
@@ -158,7 +176,7 @@ class WitAnime : MainAPI() {
 
     init {
         WitaWeb.warmup()
-        bgScope.launch { ensureStoreLoaded() }   // [v150] restore disk cache immediately
+        bgScope.launch { ensureStoreLoaded() }
     }
 
     @Suppress("DEPRECATION_ERROR")
@@ -313,8 +331,10 @@ class WitAnime : MainAPI() {
                         val epUrls = eps.mapNotNull { it["url"]?.toString() }
                         var changed = false
                         for (i in epUrls.indices) {
-                            epUrls.getOrNull(i + 1)?.let {
-                                if (nextEpMap[epUrls[i]] != it) { nextEpMap[epUrls[i]] = it; changed = true }
+                            val nxt = epUrls.getOrNull(i + 1)
+                            if (nxt != null && nextEpMap[epUrls[i]] != nxt) {
+                                nextEpMap[epUrls[i]] = nxt
+                                changed = true
                             }
                         }
                         if (nextEpMap.size > 400) nextEpMap.clear()
@@ -335,11 +355,9 @@ class WitAnime : MainAPI() {
                             }
                         }
 
-                        // [v150] prefetch the FIRST episode as soon as the anime opens
-                        epUrls.firstOrNull()?.let { first ->
-                            if (linkCache[first] == null && !inFlight.containsKey(first)) {
-                                schedulePrefetch(first, forceFirst = first)
-                            }
+                        val first = epUrls.firstOrNull()
+                        if (first != null && linkCache[first] == null && !inFlight.containsKey(first)) {
+                            schedulePrefetch(first, forceFirst = first)
                         }
                     }
                 }
@@ -422,11 +440,11 @@ class WitAnime : MainAPI() {
         silent: Boolean = false
     ): List<ExtractorLink> {
         fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
-        fun b64Bytes(i: String?) = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
-        fun bytesStr(b: ByteArray) = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
-        fun hexBytes(h: String?) = if (h.isNullOrBlank()) ByteArray(0) else { val c = h.replace(Regex("[^0-9a-fA-F]"), ""); if (c.length % 2 != 0) ByteArray(0) else c.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
-        fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
-        fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
+        fun b64Bytes(i: String?): ByteArray = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
+        fun bytesStr(b: ByteArray): String = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
+        fun hexBytes(h: String?): ByteArray = if (h.isNullOrBlank()) ByteArray(0) else { val c = h.replace(Regex("[^0-9a-fA-F]"), ""); if (c.length % 2 != 0) ByteArray(0) else c.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
+        fun xor(d: ByteArray, k: ByteArray): ByteArray = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
+        fun trim(s: String?): String = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
         suspend fun fetch(u: String): String = smartFetch(u, referer = data, silent = silent) ?: ""
 
@@ -607,7 +625,7 @@ class WitAnime : MainAPI() {
             isDoodLink(link) -> DoodExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
-            host.contains("mediafire") -> { /* removed */ }
+            host.contains("mediafire") -> { }
             isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, emit)
