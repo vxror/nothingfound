@@ -10,6 +10,7 @@ import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -23,6 +24,27 @@ class WitAnime : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
+
+    // ══════════ [v148] INSTANT NEXT EPISODE: link cache + prefetch ══════════
+    companion object {
+        private const val LINK_CACHE_TTL = 15 * 60_000L   // 15 min — tokens stay valid
+        private const val LINK_CACHE_MAX = 8              // up to 8 episodes in RAM
+
+        private class CachedLinks(val links: List<ExtractorLink>, val subs: List<SubtitleFile>, val ts: Long)
+
+        private val linkCache = ConcurrentHashMap<String, CachedLinks>()
+        private val inFlight = ConcurrentHashMap<String, Job>()          // prefetch jobs
+        private val nextEpMap = ConcurrentHashMap<String, String>()      // epUrl -> next epUrl
+
+        // survives after loadLinks returns — prefetch keeps running while you watch
+        private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        private fun trimCache() {
+            while (linkCache.size > LINK_CACHE_MAX) {
+                linkCache.entries.minByOrNull { it.value.ts }?.let { linkCache.remove(it.key) } ?: break
+            }
+        }
+    }
 
     private val userAgent = EXTRACTOR_UA
 
@@ -40,7 +62,7 @@ class WitAnime : MainAPI() {
         .replace(Regex("""\s{2,}"""), " ")
         .trim()
 
-    private suspend fun smartFetch(url: String, referer: String? = null): String? {
+    private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
         val base = mapOf("User-Agent" to userAgent)
         val rp = WitaWeb.replayWorks()
 
@@ -86,7 +108,7 @@ class WitAnime : MainAPI() {
         }
 
         println("WitAnimeDebug: [$url] challenge → WebView render")
-        val html = WitaWeb.fetchHtml(url)
+        val html = WitaWeb.fetchHtml(url, silent)
 
         if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
             val cookie = WitaWeb.clearanceCookie(url)
@@ -178,18 +200,27 @@ class WitAnime : MainAPI() {
                     val sb = StringBuilder()
                     for (i in p1.indices) sb.append((p1[i].code xor p2[i % p2.length].code).toChar())
                     val eps = AppUtils.parseJson(sb.toString()) as? List<Map<String, Any>>
-                    if (eps != null) episodes = eps.mapNotNull { ep ->
-                        val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
-                        val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
-                        val epNum = when (val raw = ep["number"]) {
-                            is Int -> raw
-                            is Long -> raw.toInt()
-                            is Double -> raw.toInt()
-                            else -> raw?.toString()?.trim()?.toDoubleOrNull()?.toInt()
+                    if (eps != null) {
+                        // [v148] remember episode order so we know what to prefetch next
+                        val epUrls = eps.mapNotNull { it["url"]?.toString() }
+                        for (i in epUrls.indices) {
+                            epUrls.getOrNull(i + 1)?.let { nextEpMap[epUrls[i]] = it }
                         }
-                        newEpisode(epUrl) {
-                            this.name = epName
-                            this.episode = epNum
+                        if (nextEpMap.size > 400) nextEpMap.clear()
+
+                        episodes = eps.mapNotNull { ep ->
+                            val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
+                            val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
+                            val epNum = when (val raw = ep["number"]) {
+                                is Int -> raw
+                                is Long -> raw.toInt()
+                                is Double -> raw.toInt()
+                                else -> raw?.toString()?.trim()?.toDoubleOrNull()?.toInt()
+                            }
+                            newEpisode(epUrl) {
+                                this.name = epName
+                                this.episode = epNum
+                            }
                         }
                     }
                 }
@@ -207,6 +238,83 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        // ── 1) fresh cache → INSTANT (also means no page fetch → no Cloudflare box) ──
+        val cached = linkCache[data]
+        if (cached != null && System.currentTimeMillis() - cached.ts < LINK_CACHE_TTL) {
+            println("WitAnimeDebug: CACHE HIT — ${cached.links.size} links instantly")
+            cached.subs.forEach(subtitleCallback)
+            cached.links.forEach(callback)
+            schedulePrefetch(data)
+            return true
+        }
+
+        // ── 2) prefetch already running for this episode? wait for it instead
+        //      of double-loading (double-load = same-host bursts = missing links) ──
+        val pending = inFlight[data]
+        if (pending != null && pending.isActive) {
+            println("WitAnimeDebug: prefetch in-flight — waiting")
+            withTimeoutOrNull(15_000) { pending.join() }
+            val c = linkCache[data]
+            if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) {
+                println("WitAnimeDebug: prefetch delivered ${c.links.size} links")
+                c.subs.forEach(subtitleCallback)
+                c.links.forEach(callback)
+                schedulePrefetch(data)
+                return true
+            }
+            // prefetch failed (e.g. silent challenge) → normal load below
+        }
+
+        // ── 3) normal extraction ──
+        val capturedSubs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
+        val subCb: (SubtitleFile) -> Unit = { s -> subtitleCallback(s); capturedSubs.add(s) }
+
+        val links = extractLinks(data, subCb, callback)
+
+        if (links.isNotEmpty()) {
+            linkCache[data] = CachedLinks(links, capturedSubs.toList(), System.currentTimeMillis())
+            trimCache()
+            schedulePrefetch(data)
+        }
+        return links.isNotEmpty()
+    }
+
+    /** [v148] background prefetch of the NEXT episode — silent (no dialogs) */
+    private fun schedulePrefetch(currentUrl: String) {
+        if (inFlight.size > 4) return
+        val next = nextEpMap[currentUrl] ?: return
+        val c = linkCache[next]
+        if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return  // already cached
+        if (inFlight.containsKey(next)) return
+        println("WitAnimeDebug: prefetch START $next")
+        val job = bgScope.launch {
+            try {
+                val subs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
+                val links = extractLinks(next, { subs.add(it) }, {}, silent = true)
+                if (links.isNotEmpty()) {
+                    linkCache[next] = CachedLinks(links, subs.toList(), System.currentTimeMillis())
+                    trimCache()
+                    println("WitAnimeDebug: prefetched ${links.size} links for next episode")
+                }
+            } catch (_: Exception) {
+            } finally {
+                inFlight.remove(next)
+            }
+        }
+        inFlight[next] = job
+    }
+
+    /**
+     * [v148] The full extraction pipeline (previously the body of loadLinks).
+     * Emits sorted+deduped links via [callback] and returns them for caching.
+     * silent=true → background prefetch mode: no Cloudflare dialogs.
+     */
+    private suspend fun extractLinks(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        silent: Boolean = false
+    ): List<ExtractorLink> {
         fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
         fun b64Bytes(i: String?) = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
         fun bytesStr(b: ByteArray) = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
@@ -214,7 +322,7 @@ class WitAnime : MainAPI() {
         fun xor(d: ByteArray, k: ByteArray) = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
         fun trim(s: String?) = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
 
-        suspend fun fetch(u: String): String = smartFetch(u, referer = data) ?: ""
+        suspend fun fetch(u: String): String = smartFetch(u, referer = data, silent = silent) ?: ""
 
         fun findServers(html: String): List<Pair<String, String>> {
             val items = mutableListOf<Pair<String, String>>()
@@ -284,7 +392,7 @@ class WitAnime : MainAPI() {
 
         return try {
             val html = fetch(data)
-            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return false }
+            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return emptyList() }
 
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
@@ -354,7 +462,7 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 4: dedupe + sort + emit once ──
+            // ── phase 4: dedupe + sort + emit ──
             val seenUrls = HashSet<String>()
             val ordered = synchronized(collected) { collected.toList() }
                 .filter { seenUrls.add(it.link.url) }
@@ -365,8 +473,8 @@ class WitAnime : MainAPI() {
                 )
             println("WitAnimeDebug: emitting ${ordered.size} links (sorted, deduped)")
             ordered.forEach { callback(it.link) }
-            true
-        } catch (e: Exception) { logError(e); false }
+            ordered.map { it.link }
+        } catch (e: Exception) { logError(e); emptyList() }
     }
 
     private suspend fun routeLink(
@@ -426,7 +534,6 @@ class WitAnime : MainAPI() {
                 return n.ifBlank { base }
             }
 
-            // main player list — page order preserved via idx
             Regex(
                 """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
                 RegexOption.DOT_MATCHES_ALL
@@ -455,7 +562,6 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // fallback: remaining go_to_player payloads
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 val myIdx = idx++
                 try {
@@ -466,13 +572,11 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // known download hosts
             Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
                 val myIdx = idx++
                 if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
             }
 
-            // iframes
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
@@ -482,7 +586,6 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // direct CDN links
             Regex("""https?://[^\s"'<>]+""").findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
                     if (seen.add(cdn)) {
@@ -491,7 +594,6 @@ class WitAnime : MainAPI() {
                     }
                 }
 
-            // raw media files
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val url = m.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google") && !isDirectCdnLink(url) && seen.add(url)) {
