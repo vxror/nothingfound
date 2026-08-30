@@ -1,5 +1,6 @@
 package com.witanime
 
+import android.content.Context
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -7,6 +8,7 @@ import com.lagradost.cloudstream3.mvvm.logError
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.util.Collections
@@ -25,18 +27,99 @@ class WitAnime : MainAPI() {
 
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
-    // ══════════ INSTANT NEXT EPISODE: link cache + prefetch ══════════
+    // ══════════ INSTANT NEXT EPISODE: persistent cache + prefetch ══════════
     companion object {
         private const val LINK_CACHE_TTL = 15 * 60_000L
         private const val LINK_CACHE_MAX = 8
+        private const val STORE_FILE = "wita_link_cache.json"
 
         private class CachedLinks(val links: List<ExtractorLink>, val subs: List<SubtitleFile>, val ts: Long)
 
         private val linkCache = ConcurrentHashMap<String, CachedLinks>()
         private val inFlight = ConcurrentHashMap<String, Job>()
         private val nextEpMap = ConcurrentHashMap<String, String>()
-
         private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        @Volatile private var storeLoaded = false
+        @Volatile private var diskCtx: Context? = null
+
+        private fun ctx(): Context? {
+            diskCtx?.let { return it }
+            val c = runCatching {
+                val at = Class.forName("android.app.ActivityThread")
+                val cur = at.getMethod("currentActivityThread").invoke(null) ?: return@runCatching null
+                at.getMethod("getApplication").invoke(cur) as? Context
+            }.getOrNull()
+            diskCtx = c
+            return c
+        }
+
+        // ---- link (de)serialization ----
+        private fun linkToJson(l: ExtractorLink): JSONObject = JSONObject()
+            .put("s", l.source).put("n", l.name).put("u", l.url)
+            .put("r", l.referer ?: "").put("q", l.quality)
+            .put("t", l.type?.name ?: "").put("x", l.extractorData ?: "")
+
+        @Suppress("DEPRECATION_ERROR")
+        private fun linkFromJson(o: JSONObject): ExtractorLink = ExtractorLink(
+            o.optString("s"), o.optString("n"), o.optString("u"), o.optString("r"),
+            o.optInt("q"), try { ExtractorLinkType.valueOf(o.optString("t")) } catch (_: Exception) { null },
+            mapOf(), o.optString("x").ifBlank { null }
+        )
+
+        private fun subToJson(s: SubtitleFile): JSONObject = JSONObject()
+            .put("l", s.lang).put("u", s.url)
+
+        private fun subFromJson(o: JSONObject) = SubtitleFile(o.optString("l"), o.optString("u"))
+
+        /** [v150] load persisted cache+map from disk (once per process) */
+        private fun ensureStoreLoaded() {
+            if (storeLoaded) return
+            synchronized(this) {
+                if (storeLoaded) return
+                storeLoaded = true
+                try {
+                    val f = File(ctx()?.filesDir, STORE_FILE)
+                    if (!f.exists()) return
+                    val root = JSONObject(f.readText())
+                    val links = root.optJSONObject("links") ?: return
+                    val eps = root.optJSONObject("eps") ?: JSONObject()
+                    eps.keys().forEach { k -> nextEpMap[k] = eps.optString(k) }
+                    links.keys().forEach { epUrl ->
+                        val o = links.optJSONObject(epUrl) ?: return@forEach
+                        val ts = o.optLong("ts")
+                        if (System.currentTimeMillis() - ts > LINK_CACHE_TTL) return@forEach
+                        val arr = o.optJSONArray("l") ?: return@forEach
+                        val ls = (0 until arr.length()).mapNotNull { i ->
+                            runCatching { linkFromJson(arr.optJSONObject(i)) }.getOrNull()
+                        }
+                        val sarr = o.optJSONArray("s") ?: JSONArray()
+                        val ss = (0 until sarr.length()).mapNotNull { i ->
+                            runCatching { subFromJson(sarr.optJSONObject(i)) }.getOrNull()
+                        }
+                        if (ls.isNotEmpty()) linkCache[epUrl] = CachedLinks(ls, ss, ts)
+                    }
+                    println("WitAnimeDebug: restored ${linkCache.size} cached episodes from disk")
+                } catch (e: Exception) { println("WitAnimeDebug: store load fail ${e.message}") }
+            }
+        }
+
+        /** [v150] persist cache+map to disk */
+        private fun persistStore() {
+            try {
+                val links = JSONObject()
+                linkCache.forEach { (ep, c) ->
+                    links.put(ep, JSONObject()
+                        .put("ts", c.ts)
+                        .put("l", JSONArray(c.links.map { linkToJson(it) }))
+                        .put("s", JSONArray(c.subs.map { subToJson(it) }))
+                }
+                val eps = JSONObject()
+                nextEpMap.forEach { (k, v) -> eps.put(k, v) }
+                val root = JSONObject().put("links", links).put("eps", eps)
+                ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
+            } catch (e: Exception) { println("WitAnimeDebug: store persist fail ${e.message}") }
+        }
 
         private fun trimCache() {
             while (linkCache.size > LINK_CACHE_MAX) {
@@ -44,12 +127,18 @@ class WitAnime : MainAPI() {
             }
         }
 
-        /** [v149] deliver cached links — returns false when stale/absent */
+        private fun putCache(url: String, links: List<ExtractorLink>, subs: List<SubtitleFile>) {
+            linkCache[url] = CachedLinks(links, subs, System.currentTimeMillis())
+            trimCache()
+            persistStore()
+        }
+
         private fun deliverCached(
             url: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit
         ): Boolean {
+            ensureStoreLoaded()
             val c = linkCache[url] ?: return false
             if (System.currentTimeMillis() - c.ts > LINK_CACHE_TTL) {
                 linkCache.remove(url)
@@ -66,6 +155,7 @@ class WitAnime : MainAPI() {
 
     init {
         WitaWeb.warmup()
+        bgScope.launch { ensureStoreLoaded() }   // [v150] restore disk cache immediately
     }
 
     @Suppress("DEPRECATION_ERROR")
@@ -218,10 +308,14 @@ class WitAnime : MainAPI() {
                     val eps = AppUtils.parseJson(sb.toString()) as? List<Map<String, Any>>
                     if (eps != null) {
                         val epUrls = eps.mapNotNull { it["url"]?.toString() }
+                        var changed = false
                         for (i in epUrls.indices) {
-                            epUrls.getOrNull(i + 1)?.let { nextEpMap[epUrls[i]] = it }
+                            epUrls.getOrNull(i + 1)?.let {
+                                if (nextEpMap[epUrls[i]] != it) { nextEpMap[epUrls[i]] = it; changed = true }
+                            }
                         }
                         if (nextEpMap.size > 400) nextEpMap.clear()
+                        if (changed) persistStore()
 
                         episodes = eps.mapNotNull { ep ->
                             val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
@@ -235,6 +329,13 @@ class WitAnime : MainAPI() {
                             newEpisode(epUrl) {
                                 this.name = epName
                                 this.episode = epNum
+                            }
+                        }
+
+                        // [v150] prefetch the FIRST episode as soon as the anime opens
+                        epUrls.firstOrNull()?.let { first ->
+                            if (linkCache[first] == null && !inFlight.containsKey(first)) {
+                                schedulePrefetch(epUrls.getOrNull(0) ?: return@let, forceFirst = first)
                             }
                         }
                     }
@@ -253,15 +354,13 @@ class WitAnime : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        // ── 1) fresh cache → INSTANT ──
+        ensureStoreLoaded()
+
         if (deliverCached(data, subtitleCallback, callback)) {
             schedulePrefetch(data)
             return true
         }
 
-        // ── 2) [v149 FIXED] in-flight prefetch: wait, but if it produced
-        //      nothing, fall through to a REAL load (dialog allowed) instead
-        //      of returning empty ──
         val pending = inFlight[data]
         if (pending != null && pending.isActive) {
             println("WitAnimeDebug: prefetch in-flight — waiting")
@@ -271,29 +370,25 @@ class WitAnime : MainAPI() {
                 return true
             }
             println("WitAnimeDebug: prefetch produced nothing → full load (dialog allowed)")
-            // clear the marker so schedulePrefetch below can retry cleanly
             inFlight.remove(data)
         }
 
-        // ── 3) normal extraction ──
         val capturedSubs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
         val subCb: (SubtitleFile) -> Unit = { s -> subtitleCallback(s); capturedSubs.add(s) }
 
         val links = extractLinks(data, subCb, callback)
 
         if (links.isNotEmpty()) {
-            linkCache[data] = CachedLinks(links, capturedSubs.toList(), System.currentTimeMillis())
-            trimCache()
+            putCache(data, links, capturedSubs.toList())
             schedulePrefetch(data)
             return true
         }
         return false
     }
 
-    /** [v149] background prefetch of the NEXT episode — silent (no dialogs) */
-    private fun schedulePrefetch(currentUrl: String) {
+    private fun schedulePrefetch(currentUrl: String, forceFirst: String? = null) {
         if (inFlight.size > 4) return
-        val next = nextEpMap[currentUrl] ?: return
+        val next = forceFirst ?: nextEpMap[currentUrl] ?: return
         val c = linkCache[next]
         if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return
         if (inFlight.containsKey(next)) return
@@ -303,11 +398,10 @@ class WitAnime : MainAPI() {
                 val subs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
                 val links = extractLinks(next, { subs.add(it) }, {}, silent = true)
                 if (links.isNotEmpty()) {
-                    linkCache[next] = CachedLinks(links, subs.toList(), System.currentTimeMillis())
-                    trimCache()
-                    println("WitAnimeDebug: prefetched ${links.size} links for next episode")
+                    putCache(next, links, subs.toList())
+                    println("WitAnimeDebug: prefetched ${links.size} links ($next)")
                 } else {
-                    println("WitAnimeDebug: prefetch EMPTY (challenge?) — will full-load on open")
+                    println("WitAnimeDebug: prefetch EMPTY ($next) — will full-load on open")
                 }
             } catch (e: Exception) {
                 println("WitAnimeDebug: prefetch error: ${e.message}")
@@ -392,7 +486,6 @@ class WitAnime : MainAPI() {
             return out
         }
 
-        // ══════════════ COLLECT → SORT → EMIT ══════════════
         data class Entry(val serverIdx: Int, val order: Long, val link: ExtractorLink)
         val collected = Collections.synchronizedList(mutableListOf<Entry>())
         fun mkAt(serverIdx: Int, base: Long): (Long) -> (ExtractorLink) -> Unit = { sub ->
