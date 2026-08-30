@@ -26,7 +26,6 @@ class WitAnime : MainAPI() {
 
     private val userAgent = EXTRACTOR_UA
 
-    // [v145] register lifecycle hooks at plugin-load time (fork support)
     init {
         WitaWeb.warmup()
     }
@@ -35,10 +34,6 @@ class WitAnime : MainAPI() {
     private fun renameLink(l: ExtractorLink, newName: String): ExtractorLink =
         ExtractorLink(l.source, newName, l.url, l.referer, l.quality, l.type, l.headers, l.extractorData)
 
-    /**
-     * [v146] shared name cleaner — strips quality tokens (the player badge
-     * already shows resolution), used by routeLink AND yonaplay manual links.
-     */
     private fun cleanLinkName(name: String): String = name
         .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
         .replace(Regex("""\(\s*\)"""), "")
@@ -113,7 +108,6 @@ class WitAnime : MainAPI() {
         return Jsoup.parse(body, url)
     }
 
-    /** Posters: direct on real IP; local image proxy under WARP */
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
         if (WitaWeb.replayWorks() != false) return fixed
@@ -281,12 +275,7 @@ class WitAnime : MainAPI() {
             return out
         }
 
-        // ══════════════ [v146] COLLECT → SORT → EMIT ══════════════
-        // Links are no longer emitted the moment an extractor finishes (that
-        // produced a random order). Everything is collected with its site
-        // position, then sorted and emitted once at the end.
-        // order layout: server i → i*1000 ; yona player idx → i*1000+idx ;
-        //               downloads → 100_000_000+idx
+        // ══════════════ COLLECT → SORT → EMIT ══════════════
         data class Entry(val serverIdx: Int, val order: Long, val link: ExtractorLink)
         val collected = Collections.synchronizedList(mutableListOf<Entry>())
         fun mkAt(serverIdx: Int, base: Long): (Long) -> (ExtractorLink) -> Unit = { sub ->
@@ -305,8 +294,6 @@ class WitAnime : MainAPI() {
             val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
             println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size} downloads=${dlLinks.size}")
 
-            // [v146] 3 permits + staggered launches: same-host bursts caused
-            // rate-limiting, which is why servers randomly went missing
             val semaphore = Semaphore(3)
 
             suspend fun decodeAndRoute(idx: Int, sid: String, label: String) {
@@ -327,16 +314,15 @@ class WitAnime : MainAPI() {
 
             // ── phase 1: servers, staggered parallel ──
             supervisorScope {
-                servers.forEachIndexed { i, (sid, label) ->
+                servers.mapIndexed { i, (sid, label) ->
                     async(Dispatchers.IO) {
-                        delay((i % 3) * 350L)   // desync bursts toward the same hosts
+                        delay((i % 3) * 350L)
                         semaphore.withPermit { decodeAndRoute(i, sid, label) }
                     }
                 }.awaitAll()
             }
 
-            // ── phase 2: retry pass for servers that produced ZERO links ──
-            // (sequential, no burst → catches rate-limited / timed-out stragglers)
+            // ── phase 2: sequential retry for servers that produced ZERO links ──
             run {
                 val produced = HashMap<Int, Int>()
                 synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
@@ -350,9 +336,9 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // ── phase 3: download links, last in the list ──
+            // ── phase 3: download links ──
             supervisorScope {
-                dlLinks.forEachIndexed { i, dl ->
+                dlLinks.mapIndexed { i, dl ->
                     async(Dispatchers.IO) {
                         delay((i % 3) * 350L)
                         semaphore.withPermit {
@@ -371,11 +357,11 @@ class WitAnime : MainAPI() {
             // ── phase 4: dedupe + sort + emit once ──
             val seenUrls = HashSet<String>()
             val ordered = synchronized(collected) { collected.toList() }
-                .filter { seenUrls.add(it.link.url) }                       // duplicate URLs out
+                .filter { seenUrls.add(it.link.url) }
                 .sortedWith(
-                    compareBy<Entry> { it.order }                            // site server order
-                        .thenByDescending { it.link.quality }                // best quality first in group
-                        .thenBy { it.link.name }                             // stable tiebreak
+                    compareBy<Entry> { it.order }
+                        .thenByDescending { it.link.quality }
+                        .thenBy { it.link.name }
                 )
             println("WitAnimeDebug: emitting ${ordered.size} links (sorted, deduped)")
             ordered.forEach { callback(it.link) }
@@ -383,10 +369,6 @@ class WitAnime : MainAPI() {
         } catch (e: Exception) { logError(e); false }
     }
 
-    /**
-     * [v146] emitAt(order) returns the collecting callback for that position;
-     * selfOrder is the position of THIS link (yona players pass their index).
-     */
     private suspend fun routeLink(
         link: String,
         referer: String?,
@@ -425,7 +407,6 @@ class WitAnime : MainAPI() {
         }
     }
 
-    /** [v146] each yona player gets its page position as order (base + idx) */
     private suspend fun decodeYonaplayAndLoad(
         yonaplayUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
