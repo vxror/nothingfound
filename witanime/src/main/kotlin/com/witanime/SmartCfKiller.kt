@@ -131,11 +131,14 @@ object WitaWeb {
 
     @Volatile var wasChallenged: Boolean = false
 
+    /** the WebView user-agent the clearance was earned with (its REAL UA,
+     *  cleaned of WebView tells — NOT the app UA; CF rejects mismatched UAs) */
     @Volatile var webUa: String? = null
 
     @Volatile private var replayWorks: Boolean? = null
     @Volatile private var replayCheckedAt = 0L
 
+    /** register lifecycle hooks early — call from WitAnime.init */
     fun warmup() = ActivityResolver.warmup()
 
     fun looksChallenge(html: String?): Boolean {
@@ -210,6 +213,8 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
+    // the WebView must keep its REAL UA (only WebView tells removed) — CF
+    // refuses clearance when the UA string doesn't match the fingerprint
     settings.userAgentString = settings.userAgentString
         .replace("; wv", "")
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
@@ -343,6 +348,12 @@ private object VisibleRender {
     }
 }
 
+/**
+ * Local image proxy. The app's image loader sends the app UA, but the clearance
+ * cookie is bound to the WebView's UA — Cloudflare rejects the mismatch. So
+ * under WARP posters point at this localhost server, which fetches each image
+ * with the EXACT UA + cookie the clearance was earned with.
+ */
 object WitaImgProxy {
 
     private var serverSocket: ServerSocket? = null
