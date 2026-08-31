@@ -28,10 +28,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.app
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -124,12 +121,15 @@ object WitaWeb {
 
     private class CacheEntry(val html: String, val ts: Long)
     private val htmlCache = ConcurrentHashMap<String, CacheEntry>()
-    private const val CACHE_TTL = 30_000L
+
+    // [v156] 3 minutes — going back to a recently-rendered page no longer
+    // re-renders it (was 30s in v153, which re-rendered constantly)
+    private const val CACHE_TTL = 180_000L
     private const val REPLAY_TTL = 10 * 60_000L
 
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent the clearance was earned with — PERSISTED to disk */
+    /** the WebView user-agent the clearance was earned with — persisted to disk */
     @Volatile var webUa: String? = null
         set(value) {
             field = value
@@ -141,8 +141,6 @@ object WitaWeb {
 
     private const val UA_PREFS = "wita_cf_prefs"
     private const val UA_KEY = "web_ua"
-
-    private val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private fun appCtx(): Context? = runCatching {
         val at = Class.forName("android.app.ActivityThread")
@@ -168,9 +166,6 @@ object WitaWeb {
         ActivityResolver.warmup()
         if (webUa == null) {
             webUa = loadPersistedUa()
-        }
-        CoroutineScope(Dispatchers.Main).launch {
-            try { HiddenRender.preCreate() } catch (_: Exception) {}
         }
     }
 
@@ -202,21 +197,6 @@ object WitaWeb {
             ?.takeIf { it.contains("cf_clearance") }
     }
 
-    fun probeReplayAsync(url: String, referer: String?) {
-        if (replayWorks() != null) return
-        probeScope.launch {
-            try {
-                val cookie = clearanceCookie(url) ?: return@launch
-                val ua = webUa ?: return@launch
-                val probe = try {
-                    app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
-                } catch (e: Exception) { null }
-                setReplayWorks(probe != null && !looksChallenge(probe) && probe.isNotBlank())
-                println("WitaCF: replay probe (async) = $replayWorks")
-            } catch (_: Exception) {}
-        }
-    }
-
     suspend fun fetchHtml(url: String, silent: Boolean = false): String? {
         htmlCache[url]?.let { e ->
             if (System.currentTimeMillis() - e.ts < CACHE_TTL) return e.html
@@ -226,9 +206,11 @@ object WitaWeb {
             htmlCache[url]?.let { e ->
                 if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withLock e.html
             }
+            println("WitaCF: hidden render (invisible) for $url")
             val hidden = HiddenRender.fetch(url)
             if (hidden != null) {
                 println("WitaCF: hidden render OK — no UI shown")
+                htmlCache[url] = CacheEntry(hidden, System.currentTimeMillis())
                 return@withLock hidden
             }
             if (silent) {
@@ -261,6 +243,7 @@ private fun WebView.configForCf() {
     settings.javaScriptEnabled = true
     settings.domStorageEnabled = true
     settings.databaseEnabled = true
+    settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
     settings.userAgentString = settings.userAgentString
@@ -268,102 +251,64 @@ private fun WebView.configForCf() {
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
 }
 
+/**
+ * [v156] v153's proven renderer: a FRESH full-size WebView per render, pushed
+ * off-screen. v154's reused-WebView + shorter timeouts broke the auto-solve
+ * (box came back), so both are reverted. One real fix kept: the container is
+ * now REMOVED from the activity on cleanup — v153 leaked one invisible
+ * full-screen container per render, which made the whole app progressively
+ * slower.
+ */
 private object HiddenRender {
     private const val POLL_MS = 400L
-    private const val SETTLE_MS = 800L
-    private const val CHALLENGE_GRACE_MS = 10_000L
-    private const val HARD_TIMEOUT_MS = 20_000L
+    private const val SETTLE_MS = 1_000L
+    private const val CHALLENGE_GRACE_MS = 15_000L   // v153 value (v154 cut it to 10s — broke it)
+    private const val HARD_TIMEOUT_MS = 30_000L      // v153 value (v154 cut it to 20s — broke it)
     private const val MIN_HTML_LEN = 2_000
 
     @Volatile var lastSuccessAt: Long = 0L
 
-    private var reusableWv: WebView? = null
-    private var reusableContainer: FrameLayout? = null
-    private var attachedTo: Activity? = null
-
-    fun preCreate() {
-        try {
-            val a = ActivityResolver.current() ?: return
-            if (reusableWv == null) obtainWebView(a)
-        } catch (_: Exception) {}
-    }
-
-    private fun obtainWebView(activity: Activity): WebView? {
-        val existing = reusableWv
-        if (existing != null && attachedTo === activity && !activity.isDestroyed && existing.parent != null) {
-            return existing
-        }
-        try {
-            reusableContainer?.let { c -> (c.parent as? ViewGroup)?.removeView(c) }
-            existing?.destroy()
-        } catch (_: Exception) {}
-        reusableWv = null
-        reusableContainer = null
-        attachedTo = null
-        return try {
-            val wv = WebView(activity)
-            wv.configForCf()
-            wv.settings.loadsImagesAutomatically = false
-            wv.settings.blockNetworkImage = true
-            CookieManager.getInstance().apply {
-                setAcceptCookie(true)
-                setAcceptThirdPartyCookies(wv, true)
-            }
-            val container = FrameLayout(activity)
-            container.addView(wv, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ))
-            activity.addContentView(container, ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ))
-            container.translationX = -10000f
-            container.translationY = -10000f
-            reusableWv = wv
-            reusableContainer = container
-            attachedTo = activity
-            println("WitaCF: hidden WebView created (reusable)")
-            wv
-        } catch (e: Exception) {
-            println("WitaCF: hidden WebView create fail: ${e.message}")
-            null
-        }
-    }
-
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
         if (activity == null) {
-            println("WitaCF: no activity — hidden render skipped")
+            println("WitaCF: no activity available — hidden render skipped")
             return@withContext null
         }
         suspendCancellableCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             val done = AtomicBoolean(false)
-            val navStarted = AtomicBoolean(false)
+            var webView: WebView? = null
+            var container: FrameLayout? = null
+            var capturedUa: String? = null
             val startedAt = SystemClock.uptimeMillis()
 
-            val wv = obtainWebView(activity)
-            if (wv == null) {
-                if (cont.isActive) cont.resume(null)
-                return@suspendCancellableCoroutine
+            fun cleanup() {
+                handler.removeCallbacksAndMessages(null)
+                val c = container
+                container = null
+                val wv = webView
+                webView = null
+                // [v156 FIX] remove the CONTAINER from the activity (v153 only
+                // removed the WebView, leaking the container each render)
+                try { (c?.parent as? ViewGroup)?.removeView(c) } catch (_: Exception) {}
+                try { wv?.stopLoading() } catch (_: Exception) {}
+                try { wv?.destroy() } catch (_: Exception) {}
             }
-            val capturedUa: String? = wv.settings.userAgentString
 
             fun finish(html: String?) {
                 if (!done.compareAndSet(false, true)) return
-                handler.removeCallbacksAndMessages(null)
-                try { wv.stopLoading() } catch (_: Exception) {}
                 if (html != null) {
                     try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                     capturedUa?.let { WitaWeb.webUa = it }
                     lastSuccessAt = System.currentTimeMillis()
                 }
+                cleanup()
                 if (cont.isActive) cont.resume(html)
             }
 
             fun extractNow() {
-                wv.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
+                val wv2 = webView ?: return
+                wv2.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
                     if (done.get()) return@evaluateJavascript
                     val html = unwrapJs(jsHtml)
                     if (html != null && html.length > MIN_HTML_LEN && !WitaWeb.looksChallenge(html)) {
@@ -372,54 +317,67 @@ private object HiddenRender {
                 }
             }
 
-            wv.webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
-                override fun onPageStarted(v: WebView?, u: String?, favicon: android.graphics.Bitmap?) {
-                    navStarted.set(true)
+            try {
+                val wv = WebView(activity)
+                webView = wv
+                wv.configForCf()
+                capturedUa = wv.settings.userAgentString
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
                 }
-                override fun onPageFinished(v: WebView?, u: String?) {
-                    if (!done.get() && navStarted.get()) extractNow()
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(wv, true)
                 }
-            }
 
-            navStarted.set(false)
-            try { wv.stopLoading() } catch (_: Exception) {}
-            wv.loadUrl(url)
+                val c = FrameLayout(activity)
+                container = c
+                c.addView(wv, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ))
+                activity.addContentView(c, ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ))
+                // full size (Cloudflare needs real dimensions) but off-screen
+                c.translationX = -10000f
+                c.translationY = -10000f
 
-            val poll = object : Runnable {
-                override fun run() {
-                    if (done.get()) return
-                    val elapsed = SystemClock.uptimeMillis() - startedAt
-                    if (elapsed > HARD_TIMEOUT_MS) { finish(null); return }
-                    if (!navStarted.get()) {
-                        handler.postDelayed(this, POLL_MS)
-                        return
-                    }
-                    wv.evaluateJavascript("document.title") { jsTitle ->
-                        if (done.get()) return@evaluateJavascript
-                        val title = unwrapJs(jsTitle).orEmpty()
-                        if (WitaWeb.isChallengeTitle(title)) {
-                            if (elapsed > CHALLENGE_GRACE_MS) finish(null)
-                            else handler.postDelayed(this, POLL_MS)
-                            return@evaluateJavascript
-                        }
-                        handler.postDelayed({
-                            if (!done.get()) {
-                                extractNow()
-                                if (!done.get()) handler.postDelayed(this, POLL_MS)
+                wv.loadUrl(url)
+
+                val poll = object : Runnable {
+                    override fun run() {
+                        if (done.get()) return
+                        val elapsed = SystemClock.uptimeMillis() - startedAt
+                        if (webView == null) return
+                        if (elapsed > HARD_TIMEOUT_MS) { finish(null); return }
+                        webView?.evaluateJavascript("document.title") { jsTitle ->
+                            if (done.get()) return@evaluateJavascript
+                            val title = unwrapJs(jsTitle).orEmpty()
+                            if (WitaWeb.isChallengeTitle(title)) {
+                                if (elapsed > CHALLENGE_GRACE_MS) finish(null)
+                                else handler.postDelayed(this, POLL_MS)
+                                return@evaluateJavascript
                             }
-                        }, SETTLE_MS)
+                            handler.postDelayed({
+                                if (!done.get()) {
+                                    extractNow()
+                                    if (!done.get()) handler.postDelayed(this, POLL_MS)
+                                }
+                            }, SETTLE_MS)
+                        }
                     }
                 }
+                handler.postDelayed(poll, POLL_MS)
+            } catch (e: Exception) {
+                println("WitaCF: hidden render error ${e.message}")
+                finish(null)
             }
-            handler.postDelayed(poll, POLL_MS)
 
             cont.invokeOnCancellation {
                 if (done.compareAndSet(false, true)) {
-                    handler.post {
-                        handler.removeCallbacksAndMessages(null)
-                        try { wv.stopLoading() } catch (_: Exception) {}
-                    }
+                    handler.post { cleanup() }
                 }
             }
         }
@@ -499,10 +457,6 @@ object WitaImgProxy {
         } catch (_: Exception) {}
     }
 
-    /**
-     * [v155] Single image fetch attempt. ua+cookie = the WebView's MATCHING
-     * pair; both null = bare request (v135 style, no cookies at all).
-     */
     private fun fetchImage(target: String, ua: String?, cookie: String?): Pair<ByteArray, String>? {
         return try {
             val builder = Request.Builder().url(target)
@@ -541,14 +495,14 @@ object WitaImgProxy {
             return
         }
 
-        // [v155] attempt 1: matching UA+cookie pair earned by the WebView
+        // attempt 1: matching WebView UA + cookie
         val cookie = runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
         val ua = WitaWeb.webUa
         var result: Pair<ByteArray, String>? = null
         if (ua != null) {
             result = fetchImage(target, ua, cookie)
         }
-        // [v155] attempt 2: bare request — no cookie, no custom UA (v135 style)
+        // attempt 2: bare request (no cookie, default UA)
         if (result == null) {
             result = fetchImage(target, null, null)
         }
