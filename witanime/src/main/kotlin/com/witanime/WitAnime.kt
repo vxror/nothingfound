@@ -14,6 +14,7 @@ import java.nio.charset.Charset
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.jsoup.nodes.Document
@@ -38,6 +39,7 @@ class WitAnime : MainAPI() {
         private val inFlight = ConcurrentHashMap<String, Job>()
         private val nextEpMap = ConcurrentHashMap<String, String>()
         private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private val persistMutex = Mutex()
 
         @Volatile private var storeLoaded = false
         @Volatile private var diskCtx: Context? = null
@@ -122,22 +124,27 @@ class WitAnime : MainAPI() {
             }
         }
 
-        private fun persistStore() {
-            try {
-                val links = JSONObject()
-                linkCache.forEach { (ep, c) ->
-                    links.put(ep, JSONObject()
-                        .put("ts", c.ts)
-                        .put("l", JSONArray(c.links.map { linkToJson(it) }))
-                        .put("s", JSONArray(c.subs.map { subToJson(it) }))
-                    )
+        /** [v154] disk writes moved OFF the request path — async + serialized */
+        private fun persistStoreAsync() {
+            bgScope.launch {
+                persistMutex.withLock {
+                    try {
+                        val links = JSONObject()
+                        linkCache.forEach { (ep, c) ->
+                            links.put(ep, JSONObject()
+                                .put("ts", c.ts)
+                                .put("l", JSONArray(c.links.map { linkToJson(it) }))
+                                .put("s", JSONArray(c.subs.map { subToJson(it) }))
+                            )
+                        }
+                        val eps = JSONObject()
+                        nextEpMap.forEach { (k, v) -> eps.put(k, v) }
+                        val root = JSONObject().put("links", links).put("eps", eps)
+                        ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
+                    } catch (e: Exception) {
+                        println("WitAnimeDebug: store persist fail ${e.message}")
+                    }
                 }
-                val eps = JSONObject()
-                nextEpMap.forEach { (k, v) -> eps.put(k, v) }
-                val root = JSONObject().put("links", links).put("eps", eps)
-                ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
-            } catch (e: Exception) {
-                println("WitAnimeDebug: store persist fail ${e.message}")
             }
         }
 
@@ -150,7 +157,7 @@ class WitAnime : MainAPI() {
         private fun putCache(url: String, links: List<ExtractorLink>, subs: List<SubtitleFile>) {
             linkCache[url] = CachedLinks(links, subs, System.currentTimeMillis())
             trimCache()
-            persistStore()
+            persistStoreAsync()
         }
 
         private fun deliverCached(
@@ -190,68 +197,37 @@ class WitAnime : MainAPI() {
 
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
         val headers = mutableMapOf("User-Agent" to userAgent)
-
-        // [v153] ALWAYS attach clearance cookie + WebView UA when available.
-        // Previously only attached when replayWorks==true, meaning the FIRST
-        // request of a session skipped the cookie we already had → needless
-        // challenge → needless WebView → needless dialog box.
+        // always attach clearance cookie + WebView UA when available
         WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
         WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
 
         var body: String? = null
-        var netFailed = false
         try {
             body = app.get(url, headers = headers, referer = referer).text
-        } catch (e: Exception) {
-            netFailed = true
-        }
+        } catch (e: Exception) {}
+
         if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) {
             WitaWeb.setReplayWorks(true)
             return body
         }
 
-        // replay attempt with fresh cookie after a possible hidden-render
-        if (body != null) {
-            val cookie = WitaWeb.clearanceCookie(url)
-            val ua = WitaWeb.webUa
-            if (cookie != null && ua != null) {
-                val h2 = mapOf("User-Agent" to ua, "Cookie" to cookie)
-                val body2 = try {
-                    app.get(url, headers = h2, referer = referer).text
-                } catch (e: Exception) { null }
-                if (body2 != null && !WitaWeb.looksChallenge(body2) && body2.isNotBlank()) {
-                    WitaWeb.setReplayWorks(true)
-                    println("WitAnimeDebug: OkHttp replay OK (fast path restored)")
-                    return body2
-                }
-                WitaWeb.setReplayWorks(false)
-            }
-        }
+        // [v154] removed the "retry with the same cookie" step — if the request
+        // WITH the cookie was challenged, retrying with the identical cookie
+        // just added a full round trip of latency before the WebView
 
-        if (netFailed || body == null) {
+        if (body == null) {
+            // network error — one brief retry
             delay(400)
-            val retry = try {
-                app.get(url, headers = headers, referer = referer).text
-            } catch (e: Exception) { null }
+            val retry = try { app.get(url, headers = headers, referer = referer).text } catch (e: Exception) { null }
             if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
             if (retry == null) return null
-            body = retry
         }
 
         println("WitAnimeDebug: [$url] challenge → WebView render")
         val html = WitaWeb.fetchHtml(url, silent)
 
-        if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
-            val cookie = WitaWeb.clearanceCookie(url)
-            val ua = WitaWeb.webUa
-            if (cookie != null && ua != null) {
-                val probe = try {
-                    app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
-                } catch (e: Exception) { null }
-                WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
-                println("WitAnimeDebug: replay probe = ${WitaWeb.replayWorks()}")
-            }
-        }
+        // [v154] async probe decides poster routing — never blocks the page load
+        if (html != null) WitaWeb.probeReplayAsync(url, referer)
         return html
     }
 
@@ -342,7 +318,7 @@ class WitAnime : MainAPI() {
                             }
                         }
                         if (nextEpMap.size > 400) nextEpMap.clear()
-                        if (changed) persistStore()
+                        if (changed) persistStoreAsync()
 
                         episodes = eps.mapNotNull { ep ->
                             val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
@@ -547,6 +523,7 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
+            // ── phase 1: servers, staggered parallel ──
             supervisorScope {
                 servers.mapIndexed { i, (sid, label) ->
                     async(Dispatchers.IO) {
@@ -556,19 +533,28 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            run {
-                val produced = HashMap<Int, Int>()
-                synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
-                servers.forEachIndexed { i, server ->
-                    if ((produced[i] ?: 0) == 0) {
-                        println("WitAnimeDebug: [${server.second}] empty → retry")
-                        try {
-                            withTimeoutOrNull(25_000L) { decodeAndRoute(i, server.first, server.second) }
-                        } catch (_: Exception) {}
-                    }
+            // ── phase 2: [v154] retries now PARALLEL (was sequential — dead
+            //      servers each burned up to 25s one after another) ──
+            val produced = HashMap<Int, Int>()
+            synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
+            val toRetry = servers.mapIndexed { i, s -> i to s }.filter { (produced[it.first] ?: 0) == 0 }
+            if (toRetry.isNotEmpty()) {
+                supervisorScope {
+                    toRetry.mapIndexed { j, (i, server) ->
+                        async(Dispatchers.IO) {
+                            delay((j % 3) * 350L)
+                            semaphore.withPermit {
+                                println("WitAnimeDebug: [${server.second}] empty → retry")
+                                try {
+                                    withTimeoutOrNull(15_000L) { decodeAndRoute(i, server.first, server.second) }
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }.awaitAll()
                 }
             }
 
+            // ── phase 3: download links ──
             supervisorScope {
                 dlLinks.mapIndexed { i, dl ->
                     async(Dispatchers.IO) {
@@ -586,6 +572,7 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
+            // ── phase 4: dedupe + sort + emit ──
             val seenUrls = HashSet<String>()
             val ordered = synchronized(collected) { collected.toList() }
                 .filter { seenUrls.add(it.link.url) }
