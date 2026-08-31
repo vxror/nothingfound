@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import org.jsoup.nodes.Document
 
@@ -210,10 +211,6 @@ class WitAnime : MainAPI() {
             WitaWeb.setReplayWorks(true)
             return body
         }
-
-        // [v154] removed the "retry with the same cookie" step — if the request
-        // WITH the cookie was challenged, retrying with the identical cookie
-        // just added a full round trip of latency before the WebView
 
         if (body == null) {
             // network error — one brief retry
@@ -533,8 +530,7 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 2: [v154] retries now PARALLEL (was sequential — dead
-            //      servers each burned up to 25s one after another) ──
+            // ── phase 2: parallel retry of empty servers ──
             val produced = HashMap<Int, Int>()
             synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
             val toRetry = servers.mapIndexed { i, s -> i to s }.filter { (produced[it.first] ?: 0) == 0 }
