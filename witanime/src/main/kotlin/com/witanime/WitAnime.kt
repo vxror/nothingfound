@@ -197,18 +197,17 @@ class WitAnime : MainAPI() {
 
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
-        // [v155 FIX] the async probe hadn't finished when posters were built,
-        // so replayWorks was null and posters went DIRECT — under challenge,
-        // the app's image loader sends the app UA while the cookie is bound
-        // to the WebView's UA → mismatch → Cloudflare 403 → no images.
-        if (WitaWeb.replayWorks() == true) return fixed
-        if (WitaWeb.webUa != null) {
+        // [v156] proxy ONLY when replay is PROVEN to fail; otherwise direct
+        // (real IP: app's image loader loads images fine with its own UA —
+        // the v135/v141 behavior where images worked)
+        if (WitaWeb.replayWorks() == false) {
             return WitaImgProxy.proxyUrl(fixed) ?: fixed
         }
         return fixed
     }
 
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
+        // attempt 1: with clearance cookie + WebView UA (fast when accepted)
         val headers = mutableMapOf("User-Agent" to userAgent)
         WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
         WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
@@ -223,16 +222,42 @@ class WitAnime : MainAPI() {
             return body
         }
 
-        if (body == null) {
+        // [v156] attempt 2: PLAIN request (no cookie, no custom UA) — a stale
+        // clearance cookie can make Cloudflare challenge harder than no cookie;
+        // the plain request often passes when attempt 1 was rejected
+        if (body != null) {
+            val plain = try {
+                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+            } catch (e: Exception) { null }
+            if (plain != null && !WitaWeb.looksChallenge(plain) && plain.isNotBlank()) {
+                WitaWeb.setReplayWorks(false) // replay WITH cookie fails here; plain works
+                return plain
+            }
+        } else {
+            // network error — one brief retry
             delay(400)
-            val retry = try { app.get(url, headers = headers, referer = referer).text } catch (e: Exception) { null }
+            val retry = try {
+                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+            } catch (e: Exception) { null }
             if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
             if (retry == null) return null
         }
 
         println("WitAnimeDebug: [$url] challenge → WebView render")
         val html = WitaWeb.fetchHtml(url, silent)
-        if (html != null) WitaWeb.probeReplayAsync(url, referer)
+
+        // probe after render decides poster routing (v153 behavior)
+        if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
+            val cookie = WitaWeb.clearanceCookie(url)
+            val ua = WitaWeb.webUa
+            if (cookie != null && ua != null) {
+                val probe = try {
+                    app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
+                } catch (e: Exception) { null }
+                WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
+                println("WitAnimeDebug: replay probe = ${WitaWeb.replayWorks()}")
+            }
+        }
         return html
     }
 
