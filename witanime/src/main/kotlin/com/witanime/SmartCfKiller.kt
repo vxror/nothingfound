@@ -169,8 +169,6 @@ object WitaWeb {
         if (webUa == null) {
             webUa = loadPersistedUa()
         }
-        // [v154] pre-create the reusable hidden WebView on the main thread so
-        // the FIRST render doesn't pay the WebView-construction cost
         CoroutineScope(Dispatchers.Main).launch {
             try { HiddenRender.preCreate() } catch (_: Exception) {}
         }
@@ -204,10 +202,6 @@ object WitaWeb {
             ?.takeIf { it.contains("cf_clearance") }
     }
 
-    /**
-     * [v154] Fire-and-forget probe — decides poster routing (direct vs proxy)
-     * WITHOUT blocking the page load. Runs at most once per REPLAY_TTL.
-     */
     fun probeReplayAsync(url: String, referer: String?) {
         if (replayWorks() != null) return
         probeScope.launch {
@@ -274,13 +268,6 @@ private fun WebView.configForCf() {
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
 }
 
-/**
- * [v154] REUSABLE hidden WebView.
- * v153 created a new WebView for every render — WebView construction runs on
- * the main thread (~100-500ms) and froze the whole app each time. Now the
- * WebView is created ONCE, kept attached off-screen, and reused. Image
- * loading is blocked (we only need HTML), which makes renders much faster.
- */
 private object HiddenRender {
     private const val POLL_MS = 400L
     private const val SETTLE_MS = 800L
@@ -306,7 +293,6 @@ private object HiddenRender {
         if (existing != null && attachedTo === activity && !activity.isDestroyed && existing.parent != null) {
             return existing
         }
-        // activity changed or first time — (re)create
         try {
             reusableContainer?.let { c -> (c.parent as? ViewGroup)?.removeView(c) }
             existing?.destroy()
@@ -317,8 +303,6 @@ private object HiddenRender {
         return try {
             val wv = WebView(activity)
             wv.configForCf()
-            // [v154] block images — we only extract HTML; images were the bulk
-            // of the load time in the full-size hidden render
             wv.settings.loadsImagesAutomatically = false
             wv.settings.blockNetworkImage = true
             CookieManager.getInstance().apply {
@@ -334,7 +318,6 @@ private object HiddenRender {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             ))
-            // full size (Cloudflare needs real dimensions) but pushed off-screen
             container.translationX = -10000f
             container.translationY = -10000f
             reusableWv = wv
@@ -389,14 +372,12 @@ private object HiddenRender {
                 }
             }
 
-            // per-render client so we see THIS navigation's events
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
                 override fun onPageStarted(v: WebView?, u: String?, favicon: android.graphics.Bitmap?) {
                     navStarted.set(true)
                 }
                 override fun onPageFinished(v: WebView?, u: String?) {
-                    // early extraction — no waiting for the poll cycle
                     if (!done.get() && navStarted.get()) extractNow()
                 }
             }
@@ -411,8 +392,6 @@ private object HiddenRender {
                     val elapsed = SystemClock.uptimeMillis() - startedAt
                     if (elapsed > HARD_TIMEOUT_MS) { finish(null); return }
                     if (!navStarted.get()) {
-                        // navigation hasn't begun — the old page's title/HTML must
-                        // NOT be used (reused WebView keeps the previous page)
                         handler.postDelayed(this, POLL_MS)
                         return
                     }
@@ -512,6 +491,35 @@ object WitaImgProxy {
         } catch (_: Exception) {}
     }
 
+    private fun writeImage(output: java.io.OutputStream, bytes: ByteArray, contentType: String) {
+        try {
+            output.write("HTTP/1.1 200 OK\r\nContent-Type: $contentType\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+            output.write(bytes)
+            output.flush()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * [v155] Single image fetch attempt. ua+cookie = the WebView's MATCHING
+     * pair; both null = bare request (v135 style, no cookies at all).
+     */
+    private fun fetchImage(target: String, ua: String?, cookie: String?): Pair<ByteArray, String>? {
+        return try {
+            val builder = Request.Builder().url(target)
+                .header("Referer", "https://witanime.you/")
+            if (ua != null) builder.header("User-Agent", ua)
+            if (cookie != null) builder.header("Cookie", cookie)
+            app.baseClient.newCall(builder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val ct = resp.header("Content-Type") ?: ""
+                if (!ct.startsWith("image/")) return null
+                val b = resp.body?.bytes() ?: return null
+                if (b.isEmpty() || b.size > 24 * 1024 * 1024) return null
+                b to ct
+            }
+        } catch (_: Exception) { null }
+    }
+
     private fun handle(socket: Socket) {
         socket.soTimeout = 20_000
         val input = BufferedReader(InputStreamReader(socket.getInputStream()))
@@ -529,34 +537,26 @@ object WitaImgProxy {
 
         val cached = synchronized(cache) { cache[target] }
         if (cached != null) {
-            output.write("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: ${cached.size}\r\nConnection: close\r\n\r\n".toByteArray())
-            output.write(cached)
-            output.flush()
+            writeImage(output, cached, "image/jpeg")
             return
         }
 
+        // [v155] attempt 1: matching UA+cookie pair earned by the WebView
         val cookie = runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
         val ua = WitaWeb.webUa
-
-        val req = Request.Builder().url(target)
-            .header("Referer", "https://witanime.you/")
-            .apply {
-                ua?.let { header("User-Agent", it) }
-                cookie?.let { header("Cookie", it) }
-            }
-            .build()
-
-        app.baseClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) { write404(output); return }
-            val contentType = resp.header("Content-Type") ?: ""
-            if (!contentType.startsWith("image/")) { write404(output); return }
-            val bytes = resp.body?.bytes() ?: run { write404(output); return }
-            if (bytes.isEmpty() || bytes.size > 24 * 1024 * 1024) { write404(output); return }
-            synchronized(cache) { cache[target] = bytes }
-            output.write("HTTP/1.1 200 OK\r\nContent-Type: $contentType\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
-            output.write(bytes)
-            output.flush()
+        var result: Pair<ByteArray, String>? = null
+        if (ua != null) {
+            result = fetchImage(target, ua, cookie)
         }
+        // [v155] attempt 2: bare request — no cookie, no custom UA (v135 style)
+        if (result == null) {
+            result = fetchImage(target, null, null)
+        }
+
+        if (result == null) { write404(output); return }
+        val (bytes, contentType) = result
+        synchronized(cache) { cache[target] = bytes }
+        writeImage(output, bytes, contentType)
     }
 
     fun proxyUrl(target: String): String? {
