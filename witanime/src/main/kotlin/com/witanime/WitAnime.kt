@@ -125,7 +125,6 @@ class WitAnime : MainAPI() {
             }
         }
 
-        /** [v154] disk writes moved OFF the request path — async + serialized */
         private fun persistStoreAsync() {
             bgScope.launch {
                 persistMutex.withLock {
@@ -196,9 +195,21 @@ class WitAnime : MainAPI() {
         .replace(Regex("""\s{2,}"""), " ")
         .trim()
 
+    private fun smartPoster(raw: String?): String? {
+        val fixed = fixUrlNull(raw) ?: return null
+        // [v155 FIX] the async probe hadn't finished when posters were built,
+        // so replayWorks was null and posters went DIRECT — under challenge,
+        // the app's image loader sends the app UA while the cookie is bound
+        // to the WebView's UA → mismatch → Cloudflare 403 → no images.
+        if (WitaWeb.replayWorks() == true) return fixed
+        if (WitaWeb.webUa != null) {
+            return WitaImgProxy.proxyUrl(fixed) ?: fixed
+        }
+        return fixed
+    }
+
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
         val headers = mutableMapOf("User-Agent" to userAgent)
-        // always attach clearance cookie + WebView UA when available
         WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
         WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
 
@@ -213,7 +224,6 @@ class WitAnime : MainAPI() {
         }
 
         if (body == null) {
-            // network error — one brief retry
             delay(400)
             val retry = try { app.get(url, headers = headers, referer = referer).text } catch (e: Exception) { null }
             if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
@@ -222,8 +232,6 @@ class WitAnime : MainAPI() {
 
         println("WitAnimeDebug: [$url] challenge → WebView render")
         val html = WitaWeb.fetchHtml(url, silent)
-
-        // [v154] async probe decides poster routing — never blocks the page load
         if (html != null) WitaWeb.probeReplayAsync(url, referer)
         return html
     }
@@ -232,12 +240,6 @@ class WitAnime : MainAPI() {
         val body = smartFetch(url)
             ?: throw ErrorLoadingException("فشل تحميل الموقع — تحقق من الاتصال")
         return Jsoup.parse(body, url)
-    }
-
-    private fun smartPoster(raw: String?): String? {
-        val fixed = fixUrlNull(raw) ?: return null
-        if (WitaWeb.replayWorks() != false) return fixed
-        return WitaImgProxy.proxyUrl(fixed) ?: fixed
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -520,7 +522,6 @@ class WitAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // ── phase 1: servers, staggered parallel ──
             supervisorScope {
                 servers.mapIndexed { i, (sid, label) ->
                     async(Dispatchers.IO) {
@@ -530,7 +531,6 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 2: parallel retry of empty servers ──
             val produced = HashMap<Int, Int>()
             synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
             val toRetry = servers.mapIndexed { i, s -> i to s }.filter { (produced[it.first] ?: 0) == 0 }
@@ -550,7 +550,6 @@ class WitAnime : MainAPI() {
                 }
             }
 
-            // ── phase 3: download links ──
             supervisorScope {
                 dlLinks.mapIndexed { i, dl ->
                     async(Dispatchers.IO) {
@@ -568,7 +567,6 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            // ── phase 4: dedupe + sort + emit ──
             val seenUrls = HashSet<String>()
             val ordered = synchronized(collected) { collected.toList() }
                 .filter { seenUrls.add(it.link.url) }
