@@ -28,97 +28,54 @@ jobs:
           cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
           cp witanime/build/*.cs3 build/witanime.cs3 2>/dev/null || true
           ls -la build/
-      - name: Update plugins.json (auto version + fileSize + fileHash)
+      - name: Update plugins.json
         run: |
           python3 - <<'EOF'
-          import json, hashlib, os, re, urllib.parse
+          import json, os, hashlib, urllib.parse
 
-          PLUGINS_JSON = "plugins.json"
-          BUILD_DIR = "build"
-
-          # internalName -> (cs3 filename in build/, module dir containing build.gradle.kts)
-          module_map = {
-              "AnimeWitcher": ("Animewitcher.cs3", "Animewitcher"),
-              "WitAnime":     ("witanime.cs3",     "witanime"),
-          }
-
-          def read_gradle_version(module_dir):
-              """Extract 'version = N' from the module's build.gradle.kts"""
-              gradle_path = os.path.join(module_dir, "build.gradle.kts")
-              if not os.path.exists(gradle_path):
-                  return None
-              try:
-                  with open(gradle_path, "r", encoding="utf-8") as f:
-                      content = f.read()
-                  m = re.search(r'^\s*version\s*=\s*"?(\d+)"?\s*$', content, re.MULTILINE)
-                  if m:
-                      return int(m.group(1))
-              except Exception as e:
-                  print(f"  ⚠ error reading {gradle_path}: {e}")
-              return None
+          PLUGINS_JSON = 'plugins.json'   # <-- change this if yours lives elsewhere
+          BUILD_DIR = 'build'
 
           if not os.path.exists(PLUGINS_JSON):
-              print("plugins.json not found — skipping")
-              exit(0)
+              print(f"WARNING: {PLUGINS_JSON} not found at repo root — nothing to update")
+              raise SystemExit(0)
 
-          with open(PLUGINS_JSON, "r", encoding="utf-8") as f:
+          with open(PLUGINS_JSON, 'r', encoding='utf-8') as f:
               plugins = json.load(f)
 
-          for plugin in plugins:
-              internal = plugin.get("internalName", "")
-              entry = module_map.get(internal)
-              cs3_file, module_dir = (entry if entry else (None, None))
+          updated = 0
+          for item in plugins:
+              url = item.get('url', '')
+              # pull the cs3 filename straight from the entry's own url
+              filename = urllib.parse.unquote(url.rstrip('/').split('/')[-1])
+              path = os.path.join(BUILD_DIR, filename)
 
-              if not cs3_file:
-                  # fallback: guess from URL
-                  url = plugin.get("url", "")
-                  if url:
-                      guessed = urllib.parse.unquote(url.split("/")[-1])
-                      if os.path.exists(os.path.join(BUILD_DIR, guessed)):
-                          cs3_file = guessed
-                          module_dir = guessed.replace(".cs3", "")
-
-              if not cs3_file or not module_dir:
-                  print(f"  ⚠ {internal}: not in module_map, can't guess — skipped")
+              if not os.path.isfile(path):
+                  print(f"warn: {path} not found, skipping {item.get('internalName')}")
                   continue
 
-              changes = []
+              with open(path, 'rb') as f:
+                  data = f.read()
 
-              # ── auto version: read from build.gradle.kts ──
-              gradle_version = read_gradle_version(module_dir)
-              if gradle_version is not None:
-                  old_version = plugin.get("version")
-                  if old_version != gradle_version:
-                      plugin["version"] = gradle_version
-                      changes.append(f"version {old_version} → {gradle_version}")
+              new_hash = 'sha256-' + hashlib.sha256(data).hexdigest()
+              old_hash = item.get('fileHash')
 
-              # ── auto fileSize + fileHash from the built .cs3 ──
-              cs3_path = os.path.join(BUILD_DIR, cs3_file)
-              if os.path.exists(cs3_path):
-                  size = os.path.getsize(cs3_path)
-                  with open(cs3_path, "rb") as f:
-                      file_hash = "sha256-" + hashlib.sha256(f.read()).hexdigest()
+              item['fileSize'] = len(data)
+              item['fileHash'] = new_hash
 
-                  if plugin.get("fileSize") != size:
-                      changes.append(f"size {plugin.get('fileSize')} → {size}")
-                  if plugin.get("fileHash") != file_hash:
-                      changes.append("hash updated")
+              # if the built file changed, bump version so clients auto-update
+              if old_hash is not None and old_hash != new_hash:
+                  item['version'] = int(item.get('version', 0)) + 1
+                  print(f"bumped {filename} -> v{item['version']}")
 
-                  plugin["fileSize"] = size
-                  plugin["fileHash"] = file_hash
+              updated += 1
+              print(f"updated {filename}: {len(data)} bytes")
 
-              if "description" not in plugin or not plugin.get("description"):
-                  plugin["description"] = ""
-
-              if changes:
-                  print(f"  ✓ {internal}: {', '.join(changes)}")
-              else:
-                  print(f"  · {internal}: already up to date")
-
-          with open(PLUGINS_JSON, "w", encoding="utf-8") as f:
+          with open(PLUGINS_JSON, 'w', encoding='utf-8') as f:
               json.dump(plugins, f, indent=2, ensure_ascii=False)
+              f.write('\n')
 
-          print("\nplugins.json synced")
+          print(f"done: {updated}/{len(plugins)} entries updated")
           EOF
       - name: Push
         continue-on-error: true
@@ -126,7 +83,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add -f build/ plugins.json
-          git commit -m "update cs3 + plugins.json (auto version + stats) [skip ci]" || echo "nothing to commit"
+          git commit -m "update cs3 + plugins.json [skip ci]" || echo "nothing to commit"
           git push || echo "push failed"
       - uses: actions/upload-artifact@v4
         with:
