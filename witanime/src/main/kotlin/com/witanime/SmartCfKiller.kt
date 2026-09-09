@@ -13,9 +13,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.ViewTreeObserver
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -28,6 +31,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.ui.settings.Globals
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -122,14 +126,11 @@ object WitaWeb {
     private class CacheEntry(val html: String, val ts: Long)
     private val htmlCache = ConcurrentHashMap<String, CacheEntry>()
 
-    // [v156] 3 minutes — going back to a recently-rendered page no longer
-    // re-renders it (was 30s in v153, which re-rendered constantly)
     private const val CACHE_TTL = 180_000L
     private const val REPLAY_TTL = 10 * 60_000L
 
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent the clearance was earned with — persisted to disk */
     @Volatile var webUa: String? = null
         set(value) {
             field = value
@@ -178,7 +179,7 @@ object WitaWeb {
 
     fun isChallengeTitle(title: String): Boolean {
         val l = title.lowercase()
-        return CHALLENGE_TITLES.any { l.contains(l) }
+        return CHALLENGE_TITLES.any { l.contains(it) }
     }
 
     fun replayWorks(): Boolean? =
@@ -251,26 +252,19 @@ private fun WebView.configForCf() {
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
 }
 
-/**
- * [v156] v153's proven renderer: a FRESH full-size WebView per render, pushed
- * off-screen. v154's reused-WebView + shorter timeouts broke the auto-solve
- * (box came back), so both are reverted. One real fix kept: the container is
- * now REMOVED from the activity on cleanup — v153 leaked one invisible
- * full-screen container per render, which made the whole app progressively
- * slower.
- *
- * [v157] CfAutoClick: the hidden WebView now robot-clicks the CF checkbox
- * after 3s — many challenges solve without any UI at all.
- */
 private object HiddenRender {
     private const val POLL_MS = 400L
     private const val SETTLE_MS = 1_000L
-    private const val CHALLENGE_GRACE_MS = 15_000L   // v153 value (v154 cut it to 10s — broke it)
-    private const val HARD_TIMEOUT_MS = 30_000L      // v153 value (v154 cut it to 20s — broke it)
+    private const val CHALLENGE_GRACE_MS = 15_000L
+    private const val HARD_TIMEOUT_MS = 30_000L
     private const val MIN_HTML_LEN = 2_000
 
     @Volatile var lastSuccessAt: Long = 0L
 
+    // NOTE: no stale-cookie clearing here on purpose — the hidden renderer may
+    // still pass silently with existing cookies (the WARP silent path). Clearing
+    // would force a challenge we could have dodged. Clearing belongs in the
+    // fallback dialog only, where the cookie is proven dead.
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
         if (activity == null) {
@@ -291,8 +285,6 @@ private object HiddenRender {
                 container = null
                 val wv = webView
                 webView = null
-                // [v156 FIX] remove the CONTAINER from the activity (v153 only
-                // removed the WebView, leaking the container each render)
                 try { (c?.parent as? ViewGroup)?.removeView(c) } catch (_: Exception) {}
                 try { wv?.stopLoading() } catch (_: Exception) {}
                 try { wv?.destroy() } catch (_: Exception) {}
@@ -324,8 +316,6 @@ private object HiddenRender {
                 val wv = WebView(activity)
                 webView = wv
                 wv.configForCf()
-                // [v157] invisible auto-clicker — robot-clicks the CF checkbox
-                // after 3s, retries every ~2.5s, self-stops when done/cleanup
                 CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
                 capturedUa = wv.settings.userAgentString
                 wv.webViewClient = object : WebViewClient() {
@@ -346,7 +336,6 @@ private object HiddenRender {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 ))
-                // full size (Cloudflare needs real dimensions) but off-screen
                 c.translationX = -10000f
                 c.translationY = -10000f
 
@@ -501,14 +490,12 @@ object WitaImgProxy {
             return
         }
 
-        // attempt 1: matching WebView UA + cookie
         val cookie = runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
         val ua = WitaWeb.webUa
         var result: Pair<ByteArray, String>? = null
         if (ua != null) {
             result = fetchImage(target, ua, cookie)
         }
-        // attempt 2: bare request (no cookie, default UA)
         if (result == null) {
             result = fetchImage(target, null, null)
         }
@@ -527,6 +514,13 @@ object WitaImgProxy {
     }
 }
 
+/**
+ * [v158] the fallback dialog, upgraded with two grafts from other repos:
+ *  - stale CF cookies are EXPIRED before loading (the cookie is proven dead here,
+ *    and Cloudflare serves a harder challenge when a dead clearance is present)
+ *  - D-pad fake cursor for Android TV — TV users cannot tap the turnstile without it
+ *  - Done button to force cookie extraction when detection lags
+ */
 private class WitaRenderDialog(
     private val activity: Activity,
     private val targetUrl: String,
@@ -538,6 +532,7 @@ private class WitaRenderDialog(
         private const val REVEAL_AFTER_MS = 4_000L
         private const val SETTLE_MS = 1_000L
         private const val MIN_HTML_LEN = 2_000
+        private const val CURSOR_STEP_DP = 24f
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -546,6 +541,9 @@ private class WitaRenderDialog(
     private var webView: WebView? = null
     private var statusText: TextView? = null
     private var overlay: View? = null
+    private var cursorView: View? = null
+    private var holderRef: FrameLayout? = null
+    private val cursorPos = floatArrayOf(0f, 0f)
     private val startedAt = SystemClock.uptimeMillis()
 
     private fun status(msg: String) { statusText?.text = msg }
@@ -626,12 +624,41 @@ private class WitaRenderDialog(
         }
     }
 
+    // ---- TV D-pad cursor (grafted from the MkvBase approach) ----
+
+    private fun moveCursor(dx: Float, dy: Float) {
+        val holder = holderRef ?: return
+        val size = cursorView?.layoutParams?.width ?: 0
+        cursorPos[0] = (cursorPos[0] + dx).coerceIn(0f, holder.width.toFloat() - size)
+        cursorPos[1] = (cursorPos[1] + dy).coerceIn(0f, holder.height.toFloat() - size)
+        cursorView?.translationX = cursorPos[0] - size / 2f
+        cursorView?.translationY = cursorPos[1] - size / 2f
+    }
+
+    private fun clickAtCursor() {
+        val wv = webView ?: return
+        val x = cursorPos[0]
+        val y = cursorPos[1]
+        val t = SystemClock.uptimeMillis()
+        val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0)
+        val up = MotionEvent.obtain(t, t + 120, MotionEvent.ACTION_UP, x, y, 0)
+        try {
+            wv.dispatchTouchEvent(down)
+            wv.dispatchTouchEvent(up)
+        } catch (_: Exception) {
+        } finally {
+            down.recycle()
+            up.recycle()
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     fun show() {
         val density = activity.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
         val screenW = activity.resources.displayMetrics.widthPixels
         val screenH = activity.resources.displayMetrics.heightPixels
+        val isTv = try { Globals.isLayout(Globals.TV) } catch (e: Throwable) { false }
 
         val root = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
@@ -655,17 +682,24 @@ private class WitaRenderDialog(
         statusText = status
         root.addView(status)
 
+        root.addView(TextView(activity).apply {
+            text = if (isTv) "D-pad moves the cursor, OK/Enter clicks the checkbox."
+                   else "Solve the CAPTCHA below, then tap Done."
+            textSize = 11f
+            setTextColor(Color.parseColor("#707080"))
+            setPadding(0, 0, 0, dp(8))
+        })
+
         val progress = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
         }
         root.addView(progress, LinearLayout.LayoutParams(-1, dp(4)).also { it.bottomMargin = dp(10) })
 
         val holder = FrameLayout(activity)
+        holderRef = holder
         val wv = WebView(activity)
         webView = wv
         wv.configForCf()
-        // [v157] auto-click here too — often solves the challenge BEFORE the
-        // overlay lifts at 4s, so the user never even sees the checkbox
         CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
@@ -686,14 +720,65 @@ private class WitaRenderDialog(
         overlay = cover
         holder.addView(cover, FrameLayout.LayoutParams(-1, -1))
 
+        if (isTv) {
+            val cursorSize = (22 * density).toInt()
+            val cursor = View(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(cursorSize, cursorSize)
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(Color.argb(160, 255, 50, 50))
+                    setStroke((2 * density).toInt(), Color.WHITE)
+                }
+            }
+            cursorView = cursor
+            holder.addView(cursor)   // last child = on top of the cover
+
+            holder.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
+                override fun onGlobalLayout() {
+                    holder.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                    cursorPos[0] = holder.width / 2f
+                    cursorPos[1] = holder.height / 2f
+                    cursor.translationX = cursorPos[0] - cursorSize / 2f
+                    cursor.translationY = cursorPos[1] - cursorSize / 2f
+                }
+            })
+
+            val step = CURSOR_STEP_DP * density
+            holder.isFocusable = true
+            holder.isFocusableInTouchMode = true
+            holder.setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+                when (keyCode) {
+                    KeyEvent.KEYCODE_DPAD_UP -> { moveCursor(0f, -step); true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> { moveCursor(0f, step); true }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { moveCursor(-step, 0f); true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { moveCursor(step, 0f); true }
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { clickAtCursor(); true }
+                    else -> false
+                }
+            }
+        }
+
         root.addView(holder, LinearLayout.LayoutParams(-1, (screenH * 0.7f).toInt()))
 
-        val cancel = Button(activity).apply {
+        val btnRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        btnRow.addView(Button(activity).apply {
+            text = "Done"
+            setOnClickListener {
+                CookieManager.getInstance().flush()
+                extractNow()
+                if (!done.get()) status("No cookies yet. Solve the CAPTCHA first.")
+            }
+        })
+        btnRow.addView(Button(activity).apply {
             text = "Cancel"
             setOnClickListener { finish(null) }
-        }
+        })
         root.addView(
-            cancel,
+            btnRow,
             LinearLayout.LayoutParams(-2, -2).also {
                 it.topMargin = dp(10)
                 it.gravity = Gravity.CENTER_HORIZONTAL
@@ -716,6 +801,16 @@ private class WitaRenderDialog(
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(wv, true)
+            // [v158] the old clearance is PROVEN dead at this point (hidden render
+            // already failed with it) and Cloudflare serves a HARDER challenge when
+            // a dead clearance is present — expire it so the solve starts clean
+            val host = try {
+                val u = Uri.parse(targetUrl)
+                "${u.scheme}://${u.host}"
+            } catch (_: Exception) { targetUrl }
+            listOf("cf_clearance", "cf_chl_rc_ni", "cf_chl_prog").forEach { name ->
+                try { setCookie(host, "$name=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT") } catch (_: Exception) {}
+            }
             flush()
         }
 
@@ -725,6 +820,7 @@ private class WitaRenderDialog(
             setBackgroundDrawable(ColorDrawable(0xFF16161C.toInt()))
         }
         wv.requestFocus()
+        if (isTv) holder.requestFocus()
         wv.loadUrl(targetUrl)
         handler.postDelayed(poll, POLL_MS)
     }
