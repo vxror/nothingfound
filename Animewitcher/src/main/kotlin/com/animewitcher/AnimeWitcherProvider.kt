@@ -28,10 +28,9 @@ class AnimeWitcherProvider : MainAPI() {
     override var lang = "ar"
     override val hasMainPage = true
 
-    // seed = last known good; auto-replaced at runtime from the firestore
-    // constants doc (same source the official app uses) or the site's JS
-    @Volatile private var algoliaAppId = "QVHT7NPEJG"
-    @Volatile private var algoliaApiKey = "ce13098070fa521b536571bafbcfc083"
+    // NO hardcoded keys — pulled live from firestore Settings/constants at runtime
+    @Volatile private var algoliaAppId = ""
+    @Volatile private var algoliaApiKey = ""
     @Volatile private var algoliaCredCheckedAt = 0L
     @Volatile private var algoliaLastAttemptAt = 0L
     private val ALGOLIA_CRED_TTL_MS = 6 * 60 * 60 * 1000L
@@ -64,11 +63,10 @@ class AnimeWitcherProvider : MainAPI() {
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
 
-    // ===================== ALGOLIA AUTO-CREDENTIALS v3 =====================
-    // source of truth = the firestore constants doc, the same one the official app
-    // reads at every launch (field "search_settings" -> map with "app_id" + "api_key").
-    // discovery order: 1) firestore collection listing  2) direct doc probes
-    // 3) site JS bundles (fallback). seed above = last known good, works instantly.
+    // ===================== ALGOLIA AUTO-CREDENTIALS v4 (SEEDLESS) =====================
+    // source of truth: firestore Settings/constants — publicly readable (no auth),
+    // contains search_settings (primary) and search_settings2 (staged/backup).
+    // credentials are discovered on first use and rotated automatically on rejection.
 
     private fun log(msg: String) { println("AW-creds: $msg") }
 
@@ -88,12 +86,17 @@ class AnimeWitcherProvider : MainAPI() {
     }
 
     private suspend fun algoliaQuery(index: String, params: String): JSONArray {
+        // seedless bootstrap: discover credentials before the first query
+        if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) refreshAlgoliaCredentials(force = true)
+        if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) { log("no credentials available — returning empty"); return JSONArray() }
+
         fun buildBody() = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType())
         var res = try { app.post(algoliaUrl(index), requestBody = buildBody(), headers = getAlgoliaHeaders()).text } catch (e: Exception) { log("query network error: ${e.message}"); return JSONArray() }
         if (algoliaAuthFailed(res)) {
-            log("key rejected, forcing credential refresh")
+            log("key rejected, rotating credentials")
             debugInfo = "algolia key rejected, auto-refreshing credentials"
             refreshAlgoliaCredentials(force = true)
+            if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) return JSONArray()
             res = try { app.post(algoliaUrl(index), requestBody = buildBody(), headers = getAlgoliaHeaders()).text } catch (e: Exception) { return JSONArray() }
             if (algoliaAuthFailed(res)) { log("key still rejected after refresh"); return JSONArray() }
         }
@@ -104,12 +107,15 @@ class AnimeWitcherProvider : MainAPI() {
         credMutex.withLock {
             val now = System.currentTimeMillis()
             val haveCreds = algoliaAppId.isNotEmpty() && algoliaApiKey.isNotEmpty()
+            // valid creds: refresh on TTL or force. no creds: always attempt (bootstrapping)
             if (haveCreds && !force && now - algoliaCredCheckedAt < ALGOLIA_CRED_TTL_MS) return@withLock
+            // anti-hammering gap — only enforced once we already have working creds,
+            // so a cold start or empty state is never locked out
             if (haveCreds && now - algoliaLastAttemptAt < ALGOLIA_MIN_RETRY_MS) return@withLock
             algoliaLastAttemptAt = now
-            log("refresh start (force=$force, current app=$algoliaAppId)")
+            log("refresh start (force=$force, current app=${if (algoliaAppId.isEmpty()) "(none)" else algoliaAppId})")
 
-            if (discoverViaFirestore()) { algoliaCredCheckedAt = now; return@withLock }
+            if (discoverViaFirestore(force)) { algoliaCredCheckedAt = now; return@withLock }
 
             // ---- fallback: site JS bundles ----
             try {
@@ -118,42 +124,58 @@ class AnimeWitcherProvider : MainAPI() {
                 val srcs = LinkedHashSet<String>()
                 Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""").findAll(html).forEach { srcs.add(it.groupValues[1]) }
                 Regex("""<link[^>]+href=["']([^"']+\.js[^"']*)["']""").findAll(html).forEach { srcs.add(it.groupValues[1]) }
-                log("scanning ${srcs.size} site scripts")
                 for (src in srcs.take(25)) {
                     val abs = if (src.startsWith("http")) src else mainUrl.trimEnd('/') + "/" + src.trimStart('/')
                     val js = try { app.get(abs, headers = mapOf("User-Agent" to "Mozilla/5.0")).text } catch (e: Exception) { continue }
                     scanAlgoliaIn(js)?.let { applyAlgolia(it); algoliaCredCheckedAt = now; log("FOUND in $src: app=${it.first}"); return@withLock }
                 }
-                log("site JS had no credentials — keys are firestore-only")
+                log("site JS had no credentials")
                 debugInfo = "no algolia credentials found (firestore + site scan)"
             } catch (e: Exception) { log("site scan failed: ${e.message}") }
         }
     }
 
-    /** layer 1: read the firestore constants doc the same way the official app does */
-    private suspend fun discoverViaFirestore(): Boolean {
+    /** layer 1: firestore Settings/constants — exact path, publicly readable */
+    private suspend fun discoverViaFirestore(force: Boolean): Boolean {
         val base = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents"
 
-        // a) list collections — the response contains every doc AND its full fields
+        // 0) the known doc — one request, no auth
+        try {
+            val raw = firestoreGet("$base/Settings/constants")
+            if (raw.isNotBlank() && !raw.contains("\"error\"")) {
+                val candidates = parseSearchCandidates(JSONObject(raw))
+                if (candidates.isNotEmpty()) {
+                    val pick = if (force) {
+                        // current creds were just rejected — take the first candidate that isn't them
+                        candidates.firstOrNull { it.first != algoliaAppId || it.second != algoliaApiKey } ?: candidates.first()
+                    } else {
+                        // proactive check — stay on the pair we're already using if it's still in the doc
+                        candidates.firstOrNull { it.first == algoliaAppId && it.second == algoliaApiKey } ?: candidates.first()
+                    }
+                    applyAlgolia(pick)
+                    log("FOUND in Settings/constants: app=${pick.first} (${candidates.size} candidates in doc)")
+                    return true
+                }
+                log("Settings/constants readable but no search_settings parsed")
+            } else {
+                log("Settings/constants not readable: ${raw.take(120)}")
+            }
+        } catch (e: Exception) { log("constants doc fetch failed: ${e.message}") }
+
+        // a) collection listings (backup if the doc ever moves)
         for (col in listOf("Settings", "Constants", "constants", "App", "app")) {
             val raw = try { firestoreGet("$base/$col?pageSize=100") } catch (e: Exception) { continue }
-            if (raw.isBlank() || raw.contains("\"error\"")) { log("collection $col: no access"); continue }
-            log("collection $col listed, ${raw.length} chars")
+            if (raw.isBlank() || raw.contains("\"error\"")) continue
             try {
                 val docs = JSONObject(raw).optJSONArray("documents") ?: JSONArray()
                 for (i in 0 until docs.length()) {
                     val doc = docs.getJSONObject(i)
-                    parseSearchSettings(doc)?.let {
-                        applyAlgolia(it)
-                        log("FOUND in collection $col doc ${doc.optString("name")}: app=${it.first}")
-                        return true
-                    }
+                    parseSearchCandidates(doc).firstOrNull()?.let { applyAlgolia(it); log("FOUND in collection $col: app=${it.first}"); return true }
                 }
-                log("collection $col: no search_settings in ${docs.length()} docs")
-            } catch (e: Exception) { log("collection $col parse error: ${e.message}") }
+            } catch (e: Exception) { }
         }
 
-        // b) direct doc probes (in case listing is blocked but single docs are readable)
+        // b) direct doc probes (backup paths)
         for (p in listOf(
             "Settings/constants", "Settings/Constants", "Settings/app", "Settings/main",
             "Settings/general", "Settings/settings", "Constants", "constants",
@@ -161,28 +183,29 @@ class AnimeWitcherProvider : MainAPI() {
         )) {
             val raw = try { firestoreGet("$base/$p") } catch (e: Exception) { continue }
             if (raw.isBlank() || raw.contains("\"error\"")) continue
-            log("doc $p responded, ${raw.length} chars")
             try {
-                parseSearchSettings(JSONObject(raw))?.let {
-                    applyAlgolia(it); log("FOUND in doc $p: app=${it.first}")
-                    return true
-                }
+                parseSearchCandidates(JSONObject(raw)).firstOrNull()?.let { applyAlgolia(it); log("FOUND in doc $p: app=${it.first}"); return true }
             } catch (e: Exception) { }
         }
         log("firestore discovery: nothing found")
         return false
     }
 
-    /** constants doc shape: fields.search_settings.mapValue.fields.{api_key,app_id}.stringValue */
-    private fun parseSearchSettings(docJson: JSONObject): Pair<String, String>? {
-        return try {
-            val fields = docJson.optJSONObject("fields") ?: return null
-            val ss = fields.optJSONObject("search_settings") ?: return null
-            val inner = ss.optJSONObject("mapValue")?.optJSONObject("fields") ?: return null
-            val key = inner.optJSONObject("api_key")?.optString("stringValue").orEmpty()
-            val appId = inner.optJSONObject("app_id")?.optString("stringValue").orEmpty()
-            if (key.length == 32 && appId.length in 8..12) appId to key else null
-        } catch (e: Exception) { null }
+    /** every credential pair in the constants doc, in priority order:
+     *  search_settings first, search_settings2 (staged rotation) second */
+    private fun parseSearchCandidates(docJson: JSONObject): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        fun grab(field: String) {
+            try {
+                val inner = docJson.optJSONObject("fields")?.optJSONObject(field)?.optJSONObject("mapValue")?.optJSONObject("fields") ?: return
+                val key = inner.optJSONObject("api_key")?.optString("stringValue").orEmpty()
+                val appId = inner.optJSONObject("app_id")?.optString("stringValue").orEmpty()
+                if (key.length == 32 && appId.length in 8..12) out.add(appId to key)
+            } catch (e: Exception) { }
+        }
+        grab("search_settings")
+        grab("search_settings2")
+        return out
     }
 
     /** find (appId, apiKey) in JS/HTML text — site fallback */
@@ -207,7 +230,7 @@ class AnimeWitcherProvider : MainAPI() {
         }
     }
 
-    // ===================== END ALGOLIA AUTO-CREDENTIALS v3 =====================
+    // ===================== END ALGOLIA AUTO-CREDENTIALS v4 =====================
 
     private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
