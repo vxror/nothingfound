@@ -10,6 +10,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import okhttp3.MediaType.Companion.toMediaType
@@ -26,8 +28,15 @@ class AnimeWitcherProvider : MainAPI() {
     override var lang = "ar"
     override val hasMainPage = true
 
-    private var algoliaAppId = "D8LH9I7ZL7"
-    private var algoliaApiKey = "b56c01ef52540ef334bcdbaa00ded9e4"
+    // NO hardcoded credentials — discovered from the site's JS at runtime, re-checked every 6h
+    @Volatile private var algoliaAppId = ""
+    @Volatile private var algoliaApiKey = ""
+    @Volatile private var algoliaCredCheckedAt = 0L
+    @Volatile private var algoliaLastAttemptAt = 0L
+    private val ALGOLIA_CRED_TTL_MS = 6 * 60 * 60 * 1000L   // re-scan interval once working
+    private val ALGOLIA_MIN_RETRY_MS = 60 * 1000L           // min gap between scrapes when creds are valid
+    private val credMutex = Mutex()                          // one scrape at a time, others wait for it
+
     private val FIREBASE_PROJECT_ID = "animewitcher-1c66d"
     private var debugInfo = ""
     private var lastServerRaw = ""
@@ -50,9 +59,100 @@ class AnimeWitcherProvider : MainAPI() {
     data class ServerModel(val name: String?, val link: String?, val quality: String?, val originalLink: String?, val openBrowser: Boolean, val directLink: Boolean = false)
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
-    private fun algoliaUrl(index: String) = "https://${algoliaAppId}-dsn.algolia.net/1/indexes/$index/query"
+    private fun algoliaUrl(index: String) = "https://${algoliaAppId.lowercase()}-dsn.algolia.net/1/indexes/$index/query"
     private fun firestoreDocUrl(path: String) = "https://firestore.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/databases/(default)/documents/$path"
     private fun getQualityAsInt(quality: String?): Int = quality?.filter { it.isDigit() }?.toIntOrNull() ?: 0
+
+    // ===================== ALGOLIA AUTO-CREDENTIALS (SEEDLESS) =====================
+
+    private fun getAlgoliaHeaders(): Map<String, String> = mapOf(
+        "X-Algolia-Application-Id" to algoliaAppId,
+        "X-Algolia-API-Key" to algoliaApiKey,
+        "User-Agent" to "Algolia for Android (3.27.0); Android (14)",
+        "Content-Type" to "application/json; charset=UTF-8"
+    )
+
+    private fun algoliaAuthFailed(resText: String): Boolean {
+        if (resText.contains("Invalid Application-ID", ignoreCase = true)) return true
+        if (resText.contains("Invalid API key", ignoreCase = true)) return true
+        if (resText.contains("valid API key", ignoreCase = true)) return true
+        if (Regex(""""status"\s*:\s*40[0-9]""").containsMatchIn(resText)) return true
+        return false
+    }
+
+    /** single entry point for every algolia query: bootstraps credentials if empty,
+     *  re-discovers them if rejected, retries once. */
+    private suspend fun algoliaQuery(index: String, params: String): JSONArray {
+        if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) refreshAlgoliaCredentials(force = true)
+        if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) return JSONArray()
+
+        fun buildBody() = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType())
+        var res = try { app.post(algoliaUrl(index), requestBody = buildBody(), headers = getAlgoliaHeaders()).text } catch (e: Exception) { return JSONArray() }
+        if (algoliaAuthFailed(res)) {
+            debugInfo = "algolia key rejected, auto-refreshing credentials"
+            refreshAlgoliaCredentials(force = true)
+            if (algoliaAppId.isEmpty() || algoliaApiKey.isEmpty()) return JSONArray()
+            res = try { app.post(algoliaUrl(index), requestBody = buildBody(), headers = getAlgoliaHeaders()).text } catch (e: Exception) { return JSONArray() }
+            if (algoliaAuthFailed(res)) return JSONArray()
+        }
+        return (try { JSONObject(res) } catch (e: Exception) { JSONObject() }).optJSONArray("hits") ?: JSONArray()
+    }
+
+    /** scrape the site's frontend for the current algolia app id + search key.
+     *  the web app must ship them in its JS for its own search to work — always findable there. */
+    private suspend fun refreshAlgoliaCredentials(force: Boolean = false) {
+        credMutex.withLock {
+            val now = System.currentTimeMillis()
+            val haveCreds = algoliaAppId.isNotEmpty() && algoliaApiKey.isNotEmpty()
+            // valid creds: refresh on TTL or force. no creds: always attempt (bootstrapping)
+            if (haveCreds && !force && now - algoliaCredCheckedAt < ALGOLIA_CRED_TTL_MS) return@withLock
+            // anti-hammering gap — only enforced once we already have working creds,
+            // so a cold start is never locked out
+            if (haveCreds && now - algoliaLastAttemptAt < ALGOLIA_MIN_RETRY_MS) return@withLock
+            algoliaLastAttemptAt = now
+            try {
+                val html = app.get(mainUrl, headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")).text
+                scanAlgoliaIn(html)?.let { applyAlgolia(it); algoliaCredCheckedAt = now; return@withLock }
+
+                val srcs = LinkedHashSet<String>()
+                Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""").findAll(html).forEach { srcs.add(it.groupValues[1]) }
+                Regex("""<link[^>]+href=["']([^"']+\.js[^"']*)["']""").findAll(html).forEach { srcs.add(it.groupValues[1]) }
+                for (src in srcs.take(25)) {
+                    val abs = if (src.startsWith("http")) src else mainUrl.trimEnd('/') + "/" + src.trimStart('/')
+                    val js = try { app.get(abs, headers = mapOf("User-Agent" to "Mozilla/5.0")).text } catch (e: Exception) { continue }
+                    scanAlgoliaIn(js)?.let { applyAlgolia(it); algoliaCredCheckedAt = now; return@withLock }
+                }
+                debugInfo = "no algolia credentials found on site"
+            } catch (e: Exception) {
+                debugInfo = "cred refresh failed: ${e.message}"
+            }
+        }
+    }
+
+    /** find (appId, apiKey) inside a chunk of HTML/JS text */
+    private fun scanAlgoliaIn(text: String): Pair<String, String>? {
+        val appId = Regex("""([A-Za-z0-9]{8,12})-dsn\.algolia\.net""").find(text)?.groupValues?.get(1)?.uppercase()
+            ?: Regex("""(?:applicationID|appId|APP_ID|app_id)["']?\s*[:=,]\s*["']([A-Z0-9]{8,12})["']""").find(text)?.groupValues?.get(1)
+            ?: return null
+
+        val key = Regex("""(?:apiKey|api_key|searchKey|ALGOLIA_API_KEY)["']?\s*[:=,]\s*["']([a-f0-9]{32})["']""").find(text)?.groupValues?.get(1)
+            ?: run {
+                val idx = text.indexOf(appId)
+                if (idx >= 0) Regex("""([a-f0-9]{32})""").find(text.substring(maxOf(0, idx - 2000), minOf(text.length, idx + 2000)))?.groupValues?.get(1) else null
+            }
+            ?: return null
+        return appId to key
+    }
+
+    private fun applyAlgolia(creds: Pair<String, String>) {
+        if (creds.first != algoliaAppId || creds.second != algoliaApiKey) {
+            algoliaAppId = creds.first
+            algoliaApiKey = creds.second
+            debugInfo = "algolia credentials auto-discovered -> app ${creds.first}"
+        }
+    }
+
+    // ===================== END ALGOLIA AUTO-CREDENTIALS =====================
 
     private fun getSeasonFilter(seasonOffset: Int): String {
         val cal = java.util.Calendar.getInstance()
@@ -90,13 +190,6 @@ class AnimeWitcherProvider : MainAPI() {
     }
 
     private fun idFrom(obj: JSONObject): String = cleanId(obj.optString("path", "")).ifEmpty { cleanId(obj.optString("doc_ref", "")) }.ifEmpty { cleanId(obj.optString("anime_id", obj.optString("objectID"))) }
-
-    private fun getAlgoliaHeaders(): Map<String, String> = mapOf(
-        "X-Algolia-Application-Id" to algoliaAppId,
-        "X-Algolia-API-Key" to algoliaApiKey,
-        "User-Agent" to "Algolia for Android (3.27.0); Android (14)",
-        "Content-Type" to "application/json; charset=UTF-8"
-    )
 
     private suspend fun login(email: String, password: String): String? {
         return try {
@@ -144,6 +237,8 @@ class AnimeWitcherProvider : MainAPI() {
             return@withContext newHomePageResponse(emptyList(), hasNext = false)
         }
 
+        refreshAlgoliaCredentials()   // bootstrap / 6h re-check
+
         val recentEps = async { fetchRecentEpisodes() }
         val mostWatched = async { fetchAlgoliaList("most_watched_animations", "") }
         val prevSeason = async { fetchAlgoliaList("series", "", getSeasonFilter(-1)) }
@@ -171,9 +266,7 @@ class AnimeWitcherProvider : MainAPI() {
         val attributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
         var params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query=" + URLEncoder.encode(query, "UTF-8")
         if (facetFilters.isNotEmpty()) params += "&facetFilters=" + URLEncoder.encode(facetFilters, "UTF-8")
-        val body = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType())
-        val res = try { app.post(algoliaUrl(indexName), requestBody = body, headers = getAlgoliaHeaders()).text } catch (e: Exception) { return@withContext emptyList() }
-        val hits = (try { JSONObject(res) } catch (e: Exception) { JSONObject() }).optJSONArray("hits") ?: JSONArray()
+        val hits = algoliaQuery(indexName, params)
         val list = ArrayList<SearchResponse>()
         for (i in 0 until hits.length()) {
             val obj = hits.getJSONObject(i); val title = obj.optString("name"); if (title.isNullOrEmpty()) continue
@@ -187,9 +280,7 @@ class AnimeWitcherProvider : MainAPI() {
     private suspend fun fetchRecentEpisodes(): List<SearchResponse> = withContext(Dispatchers.IO) {
         val attributes = enc("[\"objectID\",\"name\",\"poster_uri\",\"thumb_uri\",\"episode_name\",\"doc_ref\",\"anime_id\",\"story\",\"details\",\"tags\",\"type\"]")
         val params = "attributesToRetrieve=$attributes&hitsPerPage=25&page=0&query="
-        val body = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType())
-        val res = try { app.post(algoliaUrl("recent"), requestBody = body, headers = getAlgoliaHeaders()).text } catch (e: Exception) { return@withContext emptyList() }
-        val hits = (try { JSONObject(res) } catch (e: Exception) { JSONObject() }).optJSONArray("hits") ?: JSONArray()
+        val hits = algoliaQuery("recent", params)
         val list = ArrayList<SearchResponse>()
         for (i in 0 until hits.length()) {
             val obj = hits.getJSONObject(i); val title = obj.optString("name"); val epName = obj.optString("episode_name"); if (title.isNullOrEmpty()) continue
@@ -246,13 +337,8 @@ class AnimeWitcherProvider : MainAPI() {
         val fullAttributes = enc("[\"objectID\",\"name\",\"tags\",\"poster_uri\",\"order\",\"path\",\"doc_ref\",\"type\",\"poster\",\"details\",\"cover_uri\",\"dubbed\",\"anime_id\",\"image\",\"poster_url\",\"thumb_uri\",\"cover\",\"story\",\"aniList_poster\"]")
         val filterQuery = enc("path:\"anime_list/$animeId\" OR objectID:\"$animeId\"")
         val params = "attributesToRetrieve=$fullAttributes&hitsPerPage=1&query=&filters=$filterQuery"
-        val fullAnimeRes = app.post(
-            algoliaUrl("series"),
-            requestBody = JSONObject().put("params", params).toString().toRequestBody("application/json; charset=UTF-8".toMediaType()),
-            headers = getAlgoliaHeaders()
-        ).text
-        val fullHits = JSONObject(fullAnimeRes).optJSONArray("hits")
-        if (fullHits != null && fullHits.length() > 0) {
+        val fullHits = algoliaQuery("series", params)
+        if (fullHits.length() > 0) {
             val fullObj = fullHits.getJSONObject(0)
             val keys = fullObj.keys()
             while (keys.hasNext()) { val k = keys.next(); animeJson.put(k, fullObj.opt(k)) }
