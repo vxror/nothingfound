@@ -1,15 +1,15 @@
 package com.witanime
 
+import android.os.Handler
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.webkit.WebView
 
 /**
- * Auto-clicks the Cloudflare challenge checkbox inside a WebView.
- * Adapted from the visible-solver approach: JS finds the box, computes
- * two candidate click points, dispatches realistic touch events.
- * Called by the hidden renderer BEFORE falling back to the visible dialog —
- * worst case it does nothing, best case the user never sees anything.
+ * Self-contained Cloudflare auto-clicker for the hidden renderer.
+ * Start it with ONE line and forget it — it manages its own timing,
+ * stops itself when the render finishes, and dies automatically when
+ * the renderer's handler gets cleared on cleanup.
  */
 object CfAutoClick {
 
@@ -30,8 +30,32 @@ object CfAutoClick {
         })();
     """.trimIndent()
 
-    /** One click attempt. Async and failure-proof — safe to call every ~2s
-     *  from the hidden renderer's poll loop while a challenge is showing. */
+    /**
+     * ONE call starts everything:
+     * - waits 3 seconds first (page-load grace)
+     * - then tries to click the CF checkbox every ~2.5 seconds
+     * - stops the moment shouldStop() becomes true (pass it your done flag)
+     * - also dies when the handler's callbacks get cleared on cleanup
+     */
+    fun startAutoClickLoop(webView: WebView, handler: Handler, shouldStop: () -> Boolean) {
+        val startedAt = SystemClock.uptimeMillis()
+        var lastClickAt = 0L
+
+        val runnable = object : Runnable {
+            override fun run() {
+                if (shouldStop()) return
+                val now = SystemClock.uptimeMillis()
+                if (now - startedAt > 3_000L && now - lastClickAt > 2_500L) {
+                    lastClickAt = now
+                    attempt(webView)
+                }
+                handler.postDelayed(this, 1_000L)
+            }
+        }
+        handler.postDelayed(runnable, 1_000L)
+    }
+
+    /** one click attempt — async, failure-proof */
     fun attempt(webView: WebView) {
         try {
             webView.evaluateJavascript(jsGetCoords) { res ->
