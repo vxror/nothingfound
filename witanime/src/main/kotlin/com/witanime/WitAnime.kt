@@ -118,9 +118,9 @@ class WitAnime : MainAPI() {
                         }
                         if (ls.isNotEmpty()) linkCache[epUrl] = CachedLinks(ls, ss, ts)
                     }
-                    println("WitAnimeDebug: restored ${linkCache.size} cached episodes from disk")
+                    WitaLog.d("restored ${linkCache.size} cached episodes from disk")
                 } catch (e: Exception) {
-                    println("WitAnimeDebug: store load fail ${e.message}")
+                    WitaLog.e("store load fail ${e.message}")
                 }
             }
         }
@@ -142,7 +142,7 @@ class WitAnime : MainAPI() {
                         val root = JSONObject().put("links", links).put("eps", eps)
                         ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
                     } catch (e: Exception) {
-                        println("WitAnimeDebug: store persist fail ${e.message}")
+                        WitaLog.e("store persist fail ${e.message}")
                     }
                 }
             }
@@ -171,7 +171,7 @@ class WitAnime : MainAPI() {
                 linkCache.remove(url)
                 return false
             }
-            println("WitAnimeDebug: CACHE HIT — ${c.links.size} links instantly")
+            WitaLog.d("CACHE HIT — ${c.links.size} links instantly")
             c.subs.forEach(subtitleCallback)
             c.links.forEach(callback)
             return true
@@ -198,8 +198,6 @@ class WitAnime : MainAPI() {
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
         // [v156] proxy ONLY when replay is PROVEN to fail; otherwise direct
-        // (real IP: app's image loader loads images fine with its own UA —
-        // the v135/v141 behavior where images worked)
         if (WitaWeb.replayWorks() == false) {
             return WitaImgProxy.proxyUrl(fixed) ?: fixed
         }
@@ -222,15 +220,13 @@ class WitAnime : MainAPI() {
             return body
         }
 
-        // [v156] attempt 2: PLAIN request (no cookie, no custom UA) — a stale
-        // clearance cookie can make Cloudflare challenge harder than no cookie;
-        // the plain request often passes when attempt 1 was rejected
+        // [v156] attempt 2: PLAIN request (no cookie, no custom UA)
         if (body != null) {
             val plain = try {
                 app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
             } catch (e: Exception) { null }
             if (plain != null && !WitaWeb.looksChallenge(plain) && plain.isNotBlank()) {
-                WitaWeb.setReplayWorks(false) // replay WITH cookie fails here; plain works
+                WitaWeb.setReplayWorks(false)
                 return plain
             }
         } else {
@@ -243,7 +239,7 @@ class WitAnime : MainAPI() {
             if (retry == null) return null
         }
 
-        println("WitAnimeDebug: [$url] challenge → WebView render")
+        WitaLog.d("[$url] challenge → WebView render")
         val html = WitaWeb.fetchHtml(url, silent)
 
         // probe after render decides poster routing (v153 behavior)
@@ -255,7 +251,7 @@ class WitAnime : MainAPI() {
                     app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
                 } catch (e: Exception) { null }
                 WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
-                println("WitAnimeDebug: replay probe = ${WitaWeb.replayWorks()}")
+                WitaLog.d("replay probe = ${WitaWeb.replayWorks()}")
             }
         }
         return html
@@ -271,7 +267,7 @@ class WitAnime : MainAPI() {
         val document = try { fetchDoc(mainUrl) } catch (e: Exception) {
             throw ErrorLoadingException("فشل تحميل الموقع: ${e.message}")
         }
-        println("WitAnimeDebug: title=${document.title()} widgets=${document.select("div.main-widget").size}")
+        WitaLog.d("title=${document.title()} widgets=${document.select("div.main-widget").size}")
 
         val homePageList = ArrayList<HomePageList>()
         document.select("div.main-widget").forEach { widget ->
@@ -367,7 +363,7 @@ class WitAnime : MainAPI() {
                 }
             } catch (e: Exception) { logError(e) }
         }
-        println("WitAnimeDebug: loaded '$title' episodes=${episodes.size}")
+        WitaLog.d("loaded '$title' episodes=${episodes.size}")
 
         return newAnimeLoadResponse(title, url, tvType) {
             this.posterUrl = smartPoster(poster)
@@ -388,13 +384,13 @@ class WitAnime : MainAPI() {
 
         val pending = inFlight[data]
         if (pending != null && pending.isActive) {
-            println("WitAnimeDebug: prefetch in-flight — waiting")
+            WitaLog.d("prefetch in-flight — waiting")
             withTimeoutOrNull(15_000) { pending.join() }
             if (deliverCached(data, subtitleCallback, callback)) {
                 schedulePrefetch(data)
                 return true
             }
-            println("WitAnimeDebug: prefetch produced nothing → full load (dialog allowed)")
+            WitaLog.d("prefetch produced nothing → full load (dialog allowed)")
             inFlight.remove(data)
         }
 
@@ -417,19 +413,19 @@ class WitAnime : MainAPI() {
         val c = linkCache[next]
         if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return
         if (inFlight.containsKey(next)) return
-        println("WitAnimeDebug: prefetch START $next")
+        WitaLog.d("prefetch START $next")
         val job = bgScope.launch {
             try {
                 val subs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
                 val links = extractLinks(next, { subs.add(it) }, {}, silent = true)
                 if (links.isNotEmpty()) {
                     putCache(next, links, subs.toList())
-                    println("WitAnimeDebug: prefetched ${links.size} links ($next)")
+                    WitaLog.d("prefetched ${links.size} links ($next)")
                 } else {
-                    println("WitAnimeDebug: prefetch EMPTY ($next) — will full-load on open")
+                    WitaLog.d("prefetch EMPTY ($next) — will full-load on open")
                 }
             } catch (e: Exception) {
-                println("WitAnimeDebug: prefetch error: ${e.message}")
+                WitaLog.e("prefetch error: ${e.message}")
             } finally {
                 inFlight.remove(next)
             }
@@ -507,7 +503,7 @@ class WitAnime : MainAPI() {
                     }
                     out.add(arranged.joinToString(""))
                 }
-            } catch (e: Exception) { println("WitAnimeDebug: dl error: ${e.message}") }
+            } catch (e: Exception) { WitaLog.e("dl error: ${e.message}") }
             return out
         }
 
@@ -519,7 +515,7 @@ class WitAnime : MainAPI() {
 
         return try {
             val html = fetch(data)
-            if (html.isBlank()) { println("WitAnimeDebug: episode fetch EMPTY"); return emptyList() }
+            if (html.isBlank()) { WitaLog.d("episode fetch EMPTY"); return emptyList() }
 
             val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
             val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
@@ -527,22 +523,22 @@ class WitAnime : MainAPI() {
             val cfgArr = zV?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
             val servers = findServers(html)
             val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
-            println("WitAnimeDebug: resArr=${resArr?.length() ?: -1} servers=${servers.size} downloads=${dlLinks.size}")
+            WitaLog.d("resArr=${resArr?.length() ?: -1} servers=${servers.size} downloads=${dlLinks.size}")
 
             val semaphore = Semaphore(3)
 
             suspend fun decodeAndRoute(idx: Int, sid: String, label: String) {
                 try {
                     val i = sid.toIntOrNull() ?: -1
-                    if (resArr == null || i !in 0 until resArr.length()) { println("WitAnimeDebug: [$label] no registry"); return }
+                    if (resArr == null || i !in 0 until resArr.length()) { WitaLog.d("[$label] no registry"); return }
                     val link = decodeWatch(resArr.optString(i), cfgArr?.optJSONObject(i))
-                    println("WitAnimeDebug: [$label] -> ${link.take(90)}")
+                    WitaLog.d("[$label] -> ${link.take(90)}")
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
                             "$link&apiKey=$FRAMEWORK_HASH" else link
                         withTimeoutOrNull(20_000) {
                             routeLink(finalLink, data, subtitleCallback, mkAt(idx, idx * 1000L))
-                        } ?: println("WitAnimeDebug: [$label] TIMEOUT")
+                        } ?: WitaLog.d("[$label] TIMEOUT")
                     }
                 } catch (_: Exception) {}
             }
@@ -565,7 +561,7 @@ class WitAnime : MainAPI() {
                         async(Dispatchers.IO) {
                             delay((j % 3) * 350L)
                             semaphore.withPermit {
-                                println("WitAnimeDebug: [${server.second}] empty → retry")
+                                WitaLog.d("[${server.second}] empty → retry")
                                 try {
                                     withTimeoutOrNull(15_000L) { decodeAndRoute(i, server.first, server.second) }
                                 } catch (_: Exception) {}
@@ -600,7 +596,7 @@ class WitAnime : MainAPI() {
                         .thenByDescending { it.link.quality }
                         .thenBy { it.link.name }
                 )
-            println("WitAnimeDebug: emitting ${ordered.size} links (sorted, deduped)")
+            WitaLog.d("emitting ${ordered.size} links (sorted, deduped)")
             ordered.forEach { callback(it.link) }
             ordered.map { it.link }
         } catch (e: Exception) { logError(e); emptyList() }
@@ -620,7 +616,7 @@ class WitAnime : MainAPI() {
             if (cleaned.isBlank() || cleaned == l.name) rawCb(l) else rawCb(renameLink(l, cleaned))
         }
 
-        println("WitAnimeDebug: routing -> $link")
+        WitaLog.d("routing -> $link")
         val host = linkHost(link)
         when {
             host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, emitAt)
@@ -651,9 +647,9 @@ class WitAnime : MainAPI() {
     ) {
         try {
             val html = smartFetch(yonaplayUrl, referer = "$mainUrl/") ?: run {
-                println("WitAnimeDebug: Yona fetch failed"); return
+                WitaLog.w("Yona fetch failed"); return
             }
-            println("WitAnimeDebug: Yona len=${html.length}")
+            WitaLog.d("Yona len=${html.length}")
 
             val seen = mutableSetOf<String>()
             var idx = 0L
@@ -674,7 +670,7 @@ class WitAnime : MainAPI() {
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
                     if (decoded.startsWith("http") && seen.add(decoded)) {
-                        println("WitAnimeDebug: Yona [$hostLabel | $qLabel] -> ${decoded.take(90)}")
+                        WitaLog.d("Yona [$hostLabel | $qLabel] -> ${decoded.take(90)}")
                         if (decoded.contains("drive.google.com/file/d/")) {
                             Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
                                 emitAt(myIdx)(newExtractorLink("Yonaplay", named("Google Drive", qLabel),
@@ -733,7 +729,7 @@ class WitAnime : MainAPI() {
                     })
                 }
             }
-            println("WitAnimeDebug: Yona processed=${idx}")
-        } catch (e: Exception) { println("WitAnimeDebug: Yonaplay error: ${e.message}") }
+            WitaLog.d("Yona processed=$idx")
+        } catch (e: Exception) { WitaLog.e("Yonaplay error: ${e.message}") }
     }
 }
