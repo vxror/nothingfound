@@ -11,12 +11,12 @@
     "tvTypes": [
       "Anime"
     ],
-    "version": 1,
+    "version": 2,
     "internalName": "AnimeWitcher",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Animewitcher.cs3",
     "name": "AnimeWitcher",
-    "fileSize": 121451,
-    "fileHash": "sha256-e15f375583a38f291937166afafb20aa6e46e8d921bda725659bac8f9b4e8706"
+    "fileSize": 125853,
+    "fileHash": "sha256-d32956b25bec4f439373a295fbc2f903822c4ecaebcd7aa51a2890921169d25f"
   },
   {
     "iconUrl": "https://www.witanime.net/favicon.ico",
