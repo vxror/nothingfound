@@ -17,6 +17,22 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
+      - name: Warm JitPack Cloudstream plugin
+        run: |
+          V="32895aedb6366f5075cb99bbd2e6ce0a7cac325d"
+          URL="https://jitpack.io/com/github/recloudstream/gradle/$V/gradle-$V.pom"
+          echo "checking JitPack for com.github.recloudstream:gradle:$V ..."
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            if [ "$CODE" = "200" ]; then
+              echo "artifact is live (HTTP 200) — gradle will resolve instantly"
+              exit 0
+            fi
+            echo "  not ready yet (HTTP $CODE), attempt $i/40 — waiting 20s ..."
+            sleep 20
+          done
+          echo "warning: JitPack still not serving the artifact after ~13 min"
+          echo "gradle will try anyway; if it fails, the JitPack build itself is broken"
       - name: Build All
         run: |
           chmod +x gradlew
