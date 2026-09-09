@@ -30,11 +30,11 @@
     "tvTypes": [
       "Anime"
     ],
-    "version": 157,
+    "version": 158,
     "internalName": "WitAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/witanime.cs3",
     "name": "WitAnime",
-    "fileSize": 152221,
-    "fileHash": "sha256-ce498e7b19f6b0a290885ac16c8dd1feb69e13a1c5a9a3192db9c7184033d8eb"
+    "fileSize": 152340,
+    "fileHash": "sha256-6ac16ade32ba50d7ff67aee56733d007f08f2dd51787d811f24a0ad4da78f936"
   }
 ]
