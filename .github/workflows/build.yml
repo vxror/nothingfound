@@ -19,7 +19,7 @@ jobs:
           distribution: 'temurin'
       - name: Warm JitPack Cloudstream plugin
         run: |
-          V="32895aedb6366f5075cb99bbd2e6ce0a7cac325d"
+          V="81b1d424d2"
           URL="https://jitpack.io/com/github/recloudstream/gradle/$V/gradle-$V.pom"
           echo "checking JitPack for com.github.recloudstream:gradle:$V ..."
           for i in $(seq 1 40); do
