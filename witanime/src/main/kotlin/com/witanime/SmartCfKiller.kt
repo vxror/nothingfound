@@ -35,7 +35,9 @@ import com.lagradost.cloudstream3.ui.settings.Globals
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import org.json.JSONArray
@@ -121,16 +123,23 @@ object WitaWeb {
         "verify you are human", "one more step", "ddos-guard"
     )
 
-    private val renderMutex = Mutex()
+    // [v159] hidden renders now run in PARALLEL (up to 3 at once) — the old
+    // single mutex serialized every page behind every other page, which under
+    // WARP (where every fetch is a render) made the whole extension crawl
+    private val renderSlots = Semaphore(3)
 
     private class CacheEntry(val html: String, val ts: Long)
     private val htmlCache = ConcurrentHashMap<String, CacheEntry>()
 
-    private const val CACHE_TTL = 180_000L
-    private const val REPLAY_TTL = 10 * 60_000L
+    // [v159] 10 minutes — going back after an episode hits the cache
+    private const val CACHE_TTL = 600_000L
+
+    // [v159] wrong states (e.g. WARP left replay=false, now on real IP) self-correct in 2 min
+    private const val REPLAY_TTL = 2 * 60_000L
 
     @Volatile var wasChallenged: Boolean = false
 
+    /** the WebView user-agent the clearance was earned with — persisted to disk */
     @Volatile var webUa: String? = null
         set(value) {
             field = value
@@ -198,25 +207,42 @@ object WitaWeb {
             ?.takeIf { it.contains("cf_clearance") }
     }
 
+    /** [v159] remove a proven-dead clearance cookie so nothing keeps sending it —
+     *  a stale clearance makes Cloudflare serve HARDER challenges */
+    fun expireClearance(url: String) {
+        try {
+            val host = try {
+                val u = Uri.parse(url)
+                "${u.scheme}://${u.host}"
+            } catch (_: Exception) { url }
+            CookieManager.getInstance().apply {
+                listOf("cf_clearance", "cf_chl_rc_ni", "cf_chl_prog").forEach { name ->
+                    setCookie(host, "$name=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                }
+                flush()
+            }
+        } catch (_: Exception) {}
+    }
+
     suspend fun fetchHtml(url: String, silent: Boolean = false): String? {
         htmlCache[url]?.let { e ->
             if (System.currentTimeMillis() - e.ts < CACHE_TTL) return e.html
             htmlCache.remove(url)
         }
-        return renderMutex.withLock {
+        return renderSlots.withPermit {
             htmlCache[url]?.let { e ->
-                if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withLock e.html
+                if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withPermit e.html
             }
             WitaLog.d("hidden render (invisible) for $url")
             val hidden = HiddenRender.fetch(url)
             if (hidden != null) {
                 WitaLog.d("hidden render OK — no UI shown")
                 htmlCache[url] = CacheEntry(hidden, System.currentTimeMillis())
-                return@withLock hidden
+                return@withPermit hidden
             }
             if (silent) {
                 WitaLog.d("silent mode (background prefetch) — dialog suppressed")
-                return@withLock null
+                return@withPermit null
             }
             WitaLog.d("challenge needs a human → visible dialog")
             val html = VisibleRender.fetch(url, 120_000L)
@@ -252,9 +278,14 @@ private fun WebView.configForCf() {
         .replace(Regex("Version/\\d+\\.\\d+ "), "")
 }
 
+/**
+ * [v159] hidden renderer: fresh full-size WebView per render (v153 proven
+ * design), pushed off-screen. Poll/settle tightened for speed (250ms/350ms).
+ * The CfAutoClick loop robot-clicks the CF box invisibly after ~1s.
+ */
 private object HiddenRender {
-    private const val POLL_MS = 400L
-    private const val SETTLE_MS = 1_000L
+    private const val POLL_MS = 250L      // [v159] faster poll — pages that pass need speed
+    private const val SETTLE_MS = 350L    // [v159] content HTML rarely needs a full second
     private const val CHALLENGE_GRACE_MS = 15_000L
     private const val HARD_TIMEOUT_MS = 30_000L
     private const val MIN_HTML_LEN = 2_000
@@ -262,8 +293,7 @@ private object HiddenRender {
     @Volatile var lastSuccessAt: Long = 0L
 
     // NOTE: no stale-cookie clearing here on purpose — the hidden renderer may
-    // still pass silently with existing cookies (the WARP silent path). Clearing
-    // would force a challenge we could have dodged. Clearing belongs in the
+    // still pass silently with existing cookies. Clearing belongs in the
     // fallback dialog only, where the cookie is proven dead.
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
@@ -316,6 +346,7 @@ private object HiddenRender {
                 val wv = WebView(activity)
                 webView = wv
                 wv.configForCf()
+                // [v157] invisible auto-clicker — robot-clicks the CF checkbox
                 CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
                 capturedUa = wv.settings.userAgentString
                 wv.webViewClient = object : WebViewClient() {
@@ -336,6 +367,7 @@ private object HiddenRender {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 ))
+                // full size (Cloudflare needs real dimensions) but off-screen
                 c.translationX = -10000f
                 c.translationY = -10000f
 
@@ -515,11 +547,10 @@ object WitaImgProxy {
 }
 
 /**
- * [v158] the fallback dialog, upgraded with two grafts from other repos:
- *  - stale CF cookies are EXPIRED before loading (the cookie is proven dead here,
- *    and Cloudflare serves a harder challenge when a dead clearance is present)
- *  - D-pad fake cursor for Android TV — TV users cannot tap the turnstile without it
- *  - Done button to force cookie extraction when detection lags
+ * [v158] the fallback dialog: stale CF cookies are EXPIRED before loading
+ * (proven dead here, and a dead clearance makes CF serve a harder challenge),
+ * D-pad fake cursor for Android TV, Done button to force extraction.
+ * [v157] CfAutoClick runs here too — often solves before the overlay lifts.
  */
 private class WitaRenderDialog(
     private val activity: Activity,
@@ -624,7 +655,7 @@ private class WitaRenderDialog(
         }
     }
 
-    // ---- TV D-pad cursor (grafted from the MkvBase approach) ----
+    // ---- TV D-pad cursor ----
 
     private fun moveCursor(dx: Float, dy: Float) {
         val holder = holderRef ?: return
@@ -700,6 +731,8 @@ private class WitaRenderDialog(
         val wv = WebView(activity)
         webView = wv
         wv.configForCf()
+        // [v157] auto-click here too — often solves the challenge BEFORE the
+        // overlay lifts at 4s, so the user never even sees the checkbox
         CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
