@@ -197,7 +197,6 @@ class WitAnime : MainAPI() {
 
     private fun smartPoster(raw: String?): String? {
         val fixed = fixUrlNull(raw) ?: return null
-        // [v156] proxy ONLY when replay is PROVEN to fail; otherwise direct
         if (WitaWeb.replayWorks() == false) {
             return WitaImgProxy.proxyUrl(fixed) ?: fixed
         }
@@ -205,61 +204,63 @@ class WitAnime : MainAPI() {
     }
 
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
-        // [v158 WARP FIX] if replay is PROVEN dead (WARP / flagged IP), skip the
-        // doomed okhttp attempts entirely — they can never pass from a flagged IP
-        // and burn 2 requests + seconds on every episode. go straight to the
-        // WebView renderer, which now auto-clicks the challenge box (v157).
+        // [v159] three-level strategy:
+        //   1. cookie+UA replay  (only when replay works or is unknown)
+        //   2. PLAIN request     (ALWAYS — it's the fast lane when the cookie is poison)
+        //   3. WebView render    (only when BOTH okhttp paths are challenged)
+        // v158's bug: "replay known bad" skipped ALL okhttp, so a stale cookie
+        // (e.g. earned under WARP, spent from real IP) sent every page to the
+        // renderer forever — even on clean IPs where plain passes in 0.5s.
         val replayKnownBad = WitaWeb.replayWorks() == false
 
         if (!replayKnownBad) {
-            // attempt 1: with clearance cookie + WebView UA (fast when accepted)
             val headers = mutableMapOf("User-Agent" to userAgent)
             WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
             WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
-
-            var body: String? = null
-            try {
-                body = app.get(url, headers = headers, referer = referer).text
-            } catch (e: Exception) {}
-
-            if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) {
+            val body = try {
+                app.get(url, headers = headers, referer = referer).text
+            } catch (_: Exception) { null }
+            if (body != null && body.isNotBlank() && !WitaWeb.looksChallenge(body)) {
                 WitaWeb.setReplayWorks(true)
                 return body
             }
+        }
 
-            // [v156] attempt 2: PLAIN request (no cookie, no custom UA) — a stale
-            // clearance cookie can make Cloudflare challenge harder than no cookie;
-            // the plain request often passes when attempt 1 was rejected
-            if (body != null) {
-                val plain = try {
-                    app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-                } catch (e: Exception) { null }
-                if (plain != null && !WitaWeb.looksChallenge(plain) && plain.isNotBlank()) {
-                    WitaWeb.setReplayWorks(false) // replay WITH cookie fails here; plain works
-                    return plain
-                }
-            } else {
-                // network error — one brief retry
-                delay(400)
-                val retry = try {
-                    app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-                } catch (e: Exception) { null }
-                if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
-                if (retry == null) return null
+        // attempt 2: PLAIN — always attempted, this is the fix
+        val plain = try {
+            app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+        } catch (_: Exception) { null }
+        if (plain != null && plain.isNotBlank() && !WitaWeb.looksChallenge(plain)) {
+            if (!replayKnownBad) {
+                // cookie replay failed while plain works → the clearance is stale
+                // (usually from an IP change). expire it so nothing keeps sending
+                // poison, and remember: plain is the fast lane now.
+                WitaWeb.setReplayWorks(false)
+                WitaWeb.expireClearance(url)
             }
+            return plain
+        }
+
+        if (plain == null && replayKnownBad) {
+            // no response at all — one brief retry before the renderer
+            delay(400)
+            val retry = try {
+                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+            } catch (_: Exception) { null }
+            if (retry != null && retry.isNotBlank() && !WitaWeb.looksChallenge(retry)) return retry
+            if (retry == null) return null
         }
 
         WitaLog.d("[$url] challenge → WebView render")
         val html = WitaWeb.fetchHtml(url, silent)
 
-        // probe after render decides poster routing (v153 behavior)
         if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
             val cookie = WitaWeb.clearanceCookie(url)
             val ua = WitaWeb.webUa
             if (cookie != null && ua != null) {
                 val probe = try {
                     app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
-                } catch (e: Exception) { null }
+                } catch (_: Exception) { null }
                 WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
                 WitaLog.d("replay probe = ${WitaWeb.replayWorks()}")
             }
@@ -642,6 +643,9 @@ class WitAnime : MainAPI() {
             host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
             host.contains("mediafire") -> { }
+            // [v159] workupload is a download host with its own human puzzle —
+            // WebView-scraping it burns 15s per link for nothing
+            host.contains("workupload") -> { }
             isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
                 val ok = loadExtractor(link, "$mainUrl/", subtitleCallback, emit)
@@ -689,7 +693,7 @@ class WitAnime : MainAPI() {
                                 })
                             }
                         } else {
-                            withTimeoutOrNull(15_000) {
+                            withTimeoutOrNull(10_000) {
                                 routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, qLabel, myIdx)
                             }
                         }
@@ -702,14 +706,14 @@ class WitAnime : MainAPI() {
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
                     if (decoded.startsWith("http") && seen.add(decoded)) {
-                        withTimeoutOrNull(15_000) { routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
+                        withTimeoutOrNull(10_000) { routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
                     }
                 } catch (_: Exception) {}
             }
 
             Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
                 val myIdx = idx++
-                if (seen.add(it.value)) withTimeoutOrNull(15_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
+                if (seen.add(it.value)) withTimeoutOrNull(10_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
             }
 
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
@@ -717,7 +721,7 @@ class WitAnime : MainAPI() {
                 if (src.startsWith("//")) src = "https:$src"
                 if (src.startsWith("http") && !src.contains("yonaplay") && !src.contains("dotplay") && seen.add(src)) {
                     val myIdx = idx++
-                    withTimeoutOrNull(15_000) { routeLink(src, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
+                    withTimeoutOrNull(10_000) { routeLink(src, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
                 }
             }
 
