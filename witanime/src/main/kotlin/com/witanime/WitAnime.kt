@@ -205,38 +205,48 @@ class WitAnime : MainAPI() {
     }
 
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
-        // attempt 1: with clearance cookie + WebView UA (fast when accepted)
-        val headers = mutableMapOf("User-Agent" to userAgent)
-        WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
-        WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
+        // [v158 WARP FIX] if replay is PROVEN dead (WARP / flagged IP), skip the
+        // doomed okhttp attempts entirely — they can never pass from a flagged IP
+        // and burn 2 requests + seconds on every episode. go straight to the
+        // WebView renderer, which now auto-clicks the challenge box (v157).
+        val replayKnownBad = WitaWeb.replayWorks() == false
 
-        var body: String? = null
-        try {
-            body = app.get(url, headers = headers, referer = referer).text
-        } catch (e: Exception) {}
+        if (!replayKnownBad) {
+            // attempt 1: with clearance cookie + WebView UA (fast when accepted)
+            val headers = mutableMapOf("User-Agent" to userAgent)
+            WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
+            WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
 
-        if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) {
-            WitaWeb.setReplayWorks(true)
-            return body
-        }
+            var body: String? = null
+            try {
+                body = app.get(url, headers = headers, referer = referer).text
+            } catch (e: Exception) {}
 
-        // [v156] attempt 2: PLAIN request (no cookie, no custom UA)
-        if (body != null) {
-            val plain = try {
-                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-            } catch (e: Exception) { null }
-            if (plain != null && !WitaWeb.looksChallenge(plain) && plain.isNotBlank()) {
-                WitaWeb.setReplayWorks(false)
-                return plain
+            if (body != null && !WitaWeb.looksChallenge(body) && body.isNotBlank()) {
+                WitaWeb.setReplayWorks(true)
+                return body
             }
-        } else {
-            // network error — one brief retry
-            delay(400)
-            val retry = try {
-                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-            } catch (e: Exception) { null }
-            if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
-            if (retry == null) return null
+
+            // [v156] attempt 2: PLAIN request (no cookie, no custom UA) — a stale
+            // clearance cookie can make Cloudflare challenge harder than no cookie;
+            // the plain request often passes when attempt 1 was rejected
+            if (body != null) {
+                val plain = try {
+                    app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+                } catch (e: Exception) { null }
+                if (plain != null && !WitaWeb.looksChallenge(plain) && plain.isNotBlank()) {
+                    WitaWeb.setReplayWorks(false) // replay WITH cookie fails here; plain works
+                    return plain
+                }
+            } else {
+                // network error — one brief retry
+                delay(400)
+                val retry = try {
+                    app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
+                } catch (e: Exception) { null }
+                if (retry != null && !WitaWeb.looksChallenge(retry) && retry.isNotBlank()) return retry
+                if (retry == null) return null
+            }
         }
 
         WitaLog.d("[$url] challenge → WebView render")
