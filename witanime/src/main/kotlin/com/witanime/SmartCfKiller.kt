@@ -178,7 +178,7 @@ object WitaWeb {
 
     fun isChallengeTitle(title: String): Boolean {
         val l = title.lowercase()
-        return CHALLENGE_TITLES.any { l.contains(it) }
+        return CHALLENGE_TITLES.any { l.contains(l) }
     }
 
     fun replayWorks(): Boolean? =
@@ -206,18 +206,18 @@ object WitaWeb {
             htmlCache[url]?.let { e ->
                 if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withLock e.html
             }
-            println("WitaCF: hidden render (invisible) for $url")
+            WitaLog.d("hidden render (invisible) for $url")
             val hidden = HiddenRender.fetch(url)
             if (hidden != null) {
-                println("WitaCF: hidden render OK — no UI shown")
+                WitaLog.d("hidden render OK — no UI shown")
                 htmlCache[url] = CacheEntry(hidden, System.currentTimeMillis())
                 return@withLock hidden
             }
             if (silent) {
-                println("WitaCF: silent mode (background prefetch) — dialog suppressed")
+                WitaLog.d("silent mode (background prefetch) — dialog suppressed")
                 return@withLock null
             }
-            println("WitaCF: challenge needs a human → visible dialog")
+            WitaLog.d("challenge needs a human → visible dialog")
             val html = VisibleRender.fetch(url, 120_000L)
             if (html != null) {
                 htmlCache[url] = CacheEntry(html, System.currentTimeMillis())
@@ -258,6 +258,9 @@ private fun WebView.configForCf() {
  * now REMOVED from the activity on cleanup — v153 leaked one invisible
  * full-screen container per render, which made the whole app progressively
  * slower.
+ *
+ * [v157] CfAutoClick: the hidden WebView now robot-clicks the CF checkbox
+ * after 3s — many challenges solve without any UI at all.
  */
 private object HiddenRender {
     private const val POLL_MS = 400L
@@ -271,7 +274,7 @@ private object HiddenRender {
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
         if (activity == null) {
-            println("WitaCF: no activity available — hidden render skipped")
+            WitaLog.d("no activity available — hidden render skipped")
             return@withContext null
         }
         suspendCancellableCoroutine { cont ->
@@ -321,6 +324,9 @@ private object HiddenRender {
                 val wv = WebView(activity)
                 webView = wv
                 wv.configForCf()
+                // [v157] invisible auto-clicker — robot-clicks the CF checkbox
+                // after 3s, retries every ~2.5s, self-stops when done/cleanup
+                CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
                 capturedUa = wv.settings.userAgentString
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
@@ -371,7 +377,7 @@ private object HiddenRender {
                 }
                 handler.postDelayed(poll, POLL_MS)
             } catch (e: Exception) {
-                println("WitaCF: hidden render error ${e.message}")
+                WitaLog.e("hidden render error ${e.message}")
                 finish(null)
             }
 
@@ -388,7 +394,7 @@ private object VisibleRender {
     suspend fun fetch(url: String, timeoutMs: Long): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
         if (activity == null) {
-            println("WitaCF: no activity — dialog skipped")
+            WitaLog.d("no activity — dialog skipped")
             return@withContext null
         }
         suspendCancellableCoroutine { cont ->
@@ -398,7 +404,7 @@ private object VisibleRender {
             try {
                 dlg.show()
             } catch (e: Exception) {
-                println("WitaCF: dialog error ${e.message}")
+                WitaLog.e("dialog error ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
             cont.invokeOnCancellation { dlg.cancel() }
@@ -422,7 +428,7 @@ object WitaImgProxy {
             return try {
                 val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
                 serverSocket = server
-                println("WitaCF: image proxy listening on ${server.localPort}")
+                WitaLog.d("image proxy listening on ${server.localPort}")
                 Thread {
                     while (!server.isClosed) {
                         try {
@@ -436,7 +442,7 @@ object WitaImgProxy {
                 }.apply { isDaemon = true; name = "WitaImgProxy-Accept" }.start()
                 server.localPort
             } catch (e: Exception) {
-                println("WitaCF: image proxy start fail: ${e.message}")
+                WitaLog.e("image proxy start fail: ${e.message}")
                 null
             }
         }
@@ -658,6 +664,9 @@ private class WitaRenderDialog(
         val wv = WebView(activity)
         webView = wv
         wv.configForCf()
+        // [v157] auto-click here too — often solves the challenge BEFORE the
+        // overlay lifts at 4s, so the user never even sees the checkbox
+        CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
         }
