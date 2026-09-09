@@ -20,7 +20,17 @@ jobs:
       - name: Build All
         run: |
           chmod +x gradlew
-          ./gradlew make --no-daemon
+          for i in 1 2 3; do
+            ./gradlew make --no-daemon && break
+            if [ "$i" = "3" ]; then
+              echo "gradle failed 3 times, giving up"
+              exit 1
+            fi
+            echo "gradle failed (attempt $i), purging plugin cache and retrying..."
+            rm -rf ~/.gradle/caches/modules-2/files-2.1/com.github.recloudstream
+            rm -rf ~/.gradle/caches/modules-2/metadata-*
+            sleep 20
+          done
       - name: Copy All Extensions
         run: |
           mkdir -p build
@@ -33,7 +43,7 @@ jobs:
           python3 - <<'EOF'
           import json, os, hashlib, urllib.parse
 
-          PLUGINS_JSON = 'plugins.json'   # <-- change this if yours lives elsewhere
+          PLUGINS_JSON = 'plugins.json'   # change if yours lives elsewhere
           BUILD_DIR = 'build'
 
           if not os.path.exists(PLUGINS_JSON):
@@ -46,7 +56,6 @@ jobs:
           updated = 0
           for item in plugins:
               url = item.get('url', '')
-              # pull the cs3 filename straight from the entry's own url
               filename = urllib.parse.unquote(url.rstrip('/').split('/')[-1])
               path = os.path.join(BUILD_DIR, filename)
 
@@ -63,7 +72,6 @@ jobs:
               item['fileSize'] = len(data)
               item['fileHash'] = new_hash
 
-              # if the built file changed, bump version so clients auto-update
               if old_hash is not None and old_hash != new_hash:
                   item['version'] = int(item.get('version', 0)) + 1
                   print(f"bumped {filename} -> v{item['version']}")
