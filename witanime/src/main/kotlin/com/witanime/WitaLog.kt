@@ -11,6 +11,7 @@ object WitaLog {
     fun d(msg: String) { runCatching { com.lagradost.api.Log.d(TAG, msg) } }
     fun w(msg: String) { runCatching { com.lagradost.api.Log.w(TAG, msg) } }
     fun e(msg: String, tr: Throwable? = null) {
-        runCatching { com.lagradost.api.Log.e(TAG, msg, tr) }
+        val full = if (tr != null) "$msg — ${tr.message}" else msg
+        runCatching { com.lagradost.api.Log.e(TAG, full) }
     }
 }
