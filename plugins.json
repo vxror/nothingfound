@@ -49,11 +49,11 @@
     "tvTypes": [
       "Anime"
     ],
-    "version": 1,
+    "version": 2,
     "internalName": "KawaiiAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Kawaii.cs3",
     "name": "KawaiiAnime",
-    "fileSize": 18341,
-    "fileHash": "sha256-8034dfd36c5da7f53666fe7ed5f8421027f60689c81a0b4a5e7cfe1b91fa74b3"
+    "fileSize": 21722,
+    "fileHash": "sha256-81f67cf11355ba68c0a0de12d314f0f73eacb83984a5b72043d765ba671f3da3"
   }
 ]
