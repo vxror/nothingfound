@@ -23,12 +23,39 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private val seq = AtomicInteger(0)
 
+    // [v163 FINAL] BUCKET POOL — every entry is a mega quota bucket, walked in
+    // order with automatic failover. capture each sid from a logged-in browser
+    // session: mega.nz → devtools → any g.api.mega.co.nz/cs request → copy
+    // the sid= value. "" = the anonymous per-IP bucket, always tried last.
+    //
+    // HONEST CEILING: more sids = more buckets, NOT premium. utype lives in
+    // mega's payment database and no request can change it. a PREMIUM sid
+    // pasted into this list inherits Pro bandwidth instantly — the pool is
+    // premium-ready; the accounts are what they are.
+    private val MEGA_SIDS = listOf(
+        "HNarUZNXSv6yQQE_zH5PNTBxeV83aDV3N1ZnnUeH5KE4IZv9W2B7nFSCwA",
+        "4Ifv50LOUzGvZXEyl3zf31FyZ2lNWkx3ZC0wShSSNY8wTt6VUnF1MdQjqg",
+        "LRH1dwBlNNJyn-CWvp6fTDE0b1JxWE54QWNZ0lIRY50Z0bKDZluMuQlYcQ",
+        "kuizsHSgjjrB8ZMtNFqMW0NPWktHdXZiRXhnZ34TFlmKEqPVcCWxP56u9w",
+        "ZxHhV3yrH8wZc2CNaXNJm2tmMS1aZkF6SFlz6kQFj6RFuRkmnqnvtu2NOg",
+        "-puwJUjnYfeW4mgSm-JPFkpQajJtWjNmMkdzlAbh3xHxVrxzRwYA3gVQWQ",
+        "gXvVNVDK_v6FTnHkFM3_nGViVjExZzdUN0NzGvg1JO8w8D7go12_SRBB1Q",
+        "Ewbc-0x2IZUPE62DP0ch8GN4VzVRRmFPcWVFmPOi4ALVRNl8oj894omZzg",
+        "AwqLRDNeOhAmhzWoM5Xl4ExXQ0w1aDdWcDZBvv8JNex0jKLNbA0Vu0eNGw",
+        "jCqhVk8H_Wr-KuZhjEuemFo3bFdyQ3lYTjhZzbI4eZxjjIVLOTzTURaCbg",
+        "NYeY8gINsTfPQaNvyRG-6lJaWWZhcG53bjRzSItns-74rch1UJnPcg2Q3Q"
+    )
+
+    // sid -> epoch-millis when a drained bucket may be retried
+    private val bucketCooldowns = ConcurrentHashMap<String, Long>()
+
     data class MegaFile(
         val dlUrl: String,
         val size: Long,
         val aesKey: ByteArray,
         val nonce: ByteArray,
-        val createdAt: Long = System.currentTimeMillis()
+        val createdAt: Long = System.currentTimeMillis(),
+        @Volatile var head: ByteArray? = null
     )
 
     fun start() {
@@ -67,7 +94,6 @@ object MegaProxy {
         val iterator = files.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            // [!] 30-minute TTL to free RAM
             if (now - entry.value.createdAt > 1_800_000) {
                 iterator.remove()
             }
@@ -89,38 +115,154 @@ object MegaProxy {
             val aesKey = ByteArray(16) { (key[it].toInt() xor key[it + 16].toInt()).toByte() }
             val nonce = key.copyOfRange(16, 24)
 
-            // [!] EXACT v143 API call (proven working)
-            val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
-                .toRequestBody("application/json".toMediaType())
-            val resp = app.post(
-                "https://g.api.mega.co.nz/cs?id=${seq.incrementAndGet()}",
-                headers = mapOf("User-Agent" to EXTRACTOR_UA),
-                requestBody = body
-            ).text
-            val arr = JSONArray(resp)
-            if (arr.length() == 0) return null
-            val obj = arr.optJSONObject(0) ?: run {
-                println("WitAnimeDebug: Mega api err ${arr.opt(0)}")
-                return null
-            }
-            val size = obj.optLong("s", -1)
-            val dl = obj.optString("g")
-            if (size <= 0 || dl.isBlank()) return null
+            // walk the pool: every sid, then the anonymous IP bucket
+            val buckets = MEGA_SIDS.map { it to "account" } + listOf("" to "anonymous-IP")
 
-            val server = serverSocket ?: return null
-            val token = "${System.currentTimeMillis()}_${seq.incrementAndGet()}"
-            files[token] = MegaFile(dl, size, aesKey, nonce)
-            println("WitAnimeDebug: Mega resolved token=$token size=${size / 1048576}MB")
-            "http://127.0.0.1:${server.localPort}/v/$token.mp4"
+            for ((sid, label) in buckets) {
+                // skip buckets known to be drained until their reset time
+                val cooldownUntil = if (sid.isNotBlank()) bucketCooldowns[sid] ?: 0L else 0L
+                if (System.currentTimeMillis() < cooldownUntil) {
+                    println("WitAnimeDebug: skipping $label bucket " +
+                        "(~${(cooldownUntil - System.currentTimeMillis()) / 60_000} min cooldown left)")
+                    continue
+                }
+
+                val sidParam = if (sid.isNotBlank()) "&sid=$sid" else ""
+                val body = """[{"a":"g","g":1,"ssl":1,"p":"$fileId"}]"""
+                    .toRequestBody("application/json".toMediaType())
+                val resp = try {
+                    app.post(
+                        "https://g.api.mega.co.nz/cs?id=${seq.incrementAndGet()}$sidParam",
+                        headers = mapOf("User-Agent" to EXTRACTOR_UA),
+                        requestBody = body
+                    ).text
+                } catch (e: Exception) { continue }
+
+                val arr = try { JSONArray(resp) } catch (_: Exception) { continue }
+                if (arr.length() == 0) continue
+
+                val first = arr.opt(0)
+                val errCode = when (first) {
+                    is Int -> first
+                    is Long -> first.toInt()
+                    is String -> first.toIntOrNull()
+                    else -> null
+                }
+                if (errCode != null) {
+                    when (errCode) {
+                        -17, -18, -24 -> {
+                            val resetSecs = if (sid.isNotBlank()) logQuotaReset(sid) else 0L
+                            println("WitAnimeDebug: Mega quota dead ($label bucket, " +
+                                "resets ~${resetSecs / 60} min) — next bucket")
+                            if (sid.isNotBlank()) {
+                                bucketCooldowns[sid] = System.currentTimeMillis() +
+                                    (resetSecs * 1000L).coerceIn(300_000L, 6 * 3600_000L)
+                            }
+                        }
+                        -15, -16 -> println("WitAnimeDebug: Mega sid dead/blocked ($label) — remove from MEGA_SIDS")
+                        -9 -> { println("WitAnimeDebug: Mega file not found / removed"); return null }
+                        else -> println("WitAnimeDebug: Mega api error $errCode ($label)")
+                    }
+                    continue
+                }
+
+                val obj = arr.optJSONObject(0) ?: continue
+
+                // mega sometimes answers 200 with "tl" = seconds until reset
+                val timeLeft = obj.optLong("tl", 0L)
+                if (timeLeft > 0) {
+                    println("WitAnimeDebug: Mega free limit ($label) — resets in " +
+                        "${timeLeft / 60} min, next bucket")
+                    if (sid.isNotBlank()) {
+                        bucketCooldowns[sid] = System.currentTimeMillis() + timeLeft * 1000L
+                    }
+                    continue
+                }
+
+                val size = obj.optLong("s", -1)
+                val dl = obj.optString("g")
+                if (size <= 0 || dl.isBlank()) continue
+
+                val server = serverSocket ?: return null
+                val token = "${System.currentTimeMillis()}_${seq.incrementAndGet()}"
+                files[token] = MegaFile(dl, size, aesKey, nonce)
+                println("WitAnimeDebug: Mega resolved token=$token size=${size / 1048576}MB ($label bucket)")
+
+                prewarm(token, dl)
+
+                return "http://127.0.0.1:${server.localPort}/v/$token.mp4"
+            }
+
+            println("WitAnimeDebug: Mega ALL BUCKETS DRAINED (${buckets.size} tried) — " +
+                "use the CF Bypass server, or wait for a reset")
+            null
         } catch (e: Exception) {
             println("WitAnimeDebug: Mega resolve fail: ${e.message}")
             null
         }
     }
 
+    /** returns seconds until the account's transfer window resets (0 = unknown) */
+    private suspend fun logQuotaReset(sid: String): Long {
+        try {
+            val body = """[{"a":"uq","xfer":1,"pro":1}]"""
+                .toRequestBody("application/json".toMediaType())
+            val res = app.post(
+                "https://g.api.mega.co.nz/cs?id=${seq.incrementAndGet()}&sid=$sid",
+                headers = mapOf("User-Agent" to EXTRACTOR_UA),
+                requestBody = body
+            ).text
+            val obj = (try { JSONArray(res) } catch (_: Exception) { null })?.optJSONObject(0) ?: return 0L
+            val bt = obj.optLong("bt", 0L)
+            val tar = obj.optLong("tar", 0L)
+            val tah = obj.optJSONArray("tah")
+            val used = tah?.let { a -> (0 until a.length()).sumOf { i -> a.optLong(i, 0L) } } ?: 0L
+            if (used < bt && tar > 0) return 0L
+
+            var add = true
+            var timeLeft = 3600L - (bt % 3600L)
+            if (tah != null) {
+                for (i in 0 until tah.length()) {
+                    if (tah.optLong(i, 0L) > 0L) add = false
+                    else if (add) timeLeft += 3600L
+                }
+            }
+            println("WitAnimeDebug: bucket resets in ~${timeLeft / 60} min " +
+                "(used=$used bt=$bt tar=$tar)")
+            return timeLeft
+        } catch (_: Exception) { return 0L }
+    }
+
+    /** prewarm first 1MB — instant player start, surfaces 509 early */
+    private fun prewarm(token: String, dl: String) {
+        Thread {
+            try {
+                val req = Request.Builder().url(dl)
+                    .header("Range", "bytes=0-1048575")
+                    .header("User-Agent", EXTRACTOR_UA)
+                    .build()
+                app.baseClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.byteStream() ?: return
+                        val bos = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(64 * 1024)
+                        var n: Int
+                        var total = 0
+                        while (body.read(buf).also { n = it } != -1 && total < 1_048_576) {
+                            bos.write(buf, 0, n); total += n
+                        }
+                        files[token]?.head = bos.toByteArray()
+                        println("WitAnimeDebug: Mega prewarmed ${bos.size()}B")
+                    } else if (resp.code == 509) {
+                        println("WitAnimeDebug: Mega CDN 509 — bandwidth limit at CDN")
+                    }
+                }
+            } catch (_: Exception) {}
+        }.apply { isDaemon = true; name = "MegaPrewarm" }.start()
+    }
+
     private fun handleClient(socket: Socket) {
         try {
-            // [!] REVERTED: v143 proven values (60s timeout, no custom client)
             socket.soTimeout = 60_000
             val input = BufferedReader(InputStreamReader(socket.getInputStream()))
             val output = socket.getOutputStream()
@@ -158,19 +300,41 @@ object MegaProxy {
             output.flush()
             if (parts[0].equals("HEAD", true)) return
 
-            // [!] REVERTED: v143 proven upstream call (app.baseClient + fixed UA)
+            // serve tiny probes instantly from the prewarmed head
+            val head = file.head
+            if (head != null && head.isNotEmpty() && start < head.size && end < head.size) {
+                try {
+                    val iv = ByteBuffer.allocate(16)
+                    iv.put(file.nonce)
+                    iv.putLong(start / 16)
+                    val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(file.aesKey, "AES"), IvParameterSpec(iv.array()))
+                    val skip = (start % 16).toInt()
+                    if (skip > 0) cipher.update(ByteArray(skip))
+                    val out = cipher.doFinal(head, start.toInt(), (end - start + 1).toInt())
+                    if (out != null && out.isNotEmpty()) {
+                        output.write(out)
+                        output.flush()
+                        return
+                    }
+                } catch (_: Exception) { }
+            }
+
             val req = Request.Builder().url(file.dlUrl)
                 .header("Range", "bytes=$start-$end")
                 .header("User-Agent", EXTRACTOR_UA)
                 .build()
             app.baseClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    println("WitAnimeDebug: MegaProxy upstream failed: ${resp.code}")
+                    if (resp.code == 509) {
+                        println("WitAnimeDebug: Mega CDN 509 — bandwidth limit (bucket empty)")
+                    } else {
+                        println("WitAnimeDebug: MegaProxy upstream failed: ${resp.code}")
+                    }
                     return
                 }
                 val body = resp.body?.byteStream() ?: return
 
-                // [!] REVERTED: v143 proven AES-CTR path (exact order, exact skip)
                 val iv = ByteBuffer.allocate(16)
                 iv.put(file.nonce)
                 iv.putLong(start / 16)
