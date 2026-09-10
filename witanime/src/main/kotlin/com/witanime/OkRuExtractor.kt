@@ -19,6 +19,32 @@ class OkRuExtractor : ExtractorApi() {
         "Origin" to "https://ok.ru",
     )
 
+    /** [v165] the ok.ru API returns 4-8 quality variants per server which floods
+     *  the player list — collect, sort by quality, keep the best 3 */
+    private fun emitCapped(
+        videos: JSONArray, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val candidates = ArrayList<Triple<String, String, Int>>()
+        for (i in 0 until videos.length()) {
+            val v = videos.optJSONObject(i) ?: continue
+            val u = v.optString("url")
+            if (u.isBlank()) continue
+            val full = if (u.startsWith("//")) "https:$u" else u
+            if (!full.startsWith("http")) continue
+            val vName = v.optString("name")
+            candidates.add(Triple("$name $vName", full, okruQuality(vName)))
+        }
+        candidates.sortByDescending { it.third }
+        candidates.take(3).forEach { (nm, full, q) ->
+            callback(newExtractorLink(name, nm, full, ExtractorLinkType.M3U8) {
+                this.referer = "https://ok.ru/"
+                this.headers = playbackHeaders
+                quality = q
+            })
+        }
+        return candidates.isNotEmpty()
+    }
+
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
@@ -55,21 +81,8 @@ class OkRuExtractor : ExtractorApi() {
                     if (json != null) {
                         val videos = json.optJSONArray("videos")
                         if (videos != null && videos.length() > 0) {
-                            for (i in 0 until videos.length()) {
-                                val v = videos.optJSONObject(i) ?: continue
-                                val u = v.optString("url")
-                                if (u.isBlank()) continue
-                                val full = if (u.startsWith("//")) "https:$u" else u
-                                if (!full.startsWith("http")) continue
-                                val vName = v.optString("name")
-                                println("WitAnimeDebug: OkRu API [$vName] -> ${full.take(90)}")
-                                callback(newExtractorLink(name, "$name $vName", full, ExtractorLinkType.M3U8) {
-                                    this.referer = "https://ok.ru/"
-                                    this.headers = playbackHeaders
-                                    quality = okruQuality(vName)
-                                })
-                                emitted = true
-                            }
+                            // [v165] capped at best 3
+                            emitted = emitCapped(videos, callback)
                         }
 
                         if (!emitted) {
@@ -86,19 +99,8 @@ class OkRuExtractor : ExtractorApi() {
                             val movie = json.optJSONObject("movie")
                             val movieVideos = movie?.optJSONArray("videos")
                             if (movieVideos != null) {
-                                for (i in 0 until movieVideos.length()) {
-                                    val v = movieVideos.optJSONObject(i) ?: continue
-                                    val u = v.optString("url")
-                                    if (u.isBlank()) continue
-                                    val full = if (u.startsWith("//")) "https:$u" else u
-                                    val vName = v.optString("name")
-                                    callback(newExtractorLink(name, "$name $vName", full, ExtractorLinkType.M3U8) {
-                                        this.referer = "https://ok.ru/"
-                                        this.headers = playbackHeaders
-                                        quality = okruQuality(vName)
-                                    })
-                                    emitted = true
-                                }
+                                // [v165] capped at best 3
+                                emitted = emitCapped(movieVideos, callback)
                             }
                         }
                     }
@@ -117,14 +119,14 @@ class OkRuExtractor : ExtractorApi() {
                 }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView intercept — 15s (reverted from 10s) ═══
+            // ═══ METHOD 3: WebView intercept — 15s ═══
             println("WitAnimeDebug: OkRu: trying WebView")
             try {
                 val resolver = WebViewResolver(
                     interceptUrl = Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8"""),
                     additionalUrls = listOf(Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8""")),
                     useOkhttp = false,
-                    timeout = 15_000L   // ⚡ REVERTED from 10s back to 15s
+                    timeout = 15_000L
                 )
                 val wvResp = app.get(url, referer = referer, interceptor = resolver)
                 val intercepted = wvResp.url
@@ -171,19 +173,8 @@ class OkRuExtractor : ExtractorApi() {
             if (videosStr != null) {
                 val videos = try { JSONArray(videosStr) } catch (_: Exception) { null }
                 if (videos != null && videos.length() > 0) {
-                    for (i in 0 until videos.length()) {
-                        val v = videos.optJSONObject(i) ?: continue
-                        val u = v.optString("url")
-                        if (u.isBlank()) continue
-                        val full = if (u.startsWith("//")) "https:$u" else u
-                        val vName = v.optString("name")
-                        callback(newExtractorLink(name, "$name $vName", full, ExtractorLinkType.M3U8) {
-                            this.referer = "https://ok.ru/"
-                            this.headers = playbackHeaders
-                            quality = okruQuality(vName)
-                        })
-                        emitted = true
-                    }
+                    // [v165] capped at best 3
+                    emitted = emitCapped(videos, callback)
                     if (emitted) return true
                 }
             }
