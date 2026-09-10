@@ -77,7 +77,6 @@ class KawaiiAnime : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
-        // pair is <data, name> → request.data holds the AniList sort enum
         val sort = request.data
         val vars = JSONObject().put("page", page).put("perPage", 30)
         val mediaQuery = if (sort == "RELEASING") {
@@ -102,12 +101,12 @@ class KawaiiAnime : MainAPI() {
         if (sort != "RELEASING") vars.put("sort", sort)
 
         val data = gql(mediaQuery, vars)
-            ?: return@withContext newHomePageResponse(newHomePageList(request.name, emptyList()), hasNext = false)
+            ?: return@withContext newHomePageResponse(HomePageList(request.name, emptyList()), hasNext = false)
         val pageData = data.optJSONObject("Page")
-            ?: return@withContext newHomePageResponse(newHomePageList(request.name, emptyList()), hasNext = false)
+            ?: return@withContext newHomePageResponse(HomePageList(request.name, emptyList()), hasNext = false)
         val media = pageData.optJSONArray("media") ?: JSONArray()
         val hasNext = pageData.optJSONObject("pageInfo")?.optBoolean("hasNextPage") ?: false
-        newHomePageResponse(newHomePageList(request.name, parseShows(media)), hasNext)
+        newHomePageResponse(HomePageList(request.name, parseShows(media)), hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
@@ -189,7 +188,7 @@ class KawaiiAnime : MainAPI() {
             this.plot = plot
             this.tags = genres
             this.year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it > 0 }
-            this.score = if (score > 0) score / 10.0 else null
+            this.score = if (score > 0) Score.from10(score / 10.0) else null
             this.showStatus = when (status) {
                 "FINISHED" -> ShowStatus.Completed
                 "RELEASING" -> ShowStatus.Ongoing
