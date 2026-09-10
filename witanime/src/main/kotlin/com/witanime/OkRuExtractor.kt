@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -19,9 +20,13 @@ class OkRuExtractor : ExtractorApi() {
         "Origin" to "https://ok.ru",
     )
 
-    /** [v167] cap the 4-8 quality variants at the best 3 — the ONLY change
-     *  from the version that worked. warm-up, timeouts, method order: all
-     *  restored to original. */
+    /** [v168] intercept regex that EXCLUDES the preview-image host —
+     *  iv.okcdn.ru/videoPreview is the poster thumbnail, not a stream.
+     *  the lookbehind makes iv.okcdn.ru not match, while vd.okcdn.ru,
+     *  videoPlayerCdn and any .m3u8 still do */
+    private val interceptRx = Regex("""(?<!iv\.)okcdn\.ru|videoPlayerCdn|\.m3u8""")
+
+    /** [v168] cap the 4-8 quality variants at the best 3 */
     private suspend fun emitCapped(
         videos: JSONArray, callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -70,13 +75,16 @@ class OkRuExtractor : ExtractorApi() {
 
             var emitted = false
 
-            // ═══ METHOD 1: Metadata API (warm-up RESTORED) ═══
+            // ═══ METHOD 1: Metadata API — [v168] fast-fail at 8s so a dead API
+            //     can't eat the route budget (was burning 15s+ on Read timeouts,
+            //     leaving the WebView zero time to run) ═══
             try {
                 app.get(url, headers = headers)
 
                 val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-                val apiResp = app.get(apiUrl, headers = headers)
-                val apiText = apiResp.text
+                val apiText = withTimeoutOrNull(8_000L) {
+                    app.get(apiUrl, headers = headers).text
+                } ?: ""
                 println("WitAnimeDebug: OkRu API len=${apiText.length}")
 
                 if (apiText.length > 100) {
@@ -113,25 +121,34 @@ class OkRuExtractor : ExtractorApi() {
 
             // ═══ METHOD 2: HTML scrape ═══
             try {
-                val html = app.get(url, headers = headers).text
+                val html = withTimeoutOrNull(8_000L) {
+                    app.get(url, headers = headers).text
+                } ?: ""
                 if (html.length > 500 && emitFromHtml(html, callback)) {
                     println("WitAnimeDebug: OkRu: HTML SUCCESS")
                     return
                 }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView intercept — 15s RESTORED ═══
+            // ═══ METHOD 3: WebView intercept — now actually gets time to run,
+            //     and no longer stops at the preview thumbnail ═══
             println("WitAnimeDebug: OkRu: trying WebView")
             try {
                 val resolver = WebViewResolver(
-                    interceptUrl = Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8"""),
-                    additionalUrls = listOf(Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8""")),
+                    interceptUrl = interceptRx,
+                    additionalUrls = listOf(interceptRx),
                     useOkhttp = false,
                     timeout = 15_000L
                 )
                 val wvResp = app.get(url, referer = referer, interceptor = resolver)
                 val intercepted = wvResp.url
                 println("WitAnimeDebug: OkRu WV=${intercepted.take(120)}")
+
+                // [v168] safety net — never accept the preview thumbnail as a stream
+                if (intercepted.contains("videoPreview")) {
+                    println("WitAnimeDebug: OkRu WV caught preview image, not a stream — rejecting")
+                    return
+                }
 
                 if (intercepted.isNotEmpty() && intercepted.contains("okcdn")) {
                     if (intercepted.contains("videoPlayerCdn") || intercepted.contains(".m3u8")) {
