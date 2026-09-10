@@ -30,8 +30,9 @@ class WitAnime : MainAPI() {
     private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
     companion object {
-        private const val LINK_CACHE_TTL = 15 * 60_000L
-        private const val LINK_CACHE_MAX = 8
+        // [v166] 45 minutes — prefetched next-episode links survive browsing
+        private const val LINK_CACHE_TTL = 45 * 60_000L
+        private const val LINK_CACHE_MAX = 12
         private const val STORE_FILE = "wita_link_cache.json"
 
         private class CachedLinks(val links: List<ExtractorLink>, val subs: List<SubtitleFile>, val ts: Long)
@@ -206,11 +207,8 @@ class WitAnime : MainAPI() {
     private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
         // [v159] three-level strategy:
         //   1. cookie+UA replay  (only when replay works or is unknown)
-        //   2. PLAIN request     (ALWAYS — it's the fast lane when the cookie is poison)
+        //   2. PLAIN request     (ALWAYS — the fast lane when the cookie is poison)
         //   3. WebView render    (only when BOTH okhttp paths are challenged)
-        // v158's bug: "replay known bad" skipped ALL okhttp, so a stale cookie
-        // (e.g. earned under WARP, spent from real IP) sent every page to the
-        // renderer forever — even on clean IPs where plain passes in 0.5s.
         val replayKnownBad = WitaWeb.replayWorks() == false
 
         if (!replayKnownBad) {
@@ -226,15 +224,12 @@ class WitAnime : MainAPI() {
             }
         }
 
-        // attempt 2: PLAIN — always attempted, this is the fix
+        // attempt 2: PLAIN — always attempted
         val plain = try {
             app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
         } catch (_: Exception) { null }
         if (plain != null && plain.isNotBlank() && !WitaWeb.looksChallenge(plain)) {
             if (!replayKnownBad) {
-                // cookie replay failed while plain works → the clearance is stale
-                // (usually from an IP change). expire it so nothing keeps sending
-                // poison, and remember: plain is the fast lane now.
                 WitaWeb.setReplayWorks(false)
                 WitaWeb.expireClearance(url)
             }
@@ -242,7 +237,6 @@ class WitAnime : MainAPI() {
         }
 
         if (plain == null && replayKnownBad) {
-            // no response at all — one brief retry before the renderer
             delay(400)
             val retry = try {
                 app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
@@ -366,6 +360,8 @@ class WitAnime : MainAPI() {
                             }
                         }
 
+                        // [v166] prefetch the first episode immediately —
+                        // by the time you tap it, links are already cached
                         val first = epUrls.firstOrNull()
                         if (first != null && linkCache[first] == null && !inFlight.containsKey(first)) {
                             schedulePrefetch(first, forceFirst = first)
@@ -388,6 +384,8 @@ class WitAnime : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ensureStoreLoaded()
 
+        // [v166] cache hit = the whole reason this exists: when you open the
+        // NEXT episode after a prefetch, links deliver instantly from RAM/disk
         if (deliverCached(data, subtitleCallback, callback)) {
             schedulePrefetch(data)
             return true
@@ -418,30 +416,38 @@ class WitAnime : MainAPI() {
         return false
     }
 
+    // [v166] deep prefetch: next TWO episodes warm in the background
     private fun schedulePrefetch(currentUrl: String, forceFirst: String? = null) {
-        if (inFlight.size > 4) return
+        if (inFlight.size > 6) return
         val next = forceFirst ?: nextEpMap[currentUrl] ?: return
-        val c = linkCache[next]
+        prefetchOne(next)
+        // also warm the episode after next — by the time you finish one
+        // episode, TWO ahead are already resolved and cached
+        nextEpMap[next]?.let { nextNext -> prefetchOne(nextNext) }
+    }
+
+    private fun prefetchOne(epUrl: String) {
+        val c = linkCache[epUrl]
         if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return
-        if (inFlight.containsKey(next)) return
-        WitaLog.d("prefetch START $next")
+        if (inFlight.containsKey(epUrl)) return
+        WitaLog.d("prefetch START $epUrl")
         val job = bgScope.launch {
             try {
                 val subs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
-                val links = extractLinks(next, { subs.add(it) }, {}, silent = true)
+                val links = extractLinks(epUrl, { subs.add(it) }, {}, silent = true)
                 if (links.isNotEmpty()) {
-                    putCache(next, links, subs.toList())
-                    WitaLog.d("prefetched ${links.size} links ($next)")
+                    putCache(epUrl, links, subs.toList())
+                    WitaLog.d("prefetched ${links.size} links ($epUrl)")
                 } else {
-                    WitaLog.d("prefetch EMPTY ($next) — will full-load on open")
+                    WitaLog.d("prefetch EMPTY ($epUrl) — will full-load on open")
                 }
             } catch (e: Exception) {
                 WitaLog.e("prefetch error: ${e.message}")
             } finally {
-                inFlight.remove(next)
+                inFlight.remove(epUrl)
             }
         }
-        inFlight[next] = job
+        inFlight[epUrl] = job
     }
 
     private suspend fun extractLinks(
@@ -547,7 +553,7 @@ class WitAnime : MainAPI() {
                     if (link.isNotBlank()) {
                         val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
                             "$link&apiKey=$FRAMEWORK_HASH" else link
-                        withTimeoutOrNull(20_000) {
+                        withTimeoutOrNull(25_000) {
                             routeLink(finalLink, data, subtitleCallback, mkAt(idx, idx * 1000L))
                         } ?: WitaLog.d("[$label] TIMEOUT")
                     }
@@ -566,6 +572,23 @@ class WitAnime : MainAPI() {
             val produced = HashMap<Int, Int>()
             synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
             val toRetry = servers.mapIndexed { i, s -> i to s }.filter { (produced[it.first] ?: 0) == 0 }
+
+            // [v165] WAVE 1: emit everything pass-1 produced RIGHT NOW — the
+            // player gets the fast servers' links in seconds while slow
+            // WebView servers keep grinding in the background
+            val emittedUrls = HashSet<String>()
+            fun emitWave() {
+                val ordered = synchronized(collected) { collected.toList() }
+                    .filter { emittedUrls.add(it.link.url) }
+                    .sortedWith(
+                        compareBy<Entry> { it.order }
+                            .thenByDescending { it.link.quality }
+                            .thenBy { it.link.name }
+                    )
+                ordered.forEach { callback(it.link) }
+            }
+            emitWave()
+
             if (toRetry.isNotEmpty()) {
                 supervisorScope {
                     toRetry.mapIndexed { j, (i, server) ->
@@ -599,17 +622,9 @@ class WitAnime : MainAPI() {
                 }.awaitAll()
             }
 
-            val seenUrls = HashSet<String>()
-            val ordered = synchronized(collected) { collected.toList() }
-                .filter { seenUrls.add(it.link.url) }
-                .sortedWith(
-                    compareBy<Entry> { it.order }
-                        .thenByDescending { it.link.quality }
-                        .thenBy { it.link.name }
-                )
-            WitaLog.d("emitting ${ordered.size} links (sorted, deduped)")
-            ordered.forEach { callback(it.link) }
-            ordered.map { it.link }
+            // [v165] WAVE 2: late arrivals (retries + download links) appended
+            emitWave()
+            synchronized(collected) { collected.toList() }.map { it.link }
         } catch (e: Exception) { logError(e); emptyList() }
     }
 
@@ -643,8 +658,7 @@ class WitAnime : MainAPI() {
             host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
             host.contains("mediafire") -> { }
-            // [v159] workupload is a download host with its own human puzzle —
-            // WebView-scraping it burns 15s per link for nothing
+            // [v159] workupload is a download host with its own human puzzle
             host.contains("workupload") -> { }
             isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
