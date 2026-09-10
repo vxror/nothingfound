@@ -23,15 +23,14 @@ object MegaProxy {
     private val files = ConcurrentHashMap<String, MegaFile>()
     private val seq = AtomicInteger(0)
 
-    // [v163 FINAL] BUCKET POOL — every entry is a mega quota bucket, walked in
-    // order with automatic failover. capture each sid from a logged-in browser
-    // session: mega.nz → devtools → any g.api.mega.co.nz/cs request → copy
-    // the sid= value. "" = the anonymous per-IP bucket, always tried last.
-    //
-    // HONEST CEILING: more sids = more buckets, NOT premium. utype lives in
-    // mega's payment database and no request can change it. a PREMIUM sid
-    // pasted into this list inherits Pro bandwidth instantly — the pool is
-    // premium-ready; the accounts are what they are.
+    // [v164] BUCKET POOL — every entry is a mega quota bucket, walked with
+    // automatic failover. capture each sid from a logged-in browser session:
+    // mega.nz → devtools → any g.api.mega.co.nz/cs request → copy sid=.
+    // "" (empty) = the anonymous per-IP bucket, always tried last.
+    // MORE BUCKETS ≠ PREMIUM: utype lives in mega's payment database. a
+    // PREMIUM sid pasted here inherits Pro bandwidth instantly.
+    // WARP NOTE: a WARP connection = a different IP = a fresh anonymous
+    // bucket. toggling WARP off/on mints a new bucket on demand.
     private val MEGA_SIDS = listOf(
         "HNarUZNXSv6yQQE_zH5PNTBxeV83aDV3N1ZnnUeH5KE4IZv9W2B7nFSCwA",
         "4Ifv50LOUzGvZXEyl3zf31FyZ2lNWkx3ZC0wShSSNY8wTt6VUnF1MdQjqg",
@@ -94,6 +93,7 @@ object MegaProxy {
         val iterator = files.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
+            // 30-minute TTL to free RAM
             if (now - entry.value.createdAt > 1_800_000) {
                 iterator.remove()
             }
@@ -150,6 +150,7 @@ object MegaProxy {
                 }
                 if (errCode != null) {
                     when (errCode) {
+                        // quota family → log, cooldown, failover to next bucket
                         -17, -18, -24 -> {
                             val resetSecs = if (sid.isNotBlank()) logQuotaReset(sid) else 0L
                             println("WitAnimeDebug: Mega quota dead ($label bucket, " +
@@ -168,7 +169,7 @@ object MegaProxy {
 
                 val obj = arr.optJSONObject(0) ?: continue
 
-                // mega sometimes answers 200 with "tl" = seconds until reset
+                // mega sometimes answers 200 with "tl" = seconds until quota resets
                 val timeLeft = obj.optLong("tl", 0L)
                 if (timeLeft > 0) {
                     println("WitAnimeDebug: Mega free limit ($label) — resets in " +
@@ -194,7 +195,7 @@ object MegaProxy {
             }
 
             println("WitAnimeDebug: Mega ALL BUCKETS DRAINED (${buckets.size} tried) — " +
-                "use the CF Bypass server, or wait for a reset")
+                "toggle WARP off/on for a fresh IP bucket, or use the CF Bypass server")
             null
         } catch (e: Exception) {
             println("WitAnimeDebug: Mega resolve fail: ${e.message}")
@@ -243,7 +244,10 @@ object MegaProxy {
                     .build()
                 app.baseClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
-                        val body = resp.body?.byteStream() ?: return
+                        // [v164 FIX] labeled return — a bare `return` here is
+                        // prohibited (inside use{} nested in the non-inline
+                        // Thread lambda). return@use exits just this block.
+                        val body = resp.body?.byteStream() ?: return@use
                         val bos = java.io.ByteArrayOutputStream()
                         val buf = ByteArray(64 * 1024)
                         var n: Int
