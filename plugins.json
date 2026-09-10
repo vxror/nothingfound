@@ -43,11 +43,17 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "en",
-    "authors": ["vxror"],
-    "tvTypes": ["Anime"],
+    "authors": [
+      "vxror"
+    ],
+    "tvTypes": [
+      "Anime"
+    ],
     "version": 1,
     "internalName": "KawaiiAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Kawaii.cs3",
-    "name": "KawaiiAnime"
-}
+    "name": "KawaiiAnime",
+    "fileSize": 18341,
+    "fileHash": "sha256-8034dfd36c5da7f53666fe7ed5f8421027f60689c81a0b4a5e7cfe1b91fa74b3"
+  }
 ]
