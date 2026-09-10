@@ -7,7 +7,7 @@ buildscript {
     repositories { google(); mavenCentral(); maven("https://jitpack.io") }
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:master-aster-aster-32895aedb6-1")
+        classpath("com.github.recloudstream:gradle:81b1d424d2")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
     }
     
