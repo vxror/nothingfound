@@ -21,7 +21,7 @@ class OkRuExtractor : ExtractorApi() {
 
     /** [v165] the ok.ru API returns 4-8 quality variants per server which floods
      *  the player list — collect, sort by quality, keep the best 3 */
-    private fun emitCapped(
+    private suspend fun emitCapped(
         videos: JSONArray, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val candidates = ArrayList<Triple<String, String, Int>>()
