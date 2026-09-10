@@ -22,7 +22,7 @@ jobs:
           # [v170] polls the EXACT version the classpath requests (-SNAPSHOT).
           # the old warm-up checked 81b1d424d2 while gradle asked for -SNAPSHOT —
           # armor on the wrong door. verified live: builds resolve through it.
-          V="-SNAPSHOT"
+          V="-32895aedb6-1"
           URL="https://jitpack.io/com/github/recloudstream/gradle/$V/gradle-$V.pom"
           echo "checking JitPack for com.github.recloudstream:gradle:$V ..."
           for i in $(seq 1 40); do
