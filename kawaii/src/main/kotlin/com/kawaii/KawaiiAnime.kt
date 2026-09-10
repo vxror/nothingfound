@@ -4,8 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -22,7 +20,6 @@ class KawaiiAnime : MainAPI() {
     companion object {
         private const val ANILIST_GQL = "https://graphql.anilist.co"
 
-        // video-cache API chain — new domain first, proven legacy fallback
         private val API_BASES = listOf(
             "https://kawaiianime.cc",
             "https://kawaii-anime.com"
@@ -32,8 +29,6 @@ class KawaiiAnime : MainAPI() {
     }
 
     private fun log(msg: String) { println("KawaiiDebug: $msg") }
-
-    // ── AniList GraphQL layer (the site's entire catalog) ──
 
     private suspend fun gql(query: String, variables: JSONObject = JSONObject()): JSONObject? {
         return try {
@@ -74,8 +69,6 @@ class KawaiiAnime : MainAPI() {
         return list
     }
 
-    // ── Main page: AniList sections ──
-
     override val mainPage = mainPageOf(
         "POPULARITY_DESC" to "Popular",
         "TRENDING_DESC" to "Trending",
@@ -84,7 +77,8 @@ class KawaiiAnime : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = withContext(Dispatchers.IO) {
-        val sort = request.name
+        // pair is <data, name> → request.data holds the AniList sort enum
+        val sort = request.data
         val vars = JSONObject().put("page", page).put("perPage", 30)
         val mediaQuery = if (sort == "RELEASING") {
             """query (${'$'}page: Int, ${'$'}perPage: Int) {
@@ -107,14 +101,14 @@ class KawaiiAnime : MainAPI() {
         }
         if (sort != "RELEASING") vars.put("sort", sort)
 
-        val data = gql(mediaQuery, vars) ?: return@withContext newHomePageResponse(emptyList(), hasNext = false)
-        val pageData = data.optJSONObject("Page") ?: return@withContext newHomePageResponse(emptyList(), hasNext = false)
+        val data = gql(mediaQuery, vars)
+            ?: return@withContext newHomePageResponse(newHomePageList(request.name, emptyList()), hasNext = false)
+        val pageData = data.optJSONObject("Page")
+            ?: return@withContext newHomePageResponse(newHomePageList(request.name, emptyList()), hasNext = false)
         val media = pageData.optJSONArray("media") ?: JSONArray()
         val hasNext = pageData.optJSONObject("pageInfo")?.optBoolean("hasNextPage") ?: false
-        newHomePageResponse(parseShows(media), hasNext = hasNext)
+        newHomePageResponse(newHomePageList(request.name, parseShows(media)), hasNext)
     }
-
-    // ── Search: AniList ──
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
@@ -129,8 +123,6 @@ class KawaiiAnime : MainAPI() {
         val media = data.optJSONObject("Page")?.optJSONArray("media") ?: return@withContext emptyList()
         parseShows(media)
     }
-
-    // ── Load: AniList details + episode generation ──
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val anilistId = url.trim().removePrefix("/").substringBefore('?').toIntOrNull()
@@ -177,7 +169,6 @@ class KawaiiAnime : MainAPI() {
             else -> media.optInt("episodes", 0)
         }
 
-        // episode titles from AniList streamingEpisodes when available
         val streamEps = media.optJSONArray("streamingEpisodes")
         fun epName(n: Int): String {
             val t = streamEps?.optJSONObject(n - 1)?.optString("title") ?: ""
@@ -198,7 +189,7 @@ class KawaiiAnime : MainAPI() {
             this.plot = plot
             this.tags = genres
             this.year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it > 0 }
-            this.rating = if (score > 0) score / 10.0 else null
+            this.score = if (score > 0) score / 10.0 else null
             this.showStatus = when (status) {
                 "FINISHED" -> ShowStatus.Completed
                 "RELEASING" -> ShowStatus.Ongoing
@@ -207,8 +198,6 @@ class KawaiiAnime : MainAPI() {
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
-
-    // ── loadLinks: the signed-URL chain ──
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -220,7 +209,6 @@ class KawaiiAnime : MainAPI() {
         val showId = parts[0]; val epNum = parts[1]
         val episodeId = "$showId-ep$epNum"
 
-        // ── 1. video-cache API (returns signed mp4 + subtitles) ──
         for (base in API_BASES) {
             try {
                 val res = app.get("$base/api/video-cache?episodeId=$episodeId",
@@ -235,7 +223,6 @@ class KawaiiAnime : MainAPI() {
                         quality = Qualities.Unknown.value
                         this.headers = mapOf("User-Agent" to UA)
                     })
-                    // subtitles ride along in the same response
                     json.optJSONArray("subtitles")?.let { subs ->
                         for (i in 0 until subs.length()) {
                             val s = subs.optJSONObject(i) ?: continue
@@ -249,7 +236,6 @@ class KawaiiAnime : MainAPI() {
             } catch (e: Exception) { log("video-cache fail $base: ${e.message}") }
         }
 
-        // ── 2. direct signed-URL fallback (works when the file is pre-cached) ──
         val direct = "$VIDEO_DIRECT/$episodeId"
         log("falling back to direct: $direct")
         callback(newExtractorLink(name, "Kawaii (Direct)", direct, ExtractorLinkType.VIDEO) {
@@ -258,7 +244,6 @@ class KawaiiAnime : MainAPI() {
             this.headers = mapOf("User-Agent" to UA)
         })
 
-        // ── 3. WebView intercept on the watch page (last resort) ──
         try {
             val rx = Regex("""video\.kawaii-anime\.com|downet\.net|\.mp4|\.m3u8""")
             val resolver = WebViewResolver(
