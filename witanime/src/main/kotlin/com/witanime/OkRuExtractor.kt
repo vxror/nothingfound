@@ -12,13 +12,16 @@ class OkRuExtractor : ExtractorApi() {
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
 
+    /** Playback headers — Origin is REQUIRED by ok.ru CDN for CORS */
     private val playbackHeaders = mapOf(
         "User-Agent" to EXTRACTOR_UA,
         "Referer" to "https://ok.ru/",
         "Origin" to "https://ok.ru",
     )
 
-    /** [v166] cap ok.ru's 4-8 quality variants at the best 3, with stage logging */
+    /** [v167] cap the 4-8 quality variants at the best 3 — the ONLY change
+     *  from the version that worked. warm-up, timeouts, method order: all
+     *  restored to original. */
     private suspend fun emitCapped(
         videos: JSONArray, callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -34,7 +37,7 @@ class OkRuExtractor : ExtractorApi() {
         }
         candidates.sortByDescending { it.third }
         val picked = candidates.take(3)
-        println("WitAnimeDebug: OkRu emitCapped — ${candidates.size} variants, emitting ${picked.size}")
+        println("WitAnimeDebug: OkRu emitCapped — ${candidates.size} found, emitting ${picked.size}")
         picked.forEach { (nm, full, q) ->
             callback(newExtractorLink(name, nm, full, ExtractorLinkType.M3U8) {
                 this.referer = "https://ok.ru/"
@@ -53,7 +56,7 @@ class OkRuExtractor : ExtractorApi() {
 
             val videoId = url.substringAfter("/videoembed/").substringAfter("/video/")
                 .substringBefore("/").substringBefore("?").trim()
-            if (videoId.isBlank()) { println("WitAnimeDebug: OkRu ABORT: no ID in url"); return }
+            if (videoId.isBlank()) { println("WitAnimeDebug: OkRu no ID"); return }
 
             val headers = mapOf(
                 "User-Agent" to EXTRACTOR_UA,
@@ -67,11 +70,14 @@ class OkRuExtractor : ExtractorApi() {
 
             var emitted = false
 
-            // ═══ METHOD 1: Metadata API (warm-up removed — saves 2-3s) ═══
+            // ═══ METHOD 1: Metadata API (warm-up RESTORED) ═══
             try {
+                app.get(url, headers = headers)
+
                 val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-                val apiText = app.get(apiUrl, headers = headers).text
-                println("WitAnimeDebug: OkRu M1 api len=${apiText.length}")
+                val apiResp = app.get(apiUrl, headers = headers)
+                val apiText = apiResp.text
+                println("WitAnimeDebug: OkRu API len=${apiText.length}")
 
                 if (apiText.length > 100) {
                     val json = try { JSONObject(apiText) } catch (_: Exception) { null }
@@ -80,50 +86,52 @@ class OkRuExtractor : ExtractorApi() {
                         if (videos != null && videos.length() > 0) {
                             emitted = emitCapped(videos, callback)
                         }
+
                         if (!emitted) {
                             val hls = json.optString("hlsManifestUrl")
                             if (hls.isNotBlank() && hls.startsWith("http")) {
-                                println("WitAnimeDebug: OkRu M1 hls -> ${hls.take(90)}")
+                                println("WitAnimeDebug: OkRu API hls -> ${hls.take(90)}")
                                 M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach {
                                     callback(it); emitted = true
                                 }
                             }
                         }
+
                         if (!emitted) {
-                            val movieVideos = json.optJSONObject("movie")?.optJSONArray("videos")
+                            val movie = json.optJSONObject("movie")
+                            val movieVideos = movie?.optJSONArray("videos")
                             if (movieVideos != null) {
                                 emitted = emitCapped(movieVideos, callback)
                             }
                         }
                     }
                 }
-                if (emitted) { println("WitAnimeDebug: OkRu M1 SUCCESS"); return }
-                println("WitAnimeDebug: OkRu M1 empty — falling to M2")
+                if (emitted) { println("WitAnimeDebug: OkRu: API SUCCESS"); return }
             } catch (e: Exception) {
-                println("WitAnimeDebug: OkRu M1 fail: ${e.message}")
+                println("WitAnimeDebug: OkRu API fail: ${e.message}")
             }
 
             // ═══ METHOD 2: HTML scrape ═══
             try {
                 val html = app.get(url, headers = headers).text
-                println("WitAnimeDebug: OkRu M2 html len=${html.length}")
                 if (html.length > 500 && emitFromHtml(html, callback)) {
-                    println("WitAnimeDebug: OkRu M2 SUCCESS")
+                    println("WitAnimeDebug: OkRu: HTML SUCCESS")
                     return
                 }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView intercept — 12s (was 15s, tightens the budget) ═══
-            println("WitAnimeDebug: OkRu M3 WebView")
+            // ═══ METHOD 3: WebView intercept — 15s RESTORED ═══
+            println("WitAnimeDebug: OkRu: trying WebView")
             try {
                 val resolver = WebViewResolver(
                     interceptUrl = Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8"""),
                     additionalUrls = listOf(Regex("""okcdn\.ru|videoPlayerCdn|\.m3u8""")),
                     useOkhttp = false,
-                    timeout = 12_000L
+                    timeout = 15_000L
                 )
-                val intercepted = app.get(url, referer = referer, interceptor = resolver).url
-                println("WitAnimeDebug: OkRu M3 WV=${intercepted.take(120)}")
+                val wvResp = app.get(url, referer = referer, interceptor = resolver)
+                val intercepted = wvResp.url
+                println("WitAnimeDebug: OkRu WV=${intercepted.take(120)}")
 
                 if (intercepted.isNotEmpty() && intercepted.contains("okcdn")) {
                     if (intercepted.contains("videoPlayerCdn") || intercepted.contains(".m3u8")) {
@@ -134,10 +142,10 @@ class OkRuExtractor : ExtractorApi() {
                             this.headers = playbackHeaders
                         })
                     }
-                    println("WitAnimeDebug: OkRu M3 SUCCESS")
+                    println("WitAnimeDebug: OkRu WV SUCCESS")
                 }
             } catch (e: Exception) {
-                println("WitAnimeDebug: OkRu M3 fail: ${e.message}")
+                println("WitAnimeDebug: OkRu WV fail: ${e.message}")
             }
         } catch (e: Exception) {
             println("WitAnimeDebug: OkRu error: ${e.message}")
