@@ -18,7 +18,7 @@ class MegaExtractor : ExtractorApi() {
         try {
             val local = MegaProxy.resolve(url)
             if (local != null) {
-                // [!] Name stays clean; the quality badge shows 720p/1080p automatically
+                // local proxy — walks the sid bucket pool with failover
                 callback(newExtractorLink(name, "Mega", local, ExtractorLinkType.VIDEO) {
                     quality = labelQuality(linkLabel)
                 })
@@ -28,6 +28,9 @@ class MegaExtractor : ExtractorApi() {
         }
 
         try {
+            // CF worker — the independent fallback bucket (different IP pool,
+            // no sid, no quota clock). always emitted so the user always has
+            // a second road when every local bucket is drained.
             val fixedUrl = url.replace("/embed/", "/file/")
             val standardBase64 = Base64.encodeToString(fixedUrl.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             val cfWorkerLink = "https://mega.wldbs.workers.dev/download?url=$standardBase64"
