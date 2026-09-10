@@ -36,5 +36,18 @@
     "name": "WitAnime",
     "fileSize": 162026,
     "fileHash": "sha256-9ae45248405caf5d1345bb3e6d2eec7b59b4527b1973b2a375e2de15fbc9734f"
-  }
+  },
+  {
+    "iconUrl": "https://kawaiianime.cc/favicon.png",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/vxror/nothingfound",
+    "status": 1,
+    "language": "en",
+    "authors": ["vxror"],
+    "tvTypes": ["Anime"],
+    "version": 1,
+    "internalName": "KawaiiAnime",
+    "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Kawaii.cs3",
+    "name": "KawaiiAnime"
+}
 ]
