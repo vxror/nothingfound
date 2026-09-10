@@ -19,7 +19,10 @@ jobs:
           distribution: 'temurin'
       - name: Warm JitPack Cloudstream plugin
         run: |
-          V="81b1d424d2"
+          # [v170] polls the EXACT version the classpath requests (-SNAPSHOT).
+          # the old warm-up checked 81b1d424d2 while gradle asked for -SNAPSHOT —
+          # armor on the wrong door. verified live: builds resolve through it.
+          V="-SNAPSHOT"
           URL="https://jitpack.io/com/github/recloudstream/gradle/$V/gradle-$V.pom"
           echo "checking JitPack for com.github.recloudstream:gradle:$V ..."
           for i in $(seq 1 40); do
@@ -31,7 +34,7 @@ jobs:
             echo "  not ready yet (HTTP $CODE), attempt $i/40 — waiting 20s ..."
             sleep 20
           done
-          echo "warning: JitPack still not serving the artifact after ~13 min"
+          echo "warning: JitPack still not serving $V after ~13 min"
           echo "gradle will try anyway; if it fails, the JitPack build itself is broken"
       - name: Build All
         run: |
@@ -50,16 +53,17 @@ jobs:
       - name: Copy All Extensions
         run: |
           mkdir -p build
-          rm -f build/Animewitcher.cs3 build/witanime.cs3 build/vxrux.cs3
+          rm -f build/Animewitcher.cs3 build/witanime.cs3 build/vxrux.cs3 build/Kawaii.cs3
           cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
           cp witanime/build/*.cs3 build/witanime.cs3 2>/dev/null || true
+          cp kawaii/build/*.cs3 build/Kawaii.cs3 2>/dev/null || true
           ls -la build/
       - name: Update plugins.json
         run: |
           python3 - <<'EOF'
           import json, os, hashlib, urllib.parse
 
-          PLUGINS_JSON = 'plugins.json'   # change if yours lives elsewhere
+          PLUGINS_JSON = 'plugins.json'
           BUILD_DIR = 'build'
 
           if not os.path.exists(PLUGINS_JSON):
