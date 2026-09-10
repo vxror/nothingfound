@@ -46,6 +46,7 @@ subprojects {
             "animewitcher" -> "com.animewitcher"
             "witanime" -> "com.witanime"
             "vxrux" -> "com.vxrux"
+            "kawaii" -> "com.kawaii"
             else -> "com.witanime"
         }
         defaultConfig {
@@ -54,14 +55,14 @@ subprojects {
             targetSdk = 35
         }
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_11   // was 1_8
-            targetCompatibility = JavaVersion.VERSION_11   // was 1_8
+            sourceCompatibility = JavaVersion.VERSION_11
+            targetCompatibility = JavaVersion.VERSION_11
         }
     }
 
     tasks.withType<KotlinCompile>().configureEach {
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_11)                // was JVM_1_8
+            jvmTarget.set(JvmTarget.JVM_11)
             freeCompilerArgs.addAll(
                 "-Xno-call-assertions",
                 "-Xno-param-assertions",
