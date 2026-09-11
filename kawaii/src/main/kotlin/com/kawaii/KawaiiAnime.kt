@@ -53,16 +53,15 @@ class KawaiiAnime : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9"
     )
 
-    // ── RSC parser (unchanged) ────────────────────────────────────
+    // ── RSC parser ────────────────────────────────────────────────
 
     private fun extractRscRows(html: String): Map<String, Any> {
         val stream = StringBuilder()
         val chunkRx = Regex("""self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)""")
-        var chunks = 0
         chunkRx.findAll(html).forEach { m ->
             try {
                 val unescaped = JSONObject("{\"s\":\"${m.groupValues[1]}\"}").optString("s")
-                stream.append(unescaped).append('\n'); chunks++
+                stream.append(unescaped).append('\n')
             } catch (_: Exception) {}
         }
         val rows = HashMap<String, Any>()
@@ -208,7 +207,6 @@ class KawaiiAnime : MainAPI() {
             if (found.isEmpty()) return false
             homeSections.clear(); homeSections.putAll(found)
             homeFetchedAt = System.currentTimeMillis()
-            log("home cached: ${homeSections.size} sections, ${mediaCache.size} media")
             true
         } catch (e: Exception) { logErr("home", e); false }
     }
@@ -229,53 +227,50 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
-    // ── Search — RSC → /api/anilist GraphQL proxy → home cache ───
+    // ── Search: proxy → RSC → cache ───────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         log("search: '$query'")
 
-        // 1. try server-side AniList GraphQL proxy at /api/anilist
+        // 1. site's AniList GraphQL proxy
         try {
-            val gqlBody = JSONObject()
+            val body = JSONObject()
                 .put("query", """query (${'$'}search: String) {
                     Page(page: 1, perPage: 40) {
                         media(type: ANIME, search: ${'$'}search, sort: SEARCH_MATCH, isAdult: false) {
-                            id title { romaji english native } coverImage { extraLarge large } startDate { year } format status episodes
+                            id title { romaji english native } coverImage { extraLarge large } format status episodes seasonYear
                         }
                     }
                 }""")
                 .put("variables", JSONObject().put("search", query))
-                .toString()
-                .toRequestBody("application/json".toMediaType())
+                .toString().toRequestBody("application/json".toMediaType())
 
-            for (endpoint in listOf("$mainUrl/api/anilist", "$mainUrl/api/graphql", "$mainUrl/api/proxy/anilist")) {
-                try {
-                    val res = app.post(endpoint, requestBody = gqlBody, headers = mapOf(
-                        "User-Agent" to UA,
-                        "Accept" to "application/json",
-                        "Content-Type" to "application/json",
-                        "Origin" to mainUrl,
-                        "Referer" to "$mainUrl/"
-                    ))
-                    log("search[proxy] $endpoint -> HTTP ${res.code} len=${res.text.length}")
-                    if (!res.isSuccessful) continue
-                    val json = JSONObject(res.text)
-                    val data = json.optJSONObject("data") ?: json
-                    val arr = data.optJSONObject("Page")?.optJSONArray("media")
-                        ?: data.optJSONArray("media")
-                        ?: continue
+            val res = app.post("$mainUrl/api/anilist", requestBody = body, headers = mapOf(
+                "User-Agent" to UA,
+                "Accept" to "application/json",
+                "Content-Type" to "application/json",
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/"
+            ))
+            log("search[proxy] HTTP ${res.code} len=${res.text.length}")
+            if (res.isSuccessful && res.text.length > 200) {
+                val arr = JSONObject(res.text).optJSONObject("data")
+                    ?.optJSONObject("Page")?.optJSONArray("media")
+                if (arr != null) {
                     val out = ArrayList<SearchResponse>()
                     for (i in 0 until arr.length()) {
                         val m = arr.optJSONObject(i) ?: continue
                         mediaToShow(m)?.let { out.add(it) }
                     }
                     if (out.isNotEmpty()) { log("search[proxy] -> ${out.size}"); return@withContext out }
-                } catch (e: Exception) { logErr("search[proxy] $endpoint", e) }
+                }
+            } else if (res.text.length <= 200) {
+                log("search[proxy] tiny body: ${res.text.take(120)}")
             }
-        } catch (e: Exception) { logErr("search[proxy] init", e) }
+        } catch (e: Exception) { logErr("search proxy", e) }
 
-        // 2. try the search page RSC
+        // 2. search page RSC
         try {
             val enc = URLEncoder.encode(query, "UTF-8")
             val html = app.get("$mainUrl/search?q=$enc", headers = headers()).text
@@ -296,35 +291,39 @@ class KawaiiAnime : MainAPI() {
             }
         } catch (e: Exception) { logErr("search rsc", e) }
 
-        // 3. home-cache substring fallback
-        try {
-            ensureHomeCache()
-            val needle = query.lowercase().trim()
-            val tokens = needle.split(Regex("\\s+")).filter { it.length >= 2 }
-            val out = ArrayList<SearchResponse>()
-            val seen = HashSet<Int>()
-            for (m in mediaCache.values) {
-                val t = m.optJSONObject("title") ?: continue
-                val candidates = listOf(
-                    t.optString("english"), t.optString("romaji"), t.optString("native")
-                ).filter { it.isNotBlank() }.map { it.lowercase() }
-                // match if any token appears in any title
-                val hit = tokens.isNotEmpty() && candidates.any { c ->
-                    tokens.all { tok -> c.contains(tok) } || tokens.any { tok -> c.contains(tok) }
-                }
-                if (!hit) continue
-                val id = m.optInt("id", 0)
-                if (id <= 0 || !seen.add(id)) continue
-                mediaToShow(m)?.let { out.add(it) }
+        // 3. home-cache fallback
+        ensureHomeCache()
+        val tokens = query.lowercase().trim().split(Regex("\\s+")).filter { it.length >= 2 }
+        val out = ArrayList<SearchResponse>()
+        val seen = HashSet<Int>()
+        for (m in mediaCache.values) {
+            val t = m.optJSONObject("title") ?: continue
+            val titles = listOf(t.optString("english"), t.optString("romaji"), t.optString("native"))
+                .filter { it.isNotBlank() }.map { it.lowercase() }
+            val hit = tokens.isNotEmpty() && titles.any { ti ->
+                tokens.all { tok -> ti.contains(tok) } || tokens.any { tok -> ti.contains(tok) }
             }
-            log("search[cache] -> ${out.size}")
-            out
-        } catch (e: Exception) { logErr("search cache", e); emptyList() }
+            if (!hit) continue
+            val id = m.optInt("id", 0)
+            if (id <= 0 || !seen.add(id)) continue
+            mediaToShow(m)?.let { out.add(it) }
+        }
+        log("search[cache] -> ${out.size}")
+        out
     }
+
+    // ── Load: cache → RSC → /api/anilist fallback ─────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val id = extractId(url) ?: throw ErrorLoadingException("bad id: $url")
-        mediaCache[id.toString()]?.let { return@withContext buildLoadResponse(it, id) }
+        log("load id=$id")
+
+        mediaCache[id.toString()]?.let {
+            log("load id=$id from cache")
+            return@withContext buildLoadResponse(it, id)
+        }
+
+        // RSC from /anime/{id}
         try {
             val html = app.get("$mainUrl/anime/$id", headers = headers()).text
             val rows = extractRscRows(html)
@@ -335,44 +334,66 @@ class KawaiiAnime : MainAPI() {
                 if (m != null) { media = m; break@outer }
             }
             if (media != null) {
+                log("load id=$id from RSC")
                 mediaCache[id.toString()] = media
                 return@withContext buildLoadResponse(media, id)
             }
-        } catch (e: Exception) { logErr("detail", e) }
+        } catch (e: Exception) { logErr("load rsc", e) }
+
+        // fallback: site's AniList proxy
+        try {
+            val body = JSONObject()
+                .put("query", """query (${'$'}id: Int) {
+                    Media(id: ${'$'}id, type: ANIME) {
+                        id title { romaji english native } description(asHtml: false)
+                        coverImage { extraLarge large } bannerImage genres format status episodes
+                        duration season seasonYear averageScore nextAiringEpisode { episode }
+                    }
+                }""")
+                .put("variables", JSONObject().put("id", id))
+                .toString().toRequestBody("application/json".toMediaType())
+            val res = app.post("$mainUrl/api/anilist", requestBody = body, headers = mapOf(
+                "User-Agent" to UA, "Accept" to "application/json",
+                "Content-Type" to "application/json",
+                "Origin" to mainUrl, "Referer" to "$mainUrl/"
+            ))
+            log("load[proxy] HTTP ${res.code} len=${res.text.length}")
+            if (res.isSuccessful) {
+                val m = JSONObject(res.text).optJSONObject("data")?.optJSONObject("Media")
+                if (m != null) {
+                    mediaCache[id.toString()] = m
+                    return@withContext buildLoadResponse(m, id)
+                }
+            }
+        } catch (e: Exception) { logErr("load proxy", e) }
+
         throw ErrorLoadingException("couldn't load anime $id")
     }
 
-    // ── Translation ──────────────────────────────────────────────
+    // ── Translate via site's own endpoint ─────────────────────────
 
-    private suspend fun translateToAr(text: String): String {
+    private suspend fun translateToAr(text: String, id: Int): String {
         if (text.isBlank()) return text
         translationCache[text]?.let { return it }
-
-        // Google Translate free endpoint. Response is [[["translated","src",...], ...], ...]
-        val truncated = if (text.length > 4500) text.substring(0, 4500) else text
         try {
-            val enc = URLEncoder.encode(truncated, "UTF-8")
-            val url = "https://translate.googleapis.com/translate_a/single" +
-                    "?client=gtx&sl=en&tl=ar&dt=t&q=$enc"
+            val enc = URLEncoder.encode(text, "UTF-8")
+            val url = "$mainUrl/api/translate-description?id=$id&text=$enc"
             val res = app.get(url, headers = mapOf(
                 "User-Agent" to UA,
-                "Accept" to "application/json"
+                "Accept" to "*/*",
+                "Referer" to "$mainUrl/",
+                "Origin" to mainUrl
             ))
-            if (!res.isSuccessful) return text
-            val arr = JSONArray(res.text)
-            val outer = arr.optJSONArray(0) ?: return text
-            val sb = StringBuilder()
-            for (i in 0 until outer.length()) {
-                val chunk = outer.optJSONArray(i) ?: continue
-                val part = chunk.optString(0, "")
-                if (part.isNotEmpty()) sb.append(part)
+            log("translate HTTP ${res.code} len=${res.text.length}")
+            if (res.isSuccessful) {
+                val ar = JSONObject(res.text).optString("arabic")
+                if (ar.isNotBlank()) {
+                    translationCache[text] = ar
+                    return ar
+                }
             }
-            val result = sb.toString().ifBlank { return text }
-            translationCache[text] = result
-            result
-        } catch (e: Exception) {
-            logErr("translate", e); text
-        }
+        } catch (e: Exception) { logErr("translate", e) }
+        return text
     }
 
     private suspend fun buildLoadResponse(m: JSONObject, id: Int): LoadResponse {
@@ -384,7 +405,7 @@ class KawaiiAnime : MainAPI() {
         val cover = cObj?.optString("extraLarge")?.ifEmpty { cObj.optString("large") } ?: ""
         val banner = m.optString("bannerImage").ifEmpty { null }
         val plotEn = stripHtml(m.optString("description"))
-        val plot = if (plotEn.isNotBlank()) translateToAr(plotEn) else plotEn
+        val plot = if (plotEn.isNotBlank()) translateToAr(plotEn, id) else plotEn
         val genres = m.optJSONArray("genres")?.let { g ->
             (0 until g.length()).map { g.optString(it) }.filter { it.isNotBlank() }
         } ?: emptyList()
@@ -427,6 +448,8 @@ class KawaiiAnime : MainAPI() {
             .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
+    // ── loadLinks ─────────────────────────────────────────────────
+
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -436,21 +459,19 @@ class KawaiiAnime : MainAPI() {
         if (parts.size < 2) return@withContext false
         val showId = extractId(parts[0])?.toString() ?: return@withContext false
         val epNum = parts[1]
-        log("loadLinks: showId=$showId ep=$epNum")
 
         for (attempt in 1..2) {
             try {
-                val apiUrl = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
-                val res = app.get(apiUrl, headers = mapOf(
-                    "User-Agent" to UA, "Referer" to "$mainUrl/",
-                    "Accept" to "*/*", "Origin" to mainUrl
-                ))
+                val res = app.get("$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub",
+                    headers = mapOf(
+                        "User-Agent" to UA, "Referer" to "$mainUrl/",
+                        "Accept" to "*/*", "Origin" to mainUrl
+                    ))
                 if (!res.isSuccessful) continue
                 val root = JSONObject(res.text)
                 val d = root.optJSONObject("data") ?: root
                 val ref = d.optJSONObject("headers")?.optString("Referer")
                     ?.ifBlank { null } ?: "$mainUrl/"
-
                 var emitted = 0
                 d.optJSONArray("sources")?.let { srcs ->
                     for (i in 0 until srcs.length()) {
@@ -462,8 +483,7 @@ class KawaiiAnime : MainAPI() {
                             ?: Qualities.Unknown.value
                         callback(newExtractorLink(name, "Kawaii", u,
                             if (m3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            this.referer = ref
-                            this.quality = q
+                            this.referer = ref; this.quality = q
                             this.headers = mapOf("User-Agent" to UA, "Referer" to ref, "Origin" to mainUrl)
                         })
                         emitted++
@@ -477,11 +497,11 @@ class KawaiiAnime : MainAPI() {
                     }
                 }
                 if (emitted > 0) return@withContext true
-            } catch (e: Exception) { logErr("miruro[$attempt]", e) }
+            } catch (_: Exception) {}
         }
 
-        val direct = "$VIDEO_HOST/video/$showId-ep$epNum"
-        callback(newExtractorLink(name, "Kawaii (Direct)", direct, ExtractorLinkType.VIDEO) {
+        callback(newExtractorLink(name, "Kawaii (Direct)",
+            "$VIDEO_HOST/video/$showId-ep$epNum", ExtractorLinkType.VIDEO) {
             this.referer = "$mainUrl/"
             quality = Qualities.Unknown.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
