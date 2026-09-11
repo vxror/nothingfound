@@ -44,7 +44,7 @@ class KawaiiAnime : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9"
     )
 
-    // ── RSC parser ────────────────────────────────────────────────
+    // ── RSC extraction ────────────────────────────────────────────
 
     private fun extractRscRows(html: String): Map<String, Any> {
         val stream = StringBuilder()
@@ -79,11 +79,12 @@ class KawaiiAnime : MainAPI() {
         return rows
     }
 
+    /** Resolve $N references recursively. */
     private fun resolve(v: Any?, rows: Map<String, Any>, depth: Int = 0): Any? {
         if (depth > 25 || v == null) return v
         return when (v) {
             is String -> {
-                if (v.startsWith("$") && v.length > 1 && v[1] != '"') {
+                if (v.startsWith("$") && v.length > 1 && v[1] != '"' && v[1] != 'L') {
                     val t = rows[v.substring(1)] ?: return v
                     resolve(t, rows, depth + 1)
                 } else v
@@ -100,6 +101,65 @@ class KawaiiAnime : MainAPI() {
             }
             else -> v
         }
+    }
+
+    /** Recursively search any JSON structure for the first JSONObject matching pred. */
+    private fun deepFind(root: Any?, pred: (JSONObject) -> Boolean, depth: Int = 0): JSONObject? {
+        if (depth > 30 || root == null) return null
+        return when (root) {
+            is JSONObject -> {
+                if (pred(root)) return root
+                val keys = root.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    deepFind(root.opt(k), pred, depth + 1)?.let { return it }
+                }
+                null
+            }
+            is JSONArray -> {
+                for (i in 0 until root.length()) {
+                    deepFind(root.opt(i), pred, depth + 1)?.let { return it }
+                }
+                null
+            }
+            else -> null
+        }
+    }
+
+    private fun resolveAllRows(rows: Map<String, Any>): List<Any> {
+        val out = ArrayList<Any>(rows.size)
+        for ((_, v) in rows) {
+            val r = if (v is String && v.startsWith("$")) resolve(v, rows) ?: v else v
+            out.add(r)
+        }
+        return out
+    }
+
+    private fun findSectionContainer(rows: Map<String, Any>): JSONObject? {
+        val pred: (JSONObject) -> Boolean = { o ->
+            o.has("trending") && o.has("popular") && o.has("thisSeason") &&
+            o.has("recentlyUpdated") && o.has("topRated")
+        }
+        for (v in resolveAllRows(rows)) {
+            deepFind(v, pred)?.let { return it }
+        }
+        return null
+    }
+
+    private fun findAnimeObject(rows: Map<String, Any>, targetId: Int): JSONObject? {
+        val pred: (JSONObject) -> Boolean = { o ->
+            val inner = o.optJSONObject("anime")
+            (inner != null && inner.optInt("id", 0) == targetId && inner.has("title")) ||
+            (o.optInt("id", 0) == targetId && o.has("title") && o.has("coverImage"))
+        }
+        for (v in resolveAllRows(rows)) {
+            deepFind(v, pred)?.let { o ->
+                val inner = o.optJSONObject("anime")
+                if (inner != null && inner.optInt("id", 0) == targetId) return inner
+                return o
+            }
+        }
+        return null
     }
 
     private fun mediaToShow(m: JSONObject): SearchResponse? {
@@ -119,7 +179,7 @@ class KawaiiAnime : MainAPI() {
         }
     }
 
-    // ── Home cache ────────────────────────────────────────────────
+    // ── Home ──────────────────────────────────────────────────────
 
     private suspend fun ensureHomeCache(): Boolean {
         if (System.currentTimeMillis() - homeFetchedAt < HOME_TTL_MS && homeSections.isNotEmpty()) return true
@@ -127,22 +187,14 @@ class KawaiiAnime : MainAPI() {
             val html = app.get(mainUrl, headers = headers()).text
             log("homepage len=${html.length}")
             val rows = extractRscRows(html)
-
-            var container: JSONObject? = null
-            for ((_, v) in rows) {
-                val r = if (v is String && v.startsWith("$")) resolve(v, rows) else v
-                if (r !is JSONObject) continue
-                if (r.has("trending") && r.has("popular") && r.has("thisSeason") &&
-                    r.has("recentlyUpdated") && r.has("topRated")) {
-                    container = r; break
-                }
-            }
-            if (container == null) { log("no section container"); return false }
+            val container = findSectionContainer(rows) ?: run { log("no container found"); return false }
+            log("container found")
 
             val found = HashMap<String, List<SearchResponse>>()
             for ((csKey, rscKey) in SECTION_MAP) {
                 val raw = container.opt(rscKey) ?: continue
-                val arr = resolve(raw, rows) as? JSONArray ?: continue
+                val resolved = resolve(raw, rows)
+                val arr = resolved as? JSONArray ?: continue
                 val shows = ArrayList<SearchResponse>()
                 for (i in 0 until arr.length()) {
                     val obj = arr.opt(i) as? JSONObject ?: continue
@@ -151,11 +203,11 @@ class KawaiiAnime : MainAPI() {
                 log("$csKey <- $rscKey : ${shows.size}")
                 if (shows.isNotEmpty()) found[csKey] = shows
             }
-            if (found.isEmpty()) { log("0 sections parsed"); return false }
+            if (found.isEmpty()) { log("0 sections"); return false }
 
             homeSections.clear(); homeSections.putAll(found)
             homeFetchedAt = System.currentTimeMillis()
-            log("home cache: ${homeSections.size} sections, ${mediaCache.size} media")
+            log("home cached: ${homeSections.size} sections, ${mediaCache.size} media")
             true
         } catch (e: Exception) { logErr("home", e); false }
     }
@@ -170,7 +222,7 @@ class KawaiiAnime : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse =
         withContext(Dispatchers.IO) {
-            log("getMainPage: '${request.name}' key=${request.data} p=$page")
+            log("getMainPage: '${request.name}' key=${request.data}")
             if (!ensureHomeCache())
                 return@withContext newHomePageResponse(HomePageList(request.name, emptyList()), hasNext = false)
             val shows = homeSections[request.data] ?: emptyList()
@@ -191,16 +243,33 @@ class KawaiiAnime : MainAPI() {
             val rows = extractRscRows(html)
             val out = ArrayList<SearchResponse>()
             val seen = HashSet<Int>()
-            for ((_, v) in rows) {
-                val r = if (v is String && v.startsWith("$")) resolve(v, rows) else v
-                if (r !is JSONObject) continue
-                if (!r.has("id") || !r.has("title") || !r.has("coverImage")) continue
-                val id = r.optInt("id", 0); if (id <= 0 || !seen.add(id)) continue
-                mediaToShow(r)?.let { out.add(it) }
+            for (v in resolveAllRows(rows)) {
+                // walk every JSONObject that looks like a media record
+                walkMedia(v) { m ->
+                    val id = m.optInt("id", 0)
+                    if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
+                }
             }
             log("search -> ${out.size}")
             out
         } catch (e: Exception) { logErr("search", e); emptyList() }
+    }
+
+    private fun walkMedia(root: Any?, cb: (JSONObject) -> Unit, depth: Int = 0) {
+        if (depth > 20 || root == null) return
+        when (root) {
+            is JSONObject -> {
+                if (root.has("id") && root.has("title") && root.has("coverImage") &&
+                    root.has("format") && root.has("status")) {
+                    cb(root)
+                }
+                val keys = root.keys()
+                while (keys.hasNext()) walkMedia(root.opt(keys.next()), cb, depth + 1)
+            }
+            is JSONArray -> {
+                for (i in 0 until root.length()) walkMedia(root.opt(i), cb, depth + 1)
+            }
+        }
     }
 
     // ── Load ──────────────────────────────────────────────────────
@@ -211,7 +280,7 @@ class KawaiiAnime : MainAPI() {
         log("load id=$id")
 
         mediaCache[id.toString()]?.let {
-            log("load id=$id from cache")
+            log("load id=$id from media cache (title=${it.optJSONObject("title")?.optString("english")})")
             return@withContext buildLoadResponse(it, id)
         }
 
@@ -219,30 +288,14 @@ class KawaiiAnime : MainAPI() {
             val html = app.get("$mainUrl/anime/$id", headers = headers()).text
             log("detail html len=${html.length}")
             val rows = extractRscRows(html)
-
-            var media: JSONObject? = null
-            for ((_, v) in rows) {
-                val r = if (v is String && v.startsWith("$")) resolve(v, rows) else v
-                if (r !is JSONObject) continue
-                val inner = r.optJSONObject("anime")
-                if (inner != null && inner.optInt("id", 0) == id) { media = inner; break }
-            }
-            if (media == null) {
-                for ((_, v) in rows) {
-                    val r = if (v is String && v.startsWith("$")) resolve(v, rows) else v
-                    if (r !is JSONObject) continue
-                    if (r.optInt("id", 0) == id && r.has("title") && r.has("coverImage")) {
-                        media = r; break
-                    }
-                }
-            }
-
+            val media = findAnimeObject(rows, id)
             if (media != null) {
-                log("detail id=$id found")
+                log("detail id=$id extracted title='${media.optJSONObject("title")?.optString("english")}' " +
+                    "episodes=${media.optInt("episodes", 0)} status=${media.optString("status")}")
                 mediaCache[id.toString()] = media
                 return@withContext buildLoadResponse(media, id)
             }
-            log("detail id=$id NOT found in RSC")
+            log("detail id=$id NOT found")
         } catch (e: Exception) { logErr("detail", e) }
 
         throw ErrorLoadingException("couldn't load anime $id")
@@ -266,12 +319,10 @@ class KawaiiAnime : MainAPI() {
         val score = m.optInt("averageScore", 0)
 
         val episodesField = m.optInt("episodes", 0)
-        val nextAiring = m.optJSONObject("nextAiringEpisode")
-        val nextEp = nextAiring?.optInt("episode", 0) ?: 0
+        val nextEp = m.optJSONObject("nextAiringEpisode")?.optInt("episode", 0) ?: 0
         val epsCount = maxOf(episodesField, (nextEp - 1).coerceAtLeast(0)).coerceAtLeast(0)
 
-        log("buildLoadResponse id=$id title='$title' status=$status format=$format " +
-            "episodesField=$episodesField nextEp=$nextEp epsCount=$epsCount")
+        log("buildLoadResponse id=$id title='$title' status=$status episodesField=$episodesField nextEp=$nextEp -> epsCount=$epsCount")
 
         val episodes: List<Episode> = when {
             epsCount > 0 -> (1..epsCount).map { n ->
