@@ -34,6 +34,13 @@ class KawaiiAnime : MainAPI() {
             "RECENTLY_UPDATED" to "recentlyUpdated",
             "TOP_RATED"        to "topRated"
         )
+
+        /** Grab the last digit-run from a URL or ID string. */
+        fun extractId(raw: String?): Int? {
+            if (raw.isNullOrBlank()) return null
+            return Regex("""(\d+)""").findAll(raw).lastOrNull()
+                ?.groupValues?.get(1)?.toIntOrNull()
+        }
     }
 
     private fun log(msg: String) { Log.d(TAG, msg) }
@@ -194,7 +201,6 @@ class KawaiiAnime : MainAPI() {
                 if (c != null) { container = c; break@outer }
             }
             if (container == null) { log("no section container"); return false }
-            log("container found")
 
             val found = HashMap<String, List<SearchResponse>>()
             for ((csKey, rscKey) in SECTION_MAP) {
@@ -235,38 +241,59 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
+    // ── Search — RSC of /search, then home-cache fallback ────────
+
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         log("search: '$query'")
+
+        // 1. try the search page RSC
         try {
             val enc = URLEncoder.encode(query, "UTF-8")
             val html = app.get("$mainUrl/search?q=$enc", headers = headers()).text
             log("search html len=${html.length}")
-            if (!html.contains("self.__next_f.push")) return@withContext emptyList()
-            val rows = extractRscRows(html)
-
-            val collected = ArrayList<JSONObject>()
-            for ((_, v) in rows) {
-                val r: Any? = if (v is String && v.startsWith("$")) resolve(v, rows) else v
-                collectMedia(r, collected)
+            if (html.contains("self.__next_f.push")) {
+                val rows = extractRscRows(html)
+                val collected = ArrayList<JSONObject>()
+                for ((_, v) in rows) {
+                    val r: Any? = if (v is String && v.startsWith("$")) resolve(v, rows) else v
+                    collectMedia(r, collected)
+                }
+                val out = ArrayList<SearchResponse>()
+                val seen = HashSet<Int>()
+                for (m in collected) {
+                    val id = m.optInt("id", 0)
+                    if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
+                }
+                if (out.isNotEmpty()) { log("search RSC -> ${out.size}"); return@withContext out }
             }
+        } catch (e: Exception) { logErr("search rsc", e) }
+
+        // 2. fallback: filter the home cache by title substring
+        try {
+            ensureHomeCache()
+            val needle = query.lowercase().trim()
             val out = ArrayList<SearchResponse>()
             val seen = HashSet<Int>()
-            for (m in collected) {
+            for (m in mediaCache.values) {
+                val t = m.optJSONObject("title") ?: continue
+                val candidates = listOf(
+                    t.optString("english"), t.optString("romaji"), t.optString("native")
+                ).filter { it.isNotBlank() }
+                if (candidates.none { it.lowercase().contains(needle) }) continue
                 val id = m.optInt("id", 0)
-                if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
+                if (id <= 0 || !seen.add(id)) continue
+                mediaToShow(m)?.let { out.add(it) }
             }
-            log("search -> ${out.size}")
+            log("search cache -> ${out.size}")
             out
-        } catch (e: Exception) { logErr("search", e); emptyList() }
+        } catch (e: Exception) { logErr("search cache", e); emptyList() }
     }
 
-    // ── Load — grabs the last digit-run from any URL shape ────────
+    // ── Load ──────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
-        val id = Regex("""(\d+)""").findAll(url).lastOrNull()
-            ?.groupValues?.get(1)?.toIntOrNull()
-            ?: throw ErrorLoadingException("bad id: $url")
+        val id = extractId(url) ?: throw ErrorLoadingException("bad id: $url")
         log("load id=$id from '$url'")
 
         mediaCache[id.toString()]?.let {
@@ -353,6 +380,8 @@ class KawaiiAnime : MainAPI() {
             .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
+    // ── loadLinks — extract id, retry miruro, fallback subs ──────
+
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -360,25 +389,30 @@ class KawaiiAnime : MainAPI() {
     ): Boolean = withContext(Dispatchers.IO) {
         val parts = data.split("|")
         if (parts.size < 2) return@withContext false
-        val showId = parts[0]; val epNum = parts[1]
-        log("loadLinks: showId=$showId ep=$epNum")
+        val showIdRaw = parts[0]; val epNum = parts[1]
+        val showId = extractId(showIdRaw)?.toString()
+            ?: run { logErr("loadLinks", Exception("bad showId: $showIdRaw")); return@withContext false }
+        log("loadLinks: showIdRaw='$showIdRaw' -> showId=$showId ep=$epNum")
 
-        try {
-            val apiUrl = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
-            val res = app.get(apiUrl, headers = mapOf(
-                "User-Agent" to UA, "Referer" to "$mainUrl/",
-                "Accept" to "*/*", "Origin" to mainUrl
-            ))
-            log("miruro HTTP ${res.code} len=${res.text.length}")
-            if (res.isSuccessful) {
+        // ── attempt 1: /api/miruro (retry once on timeout) ──
+        var miruroOk = false
+        for (attempt in 1..2) {
+            try {
+                val apiUrl = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
+                val res = app.get(apiUrl, headers = mapOf(
+                    "User-Agent" to UA, "Referer" to "$mainUrl/",
+                    "Accept" to "*/*", "Origin" to mainUrl
+                ))
+                log("miruro[$attempt] HTTP ${res.code} len=${res.text.length}")
+                if (!res.isSuccessful) continue
+
                 val root = JSONObject(res.text)
                 val d = root.optJSONObject("data") ?: root
                 val ref = d.optJSONObject("headers")?.optString("Referer")
                     ?.ifBlank { null } ?: "$mainUrl/"
 
                 var emitted = 0
-                val sources = d.optJSONArray("sources")
-                if (sources != null) {
+                d.optJSONArray("sources")?.let { sources ->
                     for (i in 0 until sources.length()) {
                         val s = sources.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
@@ -395,51 +429,45 @@ class KawaiiAnime : MainAPI() {
                         emitted++
                     }
                 }
-                val subs = d.optJSONArray("subtitles")
-                if (subs != null) {
+                d.optJSONArray("subtitles")?.let { subs ->
                     for (i in 0 until subs.length()) {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
                         subtitleCallback(SubtitleFile(s.optString("lang").ifEmpty { "Arabic" }, u))
                     }
                 }
-                if (emitted > 0) { log("miruro OK: $emitted"); return@withContext true }
+                if (emitted > 0) { log("miruro OK: $emitted (attempt $attempt)"); miruroOk = true; break }
+            } catch (e: Exception) {
+                logErr("miruro[$attempt]", e)
             }
-        } catch (e: Exception) { logErr("miruro", e) }
+        }
 
-        try {
-            val res = app.get("$mainUrl/api/video-cache?episodeId=$showId-ep$epNum",
-                headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/"))
-            if (res.isSuccessful) {
-                val json = JSONObject(res.text)
-                val u = json.optString("url")
-                if (u.isNotBlank()) {
-                    log("video-cache OK -> ${u.take(90)}")
-                    callback(newExtractorLink(name, "Kawaii", u, ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                        quality = Qualities.Unknown.value
-                        this.headers = mapOf("User-Agent" to UA)
-                    })
-                    val subs = json.optJSONArray("subtitles")
-                    if (subs != null) {
-                        for (i in 0 until subs.length()) {
-                            val s = subs.optJSONObject(i) ?: continue
-                            val su = s.optString("url")
-                            if (su.isNotBlank()) subtitleCallback(SubtitleFile(s.optString("lang", "ar"), su))
-                        }
-                    }
-                    return@withContext true
-                }
-            }
-        } catch (e: Exception) { logErr("video-cache", e) }
+        if (miruroOk) return@withContext true
 
+        // ── attempt 2: direct pattern (miruro sources are predictable) ──
         val direct = "$VIDEO_HOST/video/$showId-ep$epNum"
         log("fallback direct: $direct")
         callback(newExtractorLink(name, "Kawaii (Direct)", direct, ExtractorLinkType.VIDEO) {
             this.referer = "$mainUrl/"
             quality = Qualities.Unknown.value
-            this.headers = mapOf("User-Agent" to UA)
+            this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
         })
+
+        // ── attempt 3: subtitle URL pattern from the earlier live dump ──
+        val subs = listOf(
+            "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
+            "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
+        )
+        for ((lang, url) in subs) {
+            try {
+                val r = app.get(url, headers = mapOf("Referer" to "$mainUrl/"))
+                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
+                    log("sub fallback ok: $lang")
+                    subtitleCallback(SubtitleFile(lang, url))
+                }
+            } catch (_: Exception) {}
+        }
+
         true
     }
 }
