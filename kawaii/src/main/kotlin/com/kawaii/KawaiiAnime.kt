@@ -25,7 +25,6 @@ class KawaiiAnime : MainAPI() {
         private const val VIDEO_HOST = "https://video.kawaii-anime.com"
         private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
 
-        // Style header (Script Info + V4+ Styles only, no [Events]).
         private const val STYLE_URL =
             "https://raw.githubusercontent.com/vxror/nothingfound/refs/heads/main/StyleAsShit/kawaii-style.ass"
 
@@ -549,9 +548,9 @@ class KawaiiAnime : MainAPI() {
     // ── Styled subtitle pipeline ──────────────────────────────────
     // Site serves bare .vtt only. We fetch a style header once from GitHub
     // ([Script Info] + [V4+ Styles], no [Events]), convert each per-episode
-    // VTT into ASS Dialogue lines, write the result to a temp file, and hand
-    // the player a file:// URL. data: URLs get filtered by CloudStream's
-    // subtitle picker on most builds; file:// passes through cleanly.
+    // VTT into ASS Dialogue lines, write the result to a temp file via
+    // File.createTempFile (Android routes this to the app's writable cache —
+    // no CloudStream internals required), and hand the player a file:// URL.
 
     @Volatile private var styleHeaderCache: String? = null
 
@@ -605,17 +604,13 @@ class KawaiiAnime : MainAPI() {
         return sb.toString()
     }
 
-    // Writes styled ASS to app cache dir, returns file:// URL — the player's
-    // subtitle picker only accepts http/https/file, not data:.
-    // MainAPI has no `context`; AcraApplication.getContext() is the correct hook.
-    private fun writeSubFile(content: String, name: String): String? {
+    // File.createTempFile uses java.io.tmpdir, which on Android is wired to
+    // the app's writable cache dir. No CloudStream internals needed — sidesteps
+    // the AcraApplication/CloudStreamApp deprecation dance entirely.
+    private fun writeSubFile(content: String, tag: String): String? {
         return try {
-            val ctx = AcraApplication.getContext() ?: run {
-                log("writeSubFile: no app context")
-                return null
-            }
-            val dir = File(ctx.cacheDir, "kawaii_subs").apply { mkdirs() }
-            val f = File(dir, name)
+            val prefix = "kawaii_" + tag.replace(Regex("[^A-Za-z0-9._-]"), "_").take(32) + "_"
+            val f = File.createTempFile(prefix, ".ass")
             f.writeText(content, Charsets.UTF_8)
             log("sub file written: ${f.absolutePath} (${f.length()} bytes)")
             "file://${f.absolutePath}"
@@ -688,7 +683,7 @@ class KawaiiAnime : MainAPI() {
                                 val vtt = app.get(u, headers = subHeaders).text
                                 if (vtt.contains("WEBVTT", ignoreCase = true)) {
                                     val ass = vttToAss(vtt, styleHeader)
-                                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}.ass")
+                                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}")
                                         ?.let { outUrl = it; log("subtitle styled: $lang") }
                                 }
                             } catch (e: Exception) { logErr("subtitle style", e) }
@@ -717,7 +712,7 @@ class KawaiiAnime : MainAPI() {
                 var outUrl = vttUrl
                 if (styleHeader != null) {
                     val ass = vttToAss(r.text, styleHeader)
-                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}.ass")
+                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}")
                         ?.let { outUrl = it; log("subtitle styled (fallback): $lang") }
                 }
                 log("subtitle emit (fallback): $lang -> ${outUrl.take(60)}")
