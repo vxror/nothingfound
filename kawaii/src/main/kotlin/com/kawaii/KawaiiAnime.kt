@@ -1,6 +1,5 @@
 package com.kawaii
 
-import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -10,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
@@ -26,8 +26,6 @@ class KawaiiAnime : MainAPI() {
         private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
 
         // Style header (Script Info + V4+ Styles only, no [Events]).
-        // Fetched once per app session, then reused to convert every site VTT
-        // into a styled ASS served as a data: URL to the player.
         private const val STYLE_URL =
             "https://raw.githubusercontent.com/vxror/nothingfound/refs/heads/main/StyleAsShit/kawaii-style.ass"
 
@@ -48,8 +46,6 @@ class KawaiiAnime : MainAPI() {
             "TOP_RATED"        to "topRated"
         )
 
-        // byte-for-byte copy of the query the site itself sends to /api/anilist
-        // whitespace matters — Next.js caches responses keyed on the raw request body
         private val SITE_SEARCH_QUERY: String =
             "\n    query (\$page: Int, \$perPage: Int, \$search: String) {\n" +
             "      Page(page: \$page, perPage: \$perPage) {\n" +
@@ -338,8 +334,6 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
-    // ── Search — byte-exact proxy call → RSC → cache ─────────────
-
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         val key = query.lowercase().trim()
@@ -353,7 +347,6 @@ class KawaiiAnime : MainAPI() {
             searchCache.remove(key)
         }
 
-        // 1. byte-for-byte site query
         try {
             val vars = JSONObject()
                 .put("page", 1)
@@ -388,7 +381,6 @@ class KawaiiAnime : MainAPI() {
             }
         } catch (e: Exception) { logErr("search proxy", e) }
 
-        // 2. search page RSC
         try {
             val enc = URLEncoder.encode(query, "UTF-8")
             val html = app.get("$mainUrl/search?q=$enc", headers = headers()).text
@@ -413,7 +405,6 @@ class KawaiiAnime : MainAPI() {
             }
         } catch (e: Exception) { logErr("search rsc", e) }
 
-        // 3. home-cache fallback
         ensureHomeCache()
         val tokens = key.split(Regex("\\s+")).filter { it.length >= 2 }
         val out = ArrayList<SearchResponse>()
@@ -433,8 +424,6 @@ class KawaiiAnime : MainAPI() {
         log("search[cache] -> ${out.size}")
         out
     }
-
-    // ── Load: cache → RSC → proxy ─────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val id = extractId(url) ?: throw ErrorLoadingException("bad id: $url")
@@ -558,12 +547,11 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── Styled subtitle pipeline ──────────────────────────────────
-    // Site only serves bare .vtt. We fetch a style header once from GitHub
+    // Site serves bare .vtt only. We fetch a style header once from GitHub
     // ([Script Info] + [V4+ Styles], no [Events]), convert each per-episode
-    // VTT's cues into ASS Dialogue lines in memory, and hand the player a
-    // data: URL. Colours / outline / alignment / margins / scale / bold all
-    // survive. Fontname is looked up against device-installed typefaces —
-    // custom fonts will fall back to Noto Naskh Arabic on stock Android.
+    // VTT into ASS Dialogue lines, write the result to a temp file, and hand
+    // the player a file:// URL. data: URLs get filtered by CloudStream's
+    // subtitle picker on most builds; file:// passes through cleanly.
 
     @Volatile private var styleHeaderCache: String? = null
 
@@ -577,7 +565,7 @@ class KawaiiAnime : MainAPI() {
                 styleHeaderCache = body
                 body
             } else {
-                log("style header rejected: HTTP ${r.code} len=${body.length}")
+                log("style header rejected: HTTP ${r.code} len=${body.length} head=${body.take(60)}")
                 null
             }
         } catch (e: Exception) {
@@ -617,9 +605,22 @@ class KawaiiAnime : MainAPI() {
         return sb.toString()
     }
 
-    private fun toDataUrl(content: String): String =
-        "data:text/plain;charset=utf-8;base64," +
-        Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+    // Writes styled ASS to app cache dir, returns file:// URL — the player's
+    // subtitle picker only accepts http/https/file, not data:.
+    private fun writeSubFile(content: String, name: String): String? {
+        return try {
+            val dir = File(context.cacheDir, "kawaii_subs").apply { mkdirs() }
+            val f = File(dir, name)
+            f.writeText(content, Charsets.UTF_8)
+            log("sub file written: ${f.absolutePath} (${f.length()} bytes)")
+            "file://${f.absolutePath}"
+        } catch (e: Exception) {
+            logErr("writeSubFile", e); null
+        }
+    }
+
+    private fun safeName(s: String): String =
+        s.replace(Regex("[^A-Za-z0-9._-]"), "_")
 
     // ── loadLinks ─────────────────────────────────────────────────
 
@@ -676,15 +677,18 @@ class KawaiiAnime : MainAPI() {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
                         val lang = s.optString("lang").ifEmpty { "Arabic" }
-                        val outUrl = if (styleHeader != null && u.contains(".vtt", ignoreCase = true)) {
+                        var outUrl = u
+                        if (styleHeader != null && u.contains(".vtt", ignoreCase = true)) {
                             try {
                                 val vtt = app.get(u, headers = subHeaders).text
                                 if (vtt.contains("WEBVTT", ignoreCase = true)) {
-                                    log("subtitle styled: $lang")
-                                    toDataUrl(vttToAss(vtt, styleHeader))
-                                } else u
-                            } catch (e: Exception) { logErr("subtitle style", e); u }
-                        } else u
+                                    val ass = vttToAss(vtt, styleHeader)
+                                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}.ass")
+                                        ?.let { outUrl = it; log("subtitle styled: $lang") }
+                                }
+                            } catch (e: Exception) { logErr("subtitle style", e) }
+                        }
+                        log("subtitle emit: $lang -> ${outUrl.take(60)}")
                         subtitleCallback(SubtitleFile(lang, outUrl))
                     }
                 }
@@ -705,10 +709,13 @@ class KawaiiAnime : MainAPI() {
             try {
                 val r = app.get(vttUrl, headers = subHeaders)
                 if (!r.isSuccessful || !r.text.contains("WEBVTT", ignoreCase = true)) continue
-                val outUrl = if (styleHeader != null) {
-                    log("subtitle styled (fallback): $lang")
-                    toDataUrl(vttToAss(r.text, styleHeader))
-                } else vttUrl
+                var outUrl = vttUrl
+                if (styleHeader != null) {
+                    val ass = vttToAss(r.text, styleHeader)
+                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}.ass")
+                        ?.let { outUrl = it; log("subtitle styled (fallback): $lang") }
+                }
+                log("subtitle emit (fallback): $lang -> ${outUrl.take(60)}")
                 subtitleCallback(SubtitleFile(lang, outUrl))
             } catch (_: Exception) {}
         }
