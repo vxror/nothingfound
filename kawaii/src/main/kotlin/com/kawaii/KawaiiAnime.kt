@@ -26,9 +26,12 @@ class KawaiiAnime : MainAPI() {
 
         @Volatile private var homeFetchedAt = 0L
         private const val HOME_TTL_MS = 10 * 60_000L
+        private const val SEARCH_TTL_MS = 30 * 60_000L
+
         private val homeSections = ConcurrentHashMap<String, List<SearchResponse>>()
         private val mediaCache = ConcurrentHashMap<String, JSONObject>()
         private val translationCache = ConcurrentHashMap<String, String>()
+        private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
 
         private val SECTION_MAP = mapOf(
             "TRENDING"         to "trending",
@@ -227,23 +230,41 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
-    // ── Search: proxy → RSC → cache ───────────────────────────────
+    // ── Search: cache → /api/anilist proxy → RSC → home cache ────
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
+        val key = query.lowercase().trim()
         log("search: '$query'")
 
-        // 1. site's AniList GraphQL proxy
+        // 0. search cache — survives AniList rate-limit windows
+        searchCache[key]?.let { (ts, cached) ->
+            if (System.currentTimeMillis() - ts < SEARCH_TTL_MS) {
+                log("search[cached] -> ${cached.size}")
+                return@withContext cached
+            }
+            searchCache.remove(key)
+        }
+
+        // 1. exact query the site sends to /api/anilist
         try {
             val body = JSONObject()
-                .put("query", """query (${'$'}search: String) {
-                    Page(page: 1, perPage: 40) {
-                        media(type: ANIME, search: ${'$'}search, sort: SEARCH_MATCH, isAdult: false) {
-                            id title { romaji english native } coverImage { extraLarge large } format status episodes seasonYear
+                .put("query", """
+                    query (${'$'}page: Int, ${'$'}perPage: Int, ${'$'}search: String) {
+                      Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                        pageInfo { currentPage hasNextPage perPage }
+                        media(type: ANIME, search: ${'$'}search, sort: SEARCH_MATCH) {
+                          id idMal title { romaji english native } description(asHtml: false)
+                          coverImage { extraLarge large color } bannerImage
+                          genres format status episodes duration season seasonYear averageScore
+                          popularity trending favourites
+                          nextAiringEpisode { airingAt timeUntilAiring episode }
                         }
+                      }
                     }
-                }""")
-                .put("variables", JSONObject().put("search", query))
+                """.trimIndent())
+                .put("variables", JSONObject()
+                    .put("page", 1).put("perPage", 30).put("search", query))
                 .toString().toRequestBody("application/json".toMediaType())
 
             val res = app.post("$mainUrl/api/anilist", requestBody = body, headers = mapOf(
@@ -251,7 +272,7 @@ class KawaiiAnime : MainAPI() {
                 "Accept" to "application/json",
                 "Content-Type" to "application/json",
                 "Origin" to mainUrl,
-                "Referer" to "$mainUrl/"
+                "Referer" to "$mainUrl/search?q=${URLEncoder.encode(query, "UTF-8")}"
             ))
             log("search[proxy] HTTP ${res.code} len=${res.text.length}")
             if (res.isSuccessful && res.text.length > 200) {
@@ -263,14 +284,18 @@ class KawaiiAnime : MainAPI() {
                         val m = arr.optJSONObject(i) ?: continue
                         mediaToShow(m)?.let { out.add(it) }
                     }
-                    if (out.isNotEmpty()) { log("search[proxy] -> ${out.size}"); return@withContext out }
+                    if (out.isNotEmpty()) {
+                        searchCache[key] = System.currentTimeMillis() to out
+                        log("search[proxy] -> ${out.size} (cached)")
+                        return@withContext out
+                    }
                 }
             } else if (res.text.length <= 200) {
-                log("search[proxy] tiny body: ${res.text.take(120)}")
+                log("search[proxy] short body: ${res.text.take(120)}")
             }
         } catch (e: Exception) { logErr("search proxy", e) }
 
-        // 2. search page RSC
+        // 2. search page RSC (rarely has data — site renders client-side)
         try {
             val enc = URLEncoder.encode(query, "UTF-8")
             val html = app.get("$mainUrl/search?q=$enc", headers = headers()).text
@@ -287,13 +312,17 @@ class KawaiiAnime : MainAPI() {
                     val id = m.optInt("id", 0)
                     if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
                 }
-                if (out.isNotEmpty()) { log("search[rsc] -> ${out.size}"); return@withContext out }
+                if (out.isNotEmpty()) {
+                    searchCache[key] = System.currentTimeMillis() to out
+                    log("search[rsc] -> ${out.size}")
+                    return@withContext out
+                }
             }
         } catch (e: Exception) { logErr("search rsc", e) }
 
-        // 3. home-cache fallback
+        // 3. home-cache substring fallback
         ensureHomeCache()
-        val tokens = query.lowercase().trim().split(Regex("\\s+")).filter { it.length >= 2 }
+        val tokens = key.split(Regex("\\s+")).filter { it.length >= 2 }
         val out = ArrayList<SearchResponse>()
         val seen = HashSet<Int>()
         for (m in mediaCache.values) {
@@ -312,18 +341,14 @@ class KawaiiAnime : MainAPI() {
         out
     }
 
-    // ── Load: cache → RSC → /api/anilist fallback ─────────────────
+    // ── Load: cache → RSC → /api/anilist ──────────────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val id = extractId(url) ?: throw ErrorLoadingException("bad id: $url")
-        log("load id=$id")
-
         mediaCache[id.toString()]?.let {
             log("load id=$id from cache")
             return@withContext buildLoadResponse(it, id)
         }
-
-        // RSC from /anime/{id}
         try {
             val html = app.get("$mainUrl/anime/$id", headers = headers()).text
             val rows = extractRscRows(html)
@@ -334,13 +359,10 @@ class KawaiiAnime : MainAPI() {
                 if (m != null) { media = m; break@outer }
             }
             if (media != null) {
-                log("load id=$id from RSC")
                 mediaCache[id.toString()] = media
                 return@withContext buildLoadResponse(media, id)
             }
         } catch (e: Exception) { logErr("load rsc", e) }
-
-        // fallback: site's AniList proxy
         try {
             val body = JSONObject()
                 .put("query", """query (${'$'}id: Int) {
@@ -357,7 +379,6 @@ class KawaiiAnime : MainAPI() {
                 "Content-Type" to "application/json",
                 "Origin" to mainUrl, "Referer" to "$mainUrl/"
             ))
-            log("load[proxy] HTTP ${res.code} len=${res.text.length}")
             if (res.isSuccessful) {
                 val m = JSONObject(res.text).optJSONObject("data")?.optJSONObject("Media")
                 if (m != null) {
@@ -366,11 +387,10 @@ class KawaiiAnime : MainAPI() {
                 }
             }
         } catch (e: Exception) { logErr("load proxy", e) }
-
         throw ErrorLoadingException("couldn't load anime $id")
     }
 
-    // ── Translate via site's own endpoint ─────────────────────────
+    // ── Site's own Arabic translation endpoint ────────────────────
 
     private suspend fun translateToAr(text: String, id: Int): String {
         if (text.isBlank()) return text
