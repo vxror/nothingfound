@@ -46,6 +46,8 @@ class KawaiiAnime : MainAPI() {
             "TOP_RATED"        to "topRated"
         )
 
+        // byte-for-byte copy of the query the site itself sends to /api/anilist
+        // whitespace matters — Next.js caches responses keyed on the raw request body
         private val SITE_SEARCH_QUERY: String =
             "\n    query (\$page: Int, \$perPage: Int, \$search: String) {\n" +
             "      Page(page: \$page, perPage: \$perPage) {\n" +
@@ -609,7 +611,7 @@ class KawaiiAnime : MainAPI() {
     // subtitle picker only accepts http/https/file, not data:.
     private fun writeSubFile(content: String, name: String): String? {
         return try {
-            val dir = File(context.cacheDir, "kawaii_subs").apply { mkdirs() }
+            val dir = File(app.context.cacheDir, "kawaii_subs").apply { mkdirs() }
             val f = File(dir, name)
             f.writeText(content, Charsets.UTF_8)
             log("sub file written: ${f.absolutePath} (${f.length()} bytes)")
