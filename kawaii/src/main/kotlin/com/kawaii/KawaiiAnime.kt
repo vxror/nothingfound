@@ -1,5 +1,6 @@
 package com.kawaii
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -23,6 +24,12 @@ class KawaiiAnime : MainAPI() {
         private const val TAG = "KawaiiAnime"
         private const val VIDEO_HOST = "https://video.kawaii-anime.com"
         private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
+
+        // Style header (Script Info + V4+ Styles only, no [Events]).
+        // Fetched once per app session, then reused to convert every site VTT
+        // into a styled ASS served as a data: URL to the player.
+        private const val STYLE_URL =
+            "https://raw.githubusercontent.com/vxror/nothingfound/refs/heads/main/StyleAsShit/kawaii-style.ass"
 
         @Volatile private var homeFetchedAt = 0L
         private const val HOME_TTL_MS = 10 * 60_000L
@@ -550,6 +557,70 @@ class KawaiiAnime : MainAPI() {
             .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
+    // ── Styled subtitle pipeline ──────────────────────────────────
+    // Site only serves bare .vtt. We fetch a style header once from GitHub
+    // ([Script Info] + [V4+ Styles], no [Events]), convert each per-episode
+    // VTT's cues into ASS Dialogue lines in memory, and hand the player a
+    // data: URL. Colours / outline / alignment / margins / scale / bold all
+    // survive. Fontname is looked up against device-installed typefaces —
+    // custom fonts will fall back to Noto Naskh Arabic on stock Android.
+
+    @Volatile private var styleHeaderCache: String? = null
+
+    private suspend fun getStyleHeader(): String? {
+        styleHeaderCache?.let { return it }
+        return try {
+            val r = app.get(STYLE_URL, headers = mapOf("User-Agent" to UA))
+            val body = r.text
+            if (r.isSuccessful && body.contains("[V4+ Styles]") && body.contains("[Script Info]")) {
+                log("style header loaded (${body.length} bytes)")
+                styleHeaderCache = body
+                body
+            } else {
+                log("style header rejected: HTTP ${r.code} len=${body.length}")
+                null
+            }
+        } catch (e: Exception) {
+            logErr("style fetch", e); null
+        }
+    }
+
+    private fun cs(ms: String): String = ms.padEnd(3, '0').substring(0, 2)
+
+    private fun vttToAss(vtt: String, styleHeader: String): String {
+        val sb = StringBuilder(styleHeader)
+        if (!styleHeader.endsWith("\n")) sb.append('\n')
+        sb.append("\n[Events]\n")
+        sb.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+
+        val lines = vtt.replace("\r\n", "\n").split('\n')
+        val timeRx = Regex(
+            """(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[.,](\d{3})"""
+        )
+        var i = 0
+        while (i < lines.size) {
+            val m = timeRx.find(lines[i])
+            if (m == null) { i++; continue }
+            val g = m.groupValues
+            val start = "${g[1]}:${g[2]}:${g[3]}.${cs(g[4])}"
+            val end   = "${g[5]}:${g[6]}:${g[7]}.${cs(g[8])}"
+            val text = StringBuilder()
+            var j = i + 1
+            while (j < lines.size && lines[j].isNotBlank()) {
+                if (text.isNotEmpty()) text.append("\\N")
+                text.append(lines[j].trim())
+                j++
+            }
+            sb.append("Dialogue: 0,$start,$end,Default,,0,0,0,,$text\n")
+            i = j
+        }
+        return sb.toString()
+    }
+
+    private fun toDataUrl(content: String): String =
+        "data:text/plain;charset=utf-8;base64," +
+        Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
     // ── loadLinks ─────────────────────────────────────────────────
 
     override suspend fun loadLinks(
@@ -562,6 +633,14 @@ class KawaiiAnime : MainAPI() {
         val showId = extractId(parts[0])?.toString() ?: return@withContext false
         val epNum = parts[1]
         log("loadLinks: showId=$showId ep=$epNum")
+
+        val styleHeader = getStyleHeader()
+        val subHeaders = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$mainUrl/",
+            "Origin" to mainUrl,
+            "Accept" to "*/*"
+        )
 
         for (attempt in 1..2) {
             try {
@@ -596,7 +675,17 @@ class KawaiiAnime : MainAPI() {
                     for (i in 0 until subs.length()) {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
-                        subtitleCallback(SubtitleFile(s.optString("lang").ifEmpty { "Arabic" }, u))
+                        val lang = s.optString("lang").ifEmpty { "Arabic" }
+                        val outUrl = if (styleHeader != null && u.contains(".vtt", ignoreCase = true)) {
+                            try {
+                                val vtt = app.get(u, headers = subHeaders).text
+                                if (vtt.contains("WEBVTT", ignoreCase = true)) {
+                                    log("subtitle styled: $lang")
+                                    toDataUrl(vttToAss(vtt, styleHeader))
+                                } else u
+                            } catch (e: Exception) { logErr("subtitle style", e); u }
+                        } else u
+                        subtitleCallback(SubtitleFile(lang, outUrl))
                     }
                 }
                 if (emitted > 0) return@withContext true
@@ -609,14 +698,18 @@ class KawaiiAnime : MainAPI() {
             quality = Qualities.Unknown.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
         })
-        for ((lang, url) in listOf(
+        for ((lang, vttUrl) in listOf(
             "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
             "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
         )) {
             try {
-                val r = app.get(url, headers = mapOf("Referer" to "$mainUrl/"))
-                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true))
-                    subtitleCallback(SubtitleFile(lang, url))
+                val r = app.get(vttUrl, headers = subHeaders)
+                if (!r.isSuccessful || !r.text.contains("WEBVTT", ignoreCase = true)) continue
+                val outUrl = if (styleHeader != null) {
+                    log("subtitle styled (fallback): $lang")
+                    toDataUrl(vttToAss(r.text, styleHeader))
+                } else vttUrl
+                subtitleCallback(SubtitleFile(lang, outUrl))
             } catch (_: Exception) {}
         }
         true
