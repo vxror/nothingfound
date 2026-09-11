@@ -44,7 +44,9 @@ class KawaiiAnime : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9"
     )
 
-    // ── RSC extraction ────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // RSC parser
+    // ─────────────────────────────────────────────────────────────
 
     private fun extractRscRows(html: String): Map<String, Any> {
         val stream = StringBuilder()
@@ -66,12 +68,12 @@ class KawaiiAnime : MainAPI() {
             if (ci <= 0 || ci > 6) continue
             val rid = t.substring(0, ci)
             if (!rid.matches(Regex("^[0-9a-fA-F]+$"))) continue
-            val content = t.substring(ci + 1)
+            val payload = t.substring(ci + 1)
             try {
                 rows[rid] = when {
-                    content.startsWith("{") -> JSONObject(content)
-                    content.startsWith("[") -> JSONArray(content)
-                    else -> content
+                    payload.startsWith("{") -> JSONObject(payload)
+                    payload.startsWith("[") -> JSONArray(payload)
+                    else -> payload
                 }
             } catch (_: Exception) {}
         }
@@ -79,14 +81,13 @@ class KawaiiAnime : MainAPI() {
         return rows
     }
 
-    /** Resolve $N references recursively. */
     private fun resolve(v: Any?, rows: Map<String, Any>, depth: Int = 0): Any? {
         if (depth > 25 || v == null) return v
         return when (v) {
             is String -> {
-                if (v.startsWith("$") && v.length > 1 && v[1] != '"' && v[1] != 'L') {
-                    val t = rows[v.substring(1)] ?: return v
-                    resolve(t, rows, depth + 1)
+                if (v.length > 1 && v[0] == '$' && v[1] != '"' && v[1] != 'L') {
+                    val target = rows[v.substring(1)]
+                    if (target != null) resolve(target, rows, depth + 1) else v
                 } else v
             }
             is JSONArray -> {
@@ -96,74 +97,102 @@ class KawaiiAnime : MainAPI() {
             }
             is JSONObject -> {
                 val o = JSONObject()
-                for (k in v.keys()) o.put(k, resolve(v.opt(k), rows, depth + 1))
+                val it = v.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    o.put(k, resolve(v.opt(k), rows, depth + 1))
+                }
                 o
             }
             else -> v
         }
     }
 
-    /** Recursively search any JSON structure for the first JSONObject matching pred. */
-    private fun deepFind(root: Any?, pred: (JSONObject) -> Boolean, depth: Int = 0): JSONObject? {
-        if (depth > 30 || root == null) return null
-        return when (root) {
+    // ─────────────────────────────────────────────────────────────
+    // Recursive walkers — no lambda parameters, no inference traps
+    // ─────────────────────────────────────────────────────────────
+
+    private fun findSectionContainer(root: Any?, depth: Int = 0): JSONObject? {
+        if (depth > 25 || root == null) return null
+        when (root) {
             is JSONObject -> {
-                if (pred(root)) return root
-                val keys = root.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    deepFind(root.opt(k), pred, depth + 1)?.let { return it }
+                if (root.has("trending") && root.has("popular") && root.has("thisSeason") &&
+                    root.has("recentlyUpdated") && root.has("topRated")) return root
+                val it = root.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    val found = findSectionContainer(root.opt(k), depth + 1)
+                    if (found != null) return found
                 }
-                null
             }
             is JSONArray -> {
                 for (i in 0 until root.length()) {
-                    deepFind(root.opt(i), pred, depth + 1)?.let { return it }
+                    val found = findSectionContainer(root.opt(i), depth + 1)
+                    if (found != null) return found
                 }
-                null
-            }
-            else -> null
-        }
-    }
-
-    private fun resolveAllRows(rows: Map<String, Any>): List<Any> {
-        val out = ArrayList<Any>(rows.size)
-        for ((_, v) in rows) {
-            val r = if (v is String && v.startsWith("$")) resolve(v, rows) ?: v else v
-            out.add(r)
-        }
-        return out
-    }
-
-    private fun findSectionContainer(rows: Map<String, Any>): JSONObject? {
-        val pred: (JSONObject) -> Boolean = { o ->
-            o.has("trending") && o.has("popular") && o.has("thisSeason") &&
-            o.has("recentlyUpdated") && o.has("topRated")
-        }
-        for (v in resolveAllRows(rows)) {
-            deepFind(v, pred)?.let { return it }
-        }
-        return null
-    }
-
-    private fun findAnimeObject(rows: Map<String, Any>, targetId: Int): JSONObject? {
-        val pred: (JSONObject) -> Boolean = { o ->
-            val inner = o.optJSONObject("anime")
-            (inner != null && inner.optInt("id", 0) == targetId && inner.has("title")) ||
-            (o.optInt("id", 0) == targetId && o.has("title") && o.has("coverImage"))
-        }
-        for (v in resolveAllRows(rows)) {
-            deepFind(v, pred)?.let { o ->
-                val inner = o.optJSONObject("anime")
-                if (inner != null && inner.optInt("id", 0) == targetId) return inner
-                return o
             }
         }
         return null
     }
+
+    private fun findAnimeMedia(root: Any?, targetId: Int, depth: Int = 0): JSONObject? {
+        if (depth > 25 || root == null) return null
+        when (root) {
+            is JSONObject -> {
+                if (root.optInt("id", 0) == targetId &&
+                    root.has("title") && root.has("description") && root.has("episodes")) {
+                    return root
+                }
+                val it = root.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    val found = findAnimeMedia(root.opt(k), targetId, depth + 1)
+                    if (found != null) return found
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until root.length()) {
+                    val found = findAnimeMedia(root.opt(i), targetId, depth + 1)
+                    if (found != null) return found
+                }
+            }
+        }
+        return null
+    }
+
+    private fun collectMedia(root: Any?, out: MutableList<JSONObject>, depth: Int = 0) {
+        if (depth > 25 || root == null) return
+        when (root) {
+            is JSONObject -> {
+                if (root.has("id") && root.has("title") && root.has("coverImage") &&
+                    root.has("format") && root.has("status") && root.has("episodes") &&
+                    !root.has("idMal") // top-level anime has idMal too; nested recs don't
+                ) {
+                    // nothing — this is fine, keep as candidate either way
+                }
+                if (root.has("id") && root.has("title") && root.has("coverImage") &&
+                    root.has("format") && root.has("status") && root.has("episodes")) {
+                    out.add(root)
+                }
+                val it = root.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    collectMedia(root.opt(k), out, depth + 1)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until root.length()) collectMedia(root.opt(i), out, depth + 1)
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Converters
+    // ─────────────────────────────────────────────────────────────
 
     private fun mediaToShow(m: JSONObject): SearchResponse? {
-        val id = m.optInt("id", 0); if (id <= 0) return null
+        val id = m.optInt("id", 0)
+        if (id <= 0) return null
         val t = m.optJSONObject("title") ?: return null
         val title = t.optString("english")
             .ifEmpty { t.optString("romaji").ifEmpty { t.optString("native") } }
@@ -179,7 +208,9 @@ class KawaiiAnime : MainAPI() {
         }
     }
 
-    // ── Home ──────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // Home
+    // ─────────────────────────────────────────────────────────────
 
     private suspend fun ensureHomeCache(): Boolean {
         if (System.currentTimeMillis() - homeFetchedAt < HOME_TTL_MS && homeSections.isNotEmpty()) return true
@@ -187,14 +218,20 @@ class KawaiiAnime : MainAPI() {
             val html = app.get(mainUrl, headers = headers()).text
             log("homepage len=${html.length}")
             val rows = extractRscRows(html)
-            val container = findSectionContainer(rows) ?: run { log("no container found"); return false }
+
+            var container: JSONObject? = null
+            outer@ for ((_, v) in rows) {
+                val r: Any? = if (v is String && v.startsWith("$")) resolve(v, rows) else v
+                val c = findSectionContainer(r)
+                if (c != null) { container = c; break@outer }
+            }
+            if (container == null) { log("no section container"); return false }
             log("container found")
 
             val found = HashMap<String, List<SearchResponse>>()
             for ((csKey, rscKey) in SECTION_MAP) {
                 val raw = container.opt(rscKey) ?: continue
-                val resolved = resolve(raw, rows)
-                val arr = resolved as? JSONArray ?: continue
+                val arr = raw as? JSONArray ?: (resolve(raw, rows) as? JSONArray) ?: continue
                 val shows = ArrayList<SearchResponse>()
                 for (i in 0 until arr.length()) {
                     val obj = arr.opt(i) as? JSONObject ?: continue
@@ -230,7 +267,9 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
-    // ── Search ────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // Search
+    // ─────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
@@ -241,38 +280,26 @@ class KawaiiAnime : MainAPI() {
             log("search html len=${html.length}")
             if (!html.contains("self.__next_f.push")) return@withContext emptyList()
             val rows = extractRscRows(html)
+
+            val collected = ArrayList<JSONObject>()
+            for ((_, v) in rows) {
+                val r: Any? = if (v is String && v.startsWith("$")) resolve(v, rows) else v
+                collectMedia(r, collected)
+            }
             val out = ArrayList<SearchResponse>()
             val seen = HashSet<Int>()
-            for (v in resolveAllRows(rows)) {
-                // walk every JSONObject that looks like a media record
-                walkMedia(v) { m ->
-                    val id = m.optInt("id", 0)
-                    if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
-                }
+            for (m in collected) {
+                val id = m.optInt("id", 0)
+                if (id > 0 && seen.add(id)) mediaToShow(m)?.let { out.add(it) }
             }
             log("search -> ${out.size}")
             out
         } catch (e: Exception) { logErr("search", e); emptyList() }
     }
 
-    private fun walkMedia(root: Any?, cb: (JSONObject) -> Unit, depth: Int = 0) {
-        if (depth > 20 || root == null) return
-        when (root) {
-            is JSONObject -> {
-                if (root.has("id") && root.has("title") && root.has("coverImage") &&
-                    root.has("format") && root.has("status")) {
-                    cb(root)
-                }
-                val keys = root.keys()
-                while (keys.hasNext()) walkMedia(root.opt(keys.next()), cb, depth + 1)
-            }
-            is JSONArray -> {
-                for (i in 0 until root.length()) walkMedia(root.opt(i), cb, depth + 1)
-            }
-        }
-    }
-
-    // ── Load ──────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // Load
+    // ─────────────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val id = url.trim().removePrefix("/").substringBefore('?').toIntOrNull()
@@ -280,7 +307,7 @@ class KawaiiAnime : MainAPI() {
         log("load id=$id")
 
         mediaCache[id.toString()]?.let {
-            log("load id=$id from media cache (title=${it.optJSONObject("title")?.optString("english")})")
+            log("load id=$id from media cache")
             return@withContext buildLoadResponse(it, id)
         }
 
@@ -288,14 +315,21 @@ class KawaiiAnime : MainAPI() {
             val html = app.get("$mainUrl/anime/$id", headers = headers()).text
             log("detail html len=${html.length}")
             val rows = extractRscRows(html)
-            val media = findAnimeObject(rows, id)
+
+            var media: JSONObject? = null
+            outer@ for ((_, v) in rows) {
+                val r: Any? = if (v is String && v.startsWith("$")) resolve(v, rows) else v
+                val m = findAnimeMedia(r, id)
+                if (m != null) { media = m; break@outer }
+            }
+
             if (media != null) {
                 log("detail id=$id extracted title='${media.optJSONObject("title")?.optString("english")}' " +
                     "episodes=${media.optInt("episodes", 0)} status=${media.optString("status")}")
                 mediaCache[id.toString()] = media
                 return@withContext buildLoadResponse(media, id)
             }
-            log("detail id=$id NOT found")
+            log("detail id=$id NOT found in RSC")
         } catch (e: Exception) { logErr("detail", e) }
 
         throw ErrorLoadingException("couldn't load anime $id")
@@ -322,7 +356,7 @@ class KawaiiAnime : MainAPI() {
         val nextEp = m.optJSONObject("nextAiringEpisode")?.optInt("episode", 0) ?: 0
         val epsCount = maxOf(episodesField, (nextEp - 1).coerceAtLeast(0)).coerceAtLeast(0)
 
-        log("buildLoadResponse id=$id title='$title' status=$status episodesField=$episodesField nextEp=$nextEp -> epsCount=$epsCount")
+        log("buildLoadResponse id=$id title='$title' status=$status episodesField=$episodesField nextEp=$nextEp epsCount=$epsCount")
 
         val episodes: List<Episode> = when {
             epsCount > 0 -> (1..epsCount).map { n ->
@@ -356,7 +390,9 @@ class KawaiiAnime : MainAPI() {
             .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
-    // ── loadLinks ─────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // loadLinks
+    // ─────────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -369,8 +405,8 @@ class KawaiiAnime : MainAPI() {
         log("loadLinks: showId=$showId ep=$epNum")
 
         try {
-            val url = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
-            val res = app.get(url, headers = mapOf(
+            val apiUrl = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
+            val res = app.get(apiUrl, headers = mapOf(
                 "User-Agent" to UA, "Referer" to "$mainUrl/",
                 "Accept" to "*/*", "Origin" to mainUrl
             ))
@@ -382,9 +418,10 @@ class KawaiiAnime : MainAPI() {
                     ?.ifBlank { null } ?: "$mainUrl/"
 
                 var emitted = 0
-                d.optJSONArray("sources")?.let { srcs ->
-                    for (i in 0 until srcs.length()) {
-                        val s = srcs.optJSONObject(i) ?: continue
+                val sources = d.optJSONArray("sources")
+                if (sources != null) {
+                    for (i in 0 until sources.length()) {
+                        val s = sources.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
                         val m3u8 = s.optBoolean("isM3U8", false) || u.contains(".m3u8")
                         val q = s.optString("quality").filter { it.isDigit() }.toIntOrNull()
@@ -399,7 +436,8 @@ class KawaiiAnime : MainAPI() {
                         emitted++
                     }
                 }
-                d.optJSONArray("subtitles")?.let { subs ->
+                val subs = d.optJSONArray("subtitles")
+                if (subs != null) {
                     for (i in 0 until subs.length()) {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
@@ -423,7 +461,8 @@ class KawaiiAnime : MainAPI() {
                         quality = Qualities.Unknown.value
                         this.headers = mapOf("User-Agent" to UA)
                     })
-                    json.optJSONArray("subtitles")?.let { subs ->
+                    val subs = json.optJSONArray("subtitles")
+                    if (subs != null) {
                         for (i in 0 until subs.length()) {
                             val s = subs.optJSONObject(i) ?: continue
                             val su = s.optString("url")
