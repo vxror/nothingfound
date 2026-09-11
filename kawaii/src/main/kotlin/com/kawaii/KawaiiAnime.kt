@@ -46,8 +46,6 @@ class KawaiiAnime : MainAPI() {
             "TOP_RATED"        to "topRated"
         )
 
-        // byte-for-byte copy of the query the site itself sends to /api/anilist
-        // whitespace matters — Next.js caches responses keyed on the raw request body
         private val SITE_SEARCH_QUERY: String =
             "\n    query (\$page: Int, \$perPage: Int, \$search: String) {\n" +
             "      Page(page: \$page, perPage: \$perPage) {\n" +
@@ -609,9 +607,14 @@ class KawaiiAnime : MainAPI() {
 
     // Writes styled ASS to app cache dir, returns file:// URL — the player's
     // subtitle picker only accepts http/https/file, not data:.
+    // MainAPI has no `context`; AcraApplication.getContext() is the correct hook.
     private fun writeSubFile(content: String, name: String): String? {
         return try {
-            val dir = File(app.context.cacheDir, "kawaii_subs").apply { mkdirs() }
+            val ctx = AcraApplication.getContext() ?: run {
+                log("writeSubFile: no app context")
+                return null
+            }
+            val dir = File(ctx.cacheDir, "kawaii_subs").apply { mkdirs() }
             val f = File(dir, name)
             f.writeText(content, Charsets.UTF_8)
             log("sub file written: ${f.absolutePath} (${f.length()} bytes)")
