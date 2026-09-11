@@ -34,9 +34,7 @@ class KawaiiAnime : MainAPI() {
         private val gqlCache = ConcurrentHashMap<String, Pair<Long, JSONObject>>()
 
         // [v4] flight-parsed media cache — full AniList media objects from the
-        // homepage's server-rendered RSC payload, keyed by anilist id. these
-        // survive AniList API outages completely — load() builds from them
-        // with zero API calls.
+        // homepage's server-rendered RSC payload, keyed by anilist id.
         private val flightMedia = ConcurrentHashMap<String, JSONObject>()
 
         @Volatile private var flightFetchedAt = 0L
@@ -47,7 +45,7 @@ class KawaiiAnime : MainAPI() {
     private fun logErr(stage: String, e: Throwable) { Log.e(TAG, "$stage: ${e.message}", e) }
 
     // ════════════════════════════════════════════════════════════
-    //  FLIGHT PARSER — the outage-proof data source
+    //  FLIGHT PARSER
     // ════════════════════════════════════════════════════════════
 
     private suspend fun fetchFlightShows(): List<SearchResponse> {
@@ -76,8 +74,6 @@ class KawaiiAnime : MainAPI() {
     private fun parseFlight(html: String): List<SearchResponse> {
         val out = ArrayList<SearchResponse>()
         try {
-            // extract + unescape all flight chunks (the JSON-parse trick
-            // handles every JS string escape correctly)
             val stream = StringBuilder()
             val chunkRx = Regex("""self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)""")
             chunkRx.findAll(html).forEach { m ->
@@ -87,7 +83,6 @@ class KawaiiAnime : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // build row table: rowId -> parsed JSON
             val rows = HashMap<String, Any>()
             for (line in stream.toString().split('\n')) {
                 val trimmed = line.trim()
@@ -107,14 +102,12 @@ class KawaiiAnime : MainAPI() {
             }
             log("flight rows: ${rows.size}")
 
-            // find media rows (id + idMal + title = AniList media)
             for ((_, value) in rows) {
                 if (value !is JSONObject) continue
                 if (!value.has("id") || !value.has("idMal") || !value.has("title")) continue
                 val id = value.optInt("id")
                 if (id <= 0) continue
 
-                // resolve $N references (title, coverImage, genres, etc.)
                 val resolved = JSONObject()
                 for (key in value.keys()) {
                     val v = value.opt(key)
@@ -152,7 +145,7 @@ class KawaiiAnime : MainAPI() {
     }
 
     // ════════════════════════════════════════════════════════════
-    //  AniList GraphQL chain (primary when healthy)
+    //  AniList GraphQL chain
     // ════════════════════════════════════════════════════════════
 
     private suspend fun gql(query: String, variables: JSONObject = JSONObject()): JSONObject? {
@@ -258,8 +251,7 @@ class KawaiiAnime : MainAPI() {
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Main page — Trending = flight parse (always works);
-    //  other sections = AniList chain
+    //  Main page
     // ════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
@@ -274,7 +266,6 @@ class KawaiiAnime : MainAPI() {
         withContext(Dispatchers.IO) {
             log("getMainPage: section='${request.name}' page=$page")
 
-            // Trending = homepage's own server-rendered data — outage-proof
             if (request.data == "TRENDING" && page == 1) {
                 val shows = fetchFlightShows()
                 log("Trending (flight) -> ${shows.size} shows")
@@ -378,20 +369,18 @@ class KawaiiAnime : MainAPI() {
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Load — flight cache first (outage-proof), then AniList
+    //  Load
     // ════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val anilistId = url.trim().removePrefix("/").substringBefore('?').toIntOrNull()
             ?: throw ErrorLoadingException("invalid id: $url")
 
-        // 1. flight cache (survives AniList outages)
         flightMedia[anilistId.toString()]?.let { media ->
             log("load id=$anilistId from FLIGHT cache")
             return@withContext buildLoadResponse(media, anilistId)
         }
 
-        // 2. AniList chain
         val q = """query (${'$'}id: Int) {
             Media(id: ${'$'}id, type: ANIME) {
                 id
@@ -414,7 +403,7 @@ class KawaiiAnime : MainAPI() {
         buildLoadResponse(media, anilistId)
     }
 
-    private fun buildLoadResponse(media: JSONObject, anilistId: Int): LoadResponse {
+    private suspend fun buildLoadResponse(media: JSONObject, anilistId: Int): LoadResponse {
         val title = pickTitle(media.optJSONObject("title")).ifEmpty { "Anime $anilistId" }
         val cover = media.optJSONObject("coverImage")?.let {
             it.optString("extraLarge").ifEmpty { it.optString("large") }
@@ -450,7 +439,7 @@ class KawaiiAnime : MainAPI() {
             else -> emptyList()
         }
 
-        newAnimeLoadResponse(title, "$anilistId", if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+        return newAnimeLoadResponse(title, "$anilistId", if (isMovie) TvType.AnimeMovie else TvType.Anime) {
             this.posterUrl = cover
             this.backgroundPosterUrl = banner
             this.plot = plot
@@ -468,7 +457,7 @@ class KawaiiAnime : MainAPI() {
     }
 
     // ════════════════════════════════════════════════════════════
-    //  loadLinks — /api/miruro (unaffected by AniList outages)
+    //  loadLinks
     // ════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
@@ -483,7 +472,6 @@ class KawaiiAnime : MainAPI() {
         val episodeId = "$showId-ep$epNum"
         log("loadLinks: showId=$showId ep=$epNum")
 
-        // ── primary: /api/miruro (verified live) ──
         try {
             val apiUrl = "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub"
             val res = app.get(apiUrl, headers = mapOf(
@@ -546,7 +534,6 @@ class KawaiiAnime : MainAPI() {
             logErr("miruro", e)
         }
 
-        // ── fallback: video-cache API ──
         try {
             val res = app.get("$mainUrl/api/video-cache?episodeId=$episodeId",
                 headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/"))
@@ -576,7 +563,6 @@ class KawaiiAnime : MainAPI() {
             logErr("video-cache", e)
         }
 
-        // ── last resort: direct URL pattern ──
         val direct = "$VIDEO_HOST/video/$episodeId"
         log("fallback direct: $direct")
         callback(newExtractorLink(name, "Kawaii (Direct)", direct, ExtractorLinkType.VIDEO) {
