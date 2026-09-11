@@ -4,20 +4,19 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Calendar
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 class KawaiiAnime : MainAPI() {
     override var mainUrl = "https://kawaiianime.cc"
     override var name = "KawaiiAnime"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
-    override var lang = "ar"
+    override var lang = "en"
     override val hasMainPage = true
 
     companion object {
@@ -25,427 +24,374 @@ class KawaiiAnime : MainAPI() {
         private const val VIDEO_HOST = "https://video.kawaii-anime.com"
         private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-        private val GQL_ENDPOINTS = listOf(
-            "https://graphql.anilist.co",
-            "https://kawaiianime.cc/api/anilist"
+        // homepage RSC cache — one fetch serves all 5 sections
+        @Volatile private var homeFetchedAt = 0L
+        private const val HOME_TTL_MS = 10 * 60_000L
+        private val homeSections = ConcurrentHashMap<String, List<SearchResponse>>()
+        private val mediaCache = ConcurrentHashMap<String, JSONObject>()
+
+        // map cloudstream section key -> RSC section key
+        private val SECTION_MAP = mapOf(
+            "TRENDING" to "trending",
+            "POPULAR" to "popular",
+            "THIS_SEASON" to "thisSeason",
+            "RECENTLY_UPDATED" to "recentlyUpdated",
+            "TOP_RATED" to "topRated"
         )
-
-        private const val GQL_CACHE_TTL_MS = 5 * 60_000L
-        private val gqlCache = ConcurrentHashMap<String, Pair<Long, JSONObject>>()
-
-        // [v4] flight-parsed media cache — full AniList media objects from the
-        // homepage's server-rendered RSC payload, keyed by anilist id.
-        private val flightMedia = ConcurrentHashMap<String, JSONObject>()
-
-        @Volatile private var flightFetchedAt = 0L
-        private const val FLIGHT_TTL_MS = 10 * 60_000L
     }
 
     private fun log(msg: String) { Log.d(TAG, msg) }
     private fun logErr(stage: String, e: Throwable) { Log.e(TAG, "$stage: ${e.message}", e) }
 
+    private fun baseHeaders() = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.9"
+    )
+
     // ════════════════════════════════════════════════════════════
-    //  FLIGHT PARSER
+    //  RSC (React Server Components) parser
     // ════════════════════════════════════════════════════════════
 
-    private suspend fun fetchFlightShows(): List<SearchResponse> {
-        if (System.currentTimeMillis() - flightFetchedAt < FLIGHT_TTL_MS && flightMedia.isNotEmpty()) {
-            log("flight cache hit — ${flightMedia.size} media objects")
-            return flightMedia.values.mapNotNull { m -> flightToShow(m) }
+    /** Pull every self.__next_f.push([1,"..."]) chunk, unescape, join into one string. */
+    private fun extractRscStream(html: String): String {
+        val out = StringBuilder()
+        val rx = Regex("""self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)""")
+        var n = 0
+        rx.findAll(html).forEach { m ->
+            try {
+                // wrap in a JSON string literal so JSONObject handles ALL escape sequences
+                val unescaped = JSONObject("{\"s\":\"${m.groupValues[1]}\"}").optString("s")
+                out.append(unescaped).append('\n')
+                n++
+            } catch (_: Exception) {}
         }
-        return try {
-            val res = app.get(mainUrl, headers = mapOf(
-                "User-Agent" to UA,
-                "Accept" to "text/html,application/xhtml+xml",
-                "Accept-Language" to "ar,en;q=0.9"
-            ))
-            val html = res.text
-            log("homepage fetched, ${html.length} chars")
-            val shows = parseFlight(html)
-            flightFetchedAt = System.currentTimeMillis()
-            log("flight parse -> ${shows.size} shows, ${flightMedia.size} cached media")
-            shows
-        } catch (e: Exception) {
-            logErr("fetchFlight", e)
-            flightMedia.values.mapNotNull { m -> flightToShow(m) }
-        }
+        log("rsc chunks: $n, stream len=${out.length}")
+        return out.toString()
     }
 
-    private fun parseFlight(html: String): List<SearchResponse> {
-        val out = ArrayList<SearchResponse>()
-        try {
-            val stream = StringBuilder()
-            val chunkRx = Regex("""self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)""")
-            chunkRx.findAll(html).forEach { m ->
-                try {
-                    val unescaped = JSONObject("{\"s\":\"${m.groupValues[1]}\"}").optString("s")
-                    stream.append(unescaped).append('\n')
-                } catch (_: Exception) {}
-            }
-
-            val rows = HashMap<String, Any>()
-            for (line in stream.toString().split('\n')) {
-                val trimmed = line.trim()
-                if (trimmed.length < 5) continue
-                val colonIdx = trimmed.indexOf(':')
-                if (colonIdx <= 0 || colonIdx > 4) continue
-                val rowId = trimmed.substring(0, colonIdx)
-                if (!rowId.matches(Regex("^[0-9a-f]+$"))) continue
-                val content = trimmed.substring(colonIdx + 1)
-                try {
-                    rows[rowId] = when {
-                        content.startsWith("{") -> JSONObject(content)
-                        content.startsWith("[") -> JSONArray(content)
-                        else -> content
-                    }
-                } catch (_: Exception) {}
-            }
-            log("flight rows: ${rows.size}")
-
-            for ((_, value) in rows) {
-                if (value !is JSONObject) continue
-                if (!value.has("id") || !value.has("idMal") || !value.has("title")) continue
-                val id = value.optInt("id")
-                if (id <= 0) continue
-
-                val resolved = JSONObject()
-                for (key in value.keys()) {
-                    val v = value.opt(key)
-                    if (v is String && v.startsWith("$") && v.length > 1) {
-                        resolved.put(key, rows[v.substring(1)] ?: JSONObject.NULL)
-                    } else {
-                        resolved.put(key, v)
-                    }
+    /** Parse "hexid:payload" lines into rowId -> Any(JSONObject|JSONArray|String). */
+    private fun parseRscRows(stream: String): Map<String, Any> {
+        val rows = HashMap<String, Any>()
+        for (line in stream.split('\n')) {
+            val t = line.trim()
+            if (t.length < 3) continue
+            val ci = t.indexOf(':')
+            if (ci <= 0 || ci > 6) continue
+            val rid = t.substring(0, ci)
+            if (!rid.matches(Regex("^[0-9a-fA-F]+$"))) continue
+            val payload = t.substring(ci + 1)
+            try {
+                rows[rid] = when {
+                    payload.startsWith("{") -> JSONObject(payload)
+                    payload.startsWith("[") -> JSONArray(payload)
+                    else -> payload
                 }
-
-                flightMedia[id.toString()] = resolved
-                flightToShow(resolved)?.let { out.add(it) }
-            }
-        } catch (e: Exception) {
-            logErr("parseFlight", e)
+            } catch (_: Exception) {}
         }
-        return out
+        log("rsc rows: ${rows.size}")
+        return rows
     }
 
-    private fun flightToShow(m: JSONObject): SearchResponse? {
+    /** Recursively resolve $N references against the row table. */
+    private fun deepResolve(value: Any?, rows: Map<String, Any>, depth: Int = 0): Any? {
+        if (depth > 20 || value == null) return value
+        return when (value) {
+            is String -> {
+                if (value.startsWith("$") && value.length > 1 && value[1] != '"') {
+                    val target = rows[value.substring(1)] ?: return value
+                    deepResolve(target, rows, depth + 1)
+                } else value
+            }
+            is JSONArray -> {
+                val out = JSONArray()
+                for (i in 0 until value.length()) {
+                    out.put(deepResolve(value.opt(i), rows, depth + 1))
+                }
+                out
+            }
+            is JSONObject -> {
+                val out = JSONObject()
+                for (k in value.keys()) {
+                    out.put(k, deepResolve(value.opt(k), rows, depth + 1))
+                }
+                out
+            }
+            else -> value
+        }
+    }
+
+    /** Find the object with {trending, popular, thisSeason, recentlyUpdated, topRated}. */
+    private fun findSectionContainer(rows: Map<String, Any>): JSONObject? {
+        for ((_, v) in rows) {
+            val resolved = if (v is String && v.startsWith("$")) deepResolve(v, rows) else v
+            if (resolved !is JSONObject) continue
+            if (resolved.has("trending") && resolved.has("popular") &&
+                resolved.has("thisSeason") && resolved.has("recentlyUpdated")) {
+                return resolved
+            }
+        }
+        return null
+    }
+
+    /** Convert one raw media JSONObject (already deep-resolved) into a SearchResponse. */
+    private fun mediaToShow(m: JSONObject): SearchResponse? {
+        val id = m.optInt("id", 0)
+        if (id <= 0) return null
         val titleObj = m.optJSONObject("title") ?: return null
         val title = titleObj.optString("english")
             .ifEmpty { titleObj.optString("romaji").ifEmpty { titleObj.optString("native") } }
         if (title.isBlank()) return null
         val coverObj = m.optJSONObject("coverImage")
         val cover = coverObj?.optString("extraLarge")?.ifEmpty { coverObj.optString("large") } ?: ""
-        val id = m.optInt("id").toString()
         val format = m.optString("format")
         val type = if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
-        return newAnimeSearchResponse(title, id, type) {
+
+        mediaCache[id.toString()] = m
+
+        return newAnimeSearchResponse(title, id.toString(), type) {
             posterUrl = cover
-            this.year = m.optJSONObject("startDate")?.optInt("year")?.takeIf { it > 0 }
-                ?: m.optInt("seasonYear", 0).takeIf { it > 0 }
+            this.year = m.optInt("seasonYear", 0).takeIf { it > 0 }
         }
     }
 
-    // ════════════════════════════════════════════════════════════
-    //  AniList GraphQL chain
-    // ════════════════════════════════════════════════════════════
+    private fun extractSection(container: JSONObject, key: String, rows: Map<String, Any>): List<SearchResponse> {
+        val raw = container.opt(key) ?: return emptyList()
+        val resolved = deepResolve(raw, rows) as? JSONArray ?: return emptyList()
+        val out = ArrayList<SearchResponse>()
+        for (i in 0 until resolved.length()) {
+            val obj = resolved.opt(i) as? JSONObject ?: continue
+            mediaToShow(obj)?.let { out.add(it) }
+        }
+        return out
+    }
 
-    private suspend fun gql(query: String, variables: JSONObject = JSONObject()): JSONObject? {
-        val cacheKey = "${query.hashCode()}|${variables}"
-        gqlCache[cacheKey]?.let { (ts, cached) ->
-            if (System.currentTimeMillis() - ts < GQL_CACHE_TTL_MS) {
-                log("gql cache hit")
-                return cached
+    /** Fetch homepage once, parse ALL sections, cache. */
+    private suspend fun ensureHomeCache(): Boolean {
+        if (System.currentTimeMillis() - homeFetchedAt < HOME_TTL_MS && homeSections.isNotEmpty()) {
+            log("home cache hit (${homeSections.size} sections)")
+            return true
+        }
+        return try {
+            log("fetching homepage: $mainUrl")
+            val html = app.get(mainUrl, headers = baseHeaders()).text
+            log("homepage len=${html.length}")
+
+            val stream = extractRscStream(html)
+            val rows = parseRscRows(stream)
+            val container = findSectionContainer(rows)
+            if (container == null) {
+                log("no section container found in RSC")
+                return false
             }
-            gqlCache.remove(cacheKey)
-        }
 
-        val body = JSONObject()
-            .put("query", query)
-            .put("variables", variables)
-            .toString()
-            .toRequestBody("application/json".toMediaType())
-        val headers = mapOf(
-            "User-Agent" to UA,
-            "Accept" to "application/json",
-            "Content-Type" to "application/json",
-            "Origin" to "https://anilist.co",
-            "Referer" to "https://anilist.co/"
-        )
-
-        for ((idx, endpoint) in GQL_ENDPOINTS.withIndex()) {
-            try {
-                val res = app.post(endpoint, requestBody = body, headers = headers)
-                val text = res.text
-                log("gql[$idx] $endpoint -> HTTP ${res.code} len=${text.length}")
-
-                if (res.code == 429 && idx == 0) {
-                    val waitSec = res.headers["Retry-After"]?.toLongOrNull() ?: 3L
-                    log("gql 429 — waiting ${waitSec}s")
-                    delay((waitSec * 1000L).coerceAtMost(10_000L))
-                }
-
-                if (!res.isSuccessful) {
-                    log("gql[$idx] FAIL: ${text.take(200)}")
-                    continue
-                }
-
-                val json = JSONObject(text)
-                val data = json.optJSONObject("data")
-                if (data == null) {
-                    log("gql[$idx] no data — errors: ${json.optJSONArray("errors")?.toString()?.take(200) ?: "none"}")
-                    continue
-                }
-
-                gqlCache[cacheKey] = System.currentTimeMillis() to data
-                return data
-            } catch (e: Exception) {
-                logErr("gql[$idx] $endpoint", e)
+            val found = HashMap<String, List<SearchResponse>>()
+            for ((csKey, rscKey) in SECTION_MAP) {
+                val shows = extractSection(container, rscKey, rows)
+                log("section $csKey <- $rscKey : ${shows.size} shows")
+                if (shows.isNotEmpty()) found[csKey] = shows
             }
-        }
 
-        log("gql: ALL endpoints failed")
-        return null
-    }
+            if (found.isEmpty()) {
+                log("homepage RSC yielded 0 sections")
+                return false
+            }
 
-    private fun stripHtml(s: String?): String =
-        (s ?: "").replace(Regex("<br\\s*/?>"), "\n")
-            .replace(Regex("<[^>]*>"), "")
-            .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
-            .replace("&mdash;", "—").replace("&ndash;", "–")
-            .trim()
-
-    private fun pickTitle(t: JSONObject?): String {
-        if (t == null) return ""
-        return t.optString("english")
-            .ifEmpty { t.optString("romaji").ifEmpty { t.optString("native") } }
-    }
-
-    private fun parseShows(media: JSONArray): List<SearchResponse> {
-        val list = ArrayList<SearchResponse>()
-        for (i in 0 until media.length()) {
-            val m = media.optJSONObject(i) ?: continue
-            val title = pickTitle(m.optJSONObject("title"))
-            if (title.isBlank()) continue
-            val cover = m.optJSONObject("coverImage")?.let {
-                it.optString("extraLarge").ifEmpty { it.optString("large") }
-            } ?: ""
-            val id = m.optInt("id").toString()
-            val format = m.optString("format")
-            val type = if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
-            list.add(newAnimeSearchResponse(title, id, type) {
-                posterUrl = cover
-                this.year = m.optJSONObject("startDate")?.optInt("year")?.takeIf { it > 0 }
-            })
-        }
-        return list
-    }
-
-    private fun currentSeason(): Pair<String, Int> {
-        val cal = Calendar.getInstance()
-        val year = cal.get(Calendar.YEAR)
-        return when (cal.get(Calendar.MONTH)) {
-            Calendar.DECEMBER, Calendar.JANUARY, Calendar.FEBRUARY -> "WINTER" to year
-            Calendar.MARCH, Calendar.APRIL, Calendar.MAY             -> "SPRING" to year
-            Calendar.JUNE, Calendar.JULY, Calendar.AUGUST            -> "SUMMER" to year
-            else                                                     -> "FALL"   to year
+            homeSections.clear()
+            homeSections.putAll(found)
+            homeFetchedAt = System.currentTimeMillis()
+            log("home cache refreshed: ${homeSections.size} sections, ${mediaCache.size} media cached")
+            true
+        } catch (e: Exception) {
+            logErr("ensureHomeCache", e)
+            false
         }
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Main page
+    //  Main page — everything comes from the RSC cache
     // ════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "TRENDING"        to "Trending",
-        "POPULARITY_DESC" to "Popular",
-        "THIS_SEASON"     to "This Season",
-        "UPDATED_AT_DESC" to "Recently Updated",
-        "SCORE_DESC"      to "Top Rated"
+        "TRENDING"         to "Trending",
+        "POPULAR"          to "Popular",
+        "THIS_SEASON"      to "This Season",
+        "RECENTLY_UPDATED" to "Recently Updated",
+        "TOP_RATED"        to "Top Rated"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse =
         withContext(Dispatchers.IO) {
-            log("getMainPage: section='${request.name}' page=$page")
+            log("getMainPage: '${request.name}' key=${request.data} page=$page")
 
-            if (request.data == "TRENDING" && page == 1) {
-                val shows = fetchFlightShows()
-                log("Trending (flight) -> ${shows.size} shows")
-                return@withContext newHomePageResponse(
-                    HomePageList(request.name, shows),
-                    hasNext = false
-                )
-            }
-
-            val perPage = 20
-            val query: String
-            val vars: JSONObject
-
-            when (request.data) {
-                "POPULARITY_DESC" -> {
-                    query = """query (${'$'}page: Int, ${'$'}perPage: Int) {
-                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                            pageInfo { hasNextPage }
-                            media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
-                                id title { romaji english native } coverImage { extraLarge large } startDate { year } format
-                            }
-                        }
-                    }"""
-                    vars = JSONObject().put("page", page).put("perPage", perPage)
-                }
-                "THIS_SEASON" -> {
-                    val (season, year) = currentSeason()
-                    query = """query (${'$'}page: Int, ${'$'}perPage: Int, ${'$'}season: MediaSeason, ${'$'}year: Int) {
-                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                            pageInfo { hasNextPage }
-                            media(type: ANIME, season: ${'$'}season, seasonYear: ${'$'}year, sort: POPULARITY_DESC, isAdult: false) {
-                                id title { romaji english native } coverImage { extraLarge large } startDate { year } format
-                            }
-                        }
-                    }"""
-                    vars = JSONObject().put("page", page).put("perPage", perPage)
-                        .put("season", season).put("year", year)
-                }
-                "UPDATED_AT_DESC" -> {
-                    query = """query (${'$'}page: Int, ${'$'}perPage: Int) {
-                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                            pageInfo { hasNextPage }
-                            media(type: ANIME, status: RELEASING, sort: UPDATED_AT_DESC, isAdult: false) {
-                                id title { romaji english native } coverImage { extraLarge large } startDate { year } format
-                            }
-                        }
-                    }"""
-                    vars = JSONObject().put("page", page).put("perPage", perPage)
-                }
-                "SCORE_DESC" -> {
-                    query = """query (${'$'}page: Int, ${'$'}perPage: Int) {
-                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                            pageInfo { hasNextPage }
-                            media(type: ANIME, sort: SCORE_DESC, isAdult: false) {
-                                id title { romaji english native } coverImage { extraLarge large } startDate { year } format
-                            }
-                        }
-                    }"""
-                    vars = JSONObject().put("page", page).put("perPage", perPage)
-                }
-                else -> {
-                    return@withContext newHomePageResponse(
-                        HomePageList(request.name, emptyList()), hasNext = false
-                    )
-                }
-            }
-
-            val data = gql(query, vars)
-            if (data == null) {
-                log("AniList failed for '${request.name}'")
+            if (!ensureHomeCache()) {
                 return@withContext newHomePageResponse(
                     HomePageList(request.name, emptyList()), hasNext = false
                 )
             }
 
-            val pageData = data.optJSONObject("Page")
-                ?: return@withContext newHomePageResponse(
-                    HomePageList(request.name, emptyList()), hasNext = false
-                )
+            val shows = homeSections[request.data] ?: emptyList()
+            log("serving ${shows.size} shows for ${request.name}")
 
-            val media = pageData.optJSONArray("media") ?: JSONArray()
-            val hasNext = pageData.optJSONObject("pageInfo")?.optBoolean("hasNextPage") ?: false
-            val shows = parseShows(media)
-            log("section '${request.name}' -> ${shows.size} shows")
-            newHomePageResponse(HomePageList(request.name, shows), hasNext)
+            newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
+
+    // ════════════════════════════════════════════════════════════
+    //  Search — hit the site's search page RSC, with API fallback
+    // ════════════════════════════════════════════════════════════
 
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         log("search: '$query'")
-        val q = """query (${'$'}search: String) {
-            Page(page: 1, perPage: 40) {
-                media(type: ANIME, search: ${'$'}search, sort: SEARCH_MATCH, isAdult: false) {
-                    id title { romaji english native } coverImage { extraLarge large } startDate { year } format
+
+        val encoded = URLEncoder.encode(query, "UTF-8")
+
+        // try a few endpoint patterns in order
+        val urls = listOf(
+            "$mainUrl/api/anilist/search?q=$encoded",
+            "$mainUrl/api/search?q=$encoded",
+            "$mainUrl/search?q=$encoded"
+        )
+
+        for (url in urls) {
+            try {
+                val res = app.get(url, headers = baseHeaders())
+                log("search try $url -> ${res.code} len=${res.text.length}")
+                if (!res.isSuccessful) continue
+
+                val text = res.text
+                val out = ArrayList<SearchResponse>()
+
+                // case A: JSON array / object with media objects
+                if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
+                    try {
+                        val json = if (text.trimStart().startsWith("[")) JSONObject("{\"r\":$text}").optJSONArray("r")
+                                   else JSONObject(text).optJSONArray("results")
+                                ?: JSONObject(text).optJSONArray("data")
+                                ?: JSONObject(text).optJSONArray("media")
+                        if (json != null) {
+                            for (i in 0 until json.length()) {
+                                val obj = json.optJSONObject(i) ?: continue
+                                mediaToShow(obj)?.let { out.add(it) }
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
+
+                // case B: HTML with RSC payload
+                if (out.isEmpty() && text.contains("self.__next_f.push")) {
+                    val stream = extractRscStream(text)
+                    val rows = parseRscRows(stream)
+                    // walk every JSONObject for id+title+coverImage
+                    for ((_, v) in rows) {
+                        val resolved = if (v is String && v.startsWith("$")) deepResolve(v, rows) else v
+                        if (resolved !is JSONObject) continue
+                        if (!resolved.has("id") || !resolved.has("title")) continue
+                        mediaToShow(resolved)?.let { out.add(it) }
+                    }
+                }
+
+                if (out.isNotEmpty()) {
+                    log("search '$query' -> ${out.size} results via $url")
+                    return@withContext out
+                }
+            } catch (e: Exception) {
+                logErr("search $url", e)
             }
-        }"""
-        val data = gql(q, JSONObject().put("search", query)) ?: return@withContext emptyList()
-        val media = data.optJSONObject("Page")?.optJSONArray("media") ?: return@withContext emptyList()
-        parseShows(media)
+        }
+
+        log("search '$query' -> 0 results")
+        emptyList()
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Load
+    //  Load — cache hit first, then anime detail page RSC
     // ════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
-        val anilistId = url.trim().removePrefix("/").substringBefore('?').toIntOrNull()
+        val id = url.trim().removePrefix("/").substringBefore('?').toIntOrNull()
             ?: throw ErrorLoadingException("invalid id: $url")
+        log("load id=$id")
 
-        flightMedia[anilistId.toString()]?.let { media ->
-            log("load id=$anilistId from FLIGHT cache")
-            return@withContext buildLoadResponse(media, anilistId)
+        // 1. try cached media from homepage / search
+        mediaCache[id.toString()]?.let { cached ->
+            log("load id=$id from media cache")
+            return@withContext buildLoadResponse(cached, id)
         }
 
-        val q = """query (${'$'}id: Int) {
-            Media(id: ${'$'}id, type: ANIME) {
-                id
-                title { romaji english native }
-                description(asHtml: false)
-                coverImage { extraLarge large }
-                bannerImage
-                genres
-                status
-                format
-                episodes
-                averageScore
-                startDate { year }
-                nextAiringEpisode { episode }
-            }
-        }"""
-        val media = gql(q, JSONObject().put("id", anilistId))?.optJSONObject("Media")
-            ?: throw ErrorLoadingException("couldn't load anime $anilistId")
+        // 2. fetch detail page and parse RSC
+        val detailPaths = listOf(
+            "$mainUrl/anime/$id",
+            "$mainUrl/watch/$id",
+            "$mainUrl/$id"
+        )
+        for (path in detailPaths) {
+            try {
+                val html = app.get(path, headers = baseHeaders()).text
+                log("detail $path -> ${html.length} chars")
+                val stream = extractRscStream(html)
+                val rows = parseRscRows(stream)
 
-        buildLoadResponse(media, anilistId)
+                // find a JSONObject matching this id
+                var found: JSONObject? = null
+                for ((_, v) in rows) {
+                    val resolved = if (v is String && v.startsWith("$")) deepResolve(v, rows) else v
+                    if (resolved !is JSONObject) continue
+                    if (resolved.optInt("id", 0) == id && resolved.has("title")) {
+                        found = resolved
+                        break
+                    }
+                }
+                if (found != null) {
+                    log("detail id=$id found in $path")
+                    return@withContext buildLoadResponse(found, id)
+                }
+            } catch (e: Exception) {
+                logErr("detail $path", e)
+            }
+        }
+
+        throw ErrorLoadingException("couldn't load anime $id")
     }
 
-    private suspend fun buildLoadResponse(media: JSONObject, anilistId: Int): LoadResponse {
-        val title = pickTitle(media.optJSONObject("title")).ifEmpty { "Anime $anilistId" }
-        val cover = media.optJSONObject("coverImage")?.let {
+    private suspend fun buildLoadResponse(m: JSONObject, id: Int): LoadResponse {
+        val title = pickTitle(m.optJSONObject("title")).ifEmpty { "Anime $id" }
+        val cover = m.optJSONObject("coverImage")?.let {
             it.optString("extraLarge").ifEmpty { it.optString("large") }
         } ?: ""
-        val banner = media.optString("bannerImage").ifEmpty { null }
-        val plot = stripHtml(media.optString("description"))
-        val genres = media.optJSONArray("genres")?.let { g ->
+        val banner = m.optString("bannerImage").ifEmpty { null }
+        val plot = stripHtml(m.optString("description"))
+        val genres = m.optJSONArray("genres")?.let { g ->
             (0 until g.length()).map { g.optString(it) }.filter { it.isNotBlank() }
         } ?: emptyList()
-        val status = media.optString("status")
-        val format = media.optString("format")
+        val status = m.optString("status")
+        val format = m.optString("format")
         val isMovie = format == "MOVIE"
-        val score = media.optInt("averageScore", 0)
+        val score = m.optInt("averageScore", 0)
 
-        val nextAiring = media.optJSONObject("nextAiringEpisode")
+        val nextAiring = m.optJSONObject("nextAiringEpisode")
         val epsCount = when {
             status == "RELEASING" && nextAiring != null ->
                 (nextAiring.optInt("episode", 0) - 1).coerceAtLeast(0)
-            else -> media.optInt("episodes", 0)
+            else -> m.optInt("episodes", 0)
         }
 
         val episodes: List<Episode> = when {
             epsCount > 0 -> (1..epsCount).map { n ->
-                newEpisode("$anilistId|$n") {
-                    this.name = "Episode $n"
-                    this.episode = n
-                }
+                newEpisode("$id|$n") { this.name = "Episode $n"; this.episode = n }
             }
-            isMovie -> listOf(newEpisode("$anilistId|1") {
-                this.name = "Movie"
-                this.episode = 1
-            })
+            isMovie -> listOf(newEpisode("$id|1") { this.name = "Movie"; this.episode = 1 })
             else -> emptyList()
         }
 
-        return newAnimeLoadResponse(title, "$anilistId", if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+        log("loadResponse id=$id title='$title' eps=${episodes.size}")
+
+        return newAnimeLoadResponse(title, "$id", if (isMovie) TvType.AnimeMovie else TvType.Anime) {
             this.posterUrl = cover
             this.backgroundPosterUrl = banner
             this.plot = plot
             this.tags = genres
-            this.year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it > 0 }
-                ?: media.optInt("seasonYear", 0).takeIf { it > 0 }
+            this.year = m.optInt("seasonYear", 0).takeIf { it > 0 }
             this.score = if (score > 0) Score.from10(score / 10.0) else null
             this.showStatus = when (status) {
                 "FINISHED" -> ShowStatus.Completed
@@ -456,8 +402,21 @@ class KawaiiAnime : MainAPI() {
         }
     }
 
+    private fun pickTitle(t: JSONObject?): String {
+        if (t == null) return ""
+        return t.optString("english")
+            .ifEmpty { t.optString("romaji").ifEmpty { t.optString("native") } }
+    }
+
+    private fun stripHtml(s: String?): String =
+        (s ?: "").replace(Regex("<br\\s*/?>"), "\n")
+            .replace(Regex("<[^>]*>"), "")
+            .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
+            .replace("&mdash;", "—").replace("&ndash;", "–")
+            .trim()
+
     // ════════════════════════════════════════════════════════════
-    //  loadLinks
+    //  loadLinks — unchanged, /api/miruro verified live
     // ════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
@@ -551,9 +510,7 @@ class KawaiiAnime : MainAPI() {
                         for (i in 0 until subs.length()) {
                             val s = subs.optJSONObject(i) ?: continue
                             val sUrl = s.optString("url")
-                            if (sUrl.isNotBlank()) {
-                                subtitleCallback(SubtitleFile(s.optString("lang", "en"), sUrl))
-                            }
+                            if (sUrl.isNotBlank()) subtitleCallback(SubtitleFile(s.optString("lang", "en"), sUrl))
                         }
                     }
                     return@withContext true
