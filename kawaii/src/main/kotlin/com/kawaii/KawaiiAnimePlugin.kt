@@ -7,7 +7,6 @@ import android.content.Context
 @CloudstreamPlugin
 class KawaiiAnimePlugin : Plugin() {
     override fun load(context: Context) {
-        FontInstaller.install(context)
         registerMainAPI(KawaiiAnime())
     }
 }
