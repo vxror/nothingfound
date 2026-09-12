@@ -246,7 +246,7 @@ class KawaiiAnime : MainAPI() {
                 }
             }
             is JSONArray -> for (i in 0 until root.length()) {
-                val f = findAnimeMedia(root.opt(i), targetId, depth + 1)
+                val f = findAnimeMedia(root.opt(i), depth + 1)
                 if (f != null) return f
             }
         }
@@ -547,9 +547,9 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── loadLinks ─────────────────────────────────────────────────
-    // Subtitles: pass the site's own VTT URLs straight through. OkHttp fetches
-    // them, Media3's WebVTT parser reads them, they render with the player's
-    // default caption style (white text, black outline).
+    // Subtitles route through KawaiiSubs: VTT fetched with the site's
+    // headers, converted to styled ASS (Bahij Nassim / DG Jory / signs),
+    // served from a local server. Raw VTT as fallback if conversion fails.
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -598,13 +598,15 @@ class KawaiiAnime : MainAPI() {
                         emitted++
                     }
                 }
+                // [v5] subtitles through the styled ASS converter
                 d.optJSONArray("subtitles")?.let { subs ->
                     for (i in 0 until subs.length()) {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
                         val lang = s.optString("lang").ifEmpty { "Arabic" }
-                        log("subtitle emit: $lang -> ${u.take(80)}")
-                        subtitleCallback(SubtitleFile(lang, u))
+                        val styled = KawaiiSubs.styledSubtitleUrl(u, lang) ?: u
+                        log("subtitle emit: $lang -> ${styled.take(80)}")
+                        subtitleCallback(SubtitleFile(lang, styled))
                     }
                 }
                 if (emitted > 0) return@withContext true
@@ -617,14 +619,17 @@ class KawaiiAnime : MainAPI() {
             quality = Qualities.Unknown.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
         })
+        // [v5] fallback subs also styled
         for ((lang, vttUrl) in listOf(
             "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
             "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
         )) {
             try {
                 val r = app.get(vttUrl, headers = subHeaders)
-                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true))
-                    subtitleCallback(SubtitleFile(lang, vttUrl))
+                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
+                    val styled = KawaiiSubs.styledSubtitleUrl(vttUrl, lang) ?: vttUrl
+                    subtitleCallback(SubtitleFile(lang, styled))
+                }
             } catch (_: Exception) {}
         }
         true
