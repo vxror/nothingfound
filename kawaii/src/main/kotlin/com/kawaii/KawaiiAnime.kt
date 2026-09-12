@@ -124,10 +124,13 @@ class KawaiiAnime : MainAPI() {
             "    }\n" +
             "  "
 
+        // [v12] RESTORED — the helper's proven loose parse. v9's strict
+        // /anime/(\d+) form never matched the bare "16498" episode data,
+        // which is exactly what broke loadLinks ("No Links Found").
         fun extractId(raw: String?): Int? {
             if (raw.isNullOrBlank()) return null
-            val m = Regex("""/anime/(\d+)""").find(raw) ?: return null
-            return m.groupValues[1].toIntOrNull()
+            return Regex("""(\d+)""").findAll(raw).lastOrNull()
+                ?.groupValues?.get(1)?.toIntOrNull()
         }
 
         private fun searchHeaders(referer: String) = mapOf(
@@ -581,9 +584,8 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── loadLinks ─────────────────────────────────────────────────
-    // [v11] sources FIRST and alone on the critical path; subtitles are
-    // fire-and-forget on their own supervised scope AFTER links are secured.
-    // A subtitle failure (socket, fetch, anything) can never touch the links.
+    // [v12] showId parse RESTORED to the helper's proven line. Sources first
+    // on the critical path; subtitles fire-and-forget after links secured.
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -596,16 +598,10 @@ class KawaiiAnime : MainAPI() {
             log("loadLinks ABORT: no '|' separator in data")
             return@withContext false
         }
-        val showId = extractId(parts[0])?.toString()
-            ?: parts[0].trim().takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
-        if (showId == null) {
-            log("loadLinks ABORT: unparseable showId from '${parts[0]}'")
-            return@withContext false
-        }
-        val epNum = parts[1].trim()
+        val showId = extractId(parts[0])?.toString() ?: return@withContext false
+        val epNum = parts[1]
         log("loadLinks: showId=$showId ep=$epNum")
 
-        // ── primary: /api/miruro ──
         for (attempt in 1..2) {
             try {
                 val res = app.get("$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub",
@@ -642,7 +638,6 @@ class KawaiiAnime : MainAPI() {
                 }
 
                 if (emitted > 0) {
-                    // [v11] subtitles fire-and-forget — never on the critical path
                     CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                         try {
                             d.optJSONArray("subtitles")?.let { subs ->
@@ -667,7 +662,6 @@ class KawaiiAnime : MainAPI() {
             }
         }
 
-        // ── fallback: direct URL pattern ──
         log("falling back to direct URL")
         callback(newExtractorLink(name, "Kawaii (Direct)",
             "$VIDEO_HOST/video/$showId-ep$epNum", ExtractorLinkType.VIDEO) {
