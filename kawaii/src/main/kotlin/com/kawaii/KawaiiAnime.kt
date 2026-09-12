@@ -154,30 +154,21 @@ class KawaiiAnime : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9"
     )
 
-    // ════════════════════════════════════════════════════════════
-    //  [v9] NULL-SAFE ACCESSORS — the API returns literal JSON null for
-    //  english/description/bannerImage/averageScore etc. Android's optString
-    //  on a null value can yield the STRING "null", which poisoned titles,
-    //  posters and episode counts. Every read now goes through these.
-    // ════════════════════════════════════════════════════════════
+    // ── null-safe accessors (CATALOG data only — AniList nulls live here) ──
 
-    /** optString that treats JSON null / "null" / blank as empty */
     private fun JSONObject.safeStr(key: String): String {
         if (!has(key) || isNull(key)) return ""
         return optString(key).let { if (it == "null") "" else it }
     }
 
-    /** optInt that treats JSON null / "null" as fallback */
     private fun JSONObject.safeInt(key: String, def: Int = 0): Int {
         if (!has(key) || isNull(key)) return def
         return try { optInt(key, def) } catch (_: Exception) { def }
     }
 
-    /** optJSONObject that never returns a NULL-poisoned object */
     private fun JSONObject.safeObj(key: String): JSONObject? =
         if (has(key) && !isNull(key)) optJSONObject(key) else null
 
-    /** optJSONArray, null-safe */
     private fun JSONObject.safeArr(key: String): JSONArray? =
         if (has(key) && !isNull(key)) optJSONArray(key) else null
 
@@ -290,7 +281,6 @@ class KawaiiAnime : MainAPI() {
         }
     }
 
-    /** [v9] the single validity gate — null-safe fields only */
     private fun isValidMedia(m: JSONObject): Boolean {
         val id = m.safeInt("id", -1)
         if (id <= 0) return false
@@ -522,7 +512,6 @@ class KawaiiAnime : MainAPI() {
                 "Referer" to "$mainUrl/",
                 "Origin" to mainUrl
             ))
-            log("translate HTTP ${res.code}")
             if (res.isSuccessful) {
                 val ar = JSONObject(res.text).safeStr("arabic")
                 if (ar.isNotBlank()) {
@@ -589,27 +578,35 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── loadLinks ─────────────────────────────────────────────────
+    // [v10] parsing REVERTED to the proven working calls — the null disease
+    // was in AniList catalog data, never in the miruro response, so the v9
+    // hardening here was risk without benefit. On top of the revert:
+    //  - sources are SECURED before subtitles run; subtitle failures are
+    //    fully isolated and can never void video links
+    //  - every step logs, so one logcat paste names any future failure
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        log("loadLinks: raw data='$data'")
         val parts = data.split("|")
-        if (parts.size < 2) return@withContext false
+        if (parts.size < 2) {
+            log("loadLinks ABORT: no '|' separator in data")
+            return@withContext false
+        }
+        // episode data arrives as bare digits ("113415"); urls as /anime/113415
         val showId = extractId(parts[0])?.toString()
-            ?: Regex("""^(\d+)$""").find(parts[0].trim())?.groupValues?.get(1)
-            ?: return@withContext false
-        val epNum = parts[1]
+            ?: parts[0].trim().takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+        if (showId == null) {
+            log("loadLinks ABORT: unparseable showId from '${parts[0]}'")
+            return@withContext false
+        }
+        val epNum = parts[1].trim()
         log("loadLinks: showId=$showId ep=$epNum")
 
-        val subHeaders = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$mainUrl/",
-            "Origin" to mainUrl,
-            "Accept" to "*/*"
-        )
-
+        // ── primary: /api/miruro (proven parsing, verbatim) ──
         for (attempt in 1..2) {
             try {
                 val res = app.get("$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub",
@@ -617,18 +614,23 @@ class KawaiiAnime : MainAPI() {
                         "User-Agent" to UA, "Referer" to "$mainUrl/",
                         "Accept" to "*/*", "Origin" to mainUrl
                     ))
+                log("miruro[$attempt] HTTP ${res.code} len=${res.text.length} head=${res.text.take(120)}")
                 if (!res.isSuccessful) continue
+
                 val root = JSONObject(res.text)
-                val d = root.safeObj("data") ?: root
-                val ref = d.safeObj("headers")?.safeStr("Referer")
-                    ?.ifBlank { null } ?: "$mainUrl/"
+                val d = root.optJSONObject("data") ?: root
+                val ref = d.optJSONObject("headers")?.optString("Referer")?.ifBlank { null } ?: "$mainUrl/"
+
                 var emitted = 0
-                d.safeArr("sources")?.let { srcs ->
+                val srcs = d.optJSONArray("sources")
+                log("miruro[$attempt] sources array: ${srcs?.length() ?: "null"}")
+                if (srcs != null) {
                     for (i in 0 until srcs.length()) {
                         val s = srcs.optJSONObject(i) ?: continue
-                        val u = s.safeStr("url"); if (u.isBlank()) continue
+                        val u = s.optString("url")
+                        if (u.isBlank() || u == "null") continue
                         val m3u8 = s.optBoolean("isM3U8", false) || u.contains(".m3u8")
-                        val q = s.safeStr("quality").filter { it.isDigit() }.toIntOrNull()
+                        val q = s.optString("quality").filter { it.isDigit() }.toIntOrNull()
                             ?.let { if (it in 144..2160) it else null }
                             ?: Qualities.Unknown.value
                         callback(newExtractorLink(name, "Kawaii", u,
@@ -639,38 +641,57 @@ class KawaiiAnime : MainAPI() {
                         emitted++
                     }
                 }
-                d.safeArr("subtitles")?.let { subs ->
-                    for (i in 0 until subs.length()) {
-                        val s = subs.optJSONObject(i) ?: continue
-                        val u = s.safeStr("url"); if (u.isBlank()) continue
-                        val lang = s.safeStr("lang").ifEmpty { "Arabic" }
-                        val styled = KawaiiSubs.styledSubtitleUrl(u, lang) ?: u
-                        log("subtitle emit: $lang")
-                        subtitleCallback(SubtitleFile(lang, styled))
-                    }
+
+                if (emitted > 0) {
+                    // sources secured — subtitles run AFTER, in their own
+                    // isolated try: a subtitle failure cannot void the links
+                    try {
+                        d.optJSONArray("subtitles")?.let { subs ->
+                            for (i in 0 until subs.length()) {
+                                val s = subs.optJSONObject(i) ?: continue
+                                val u = s.optString("url")
+                                if (u.isBlank() || u == "null") continue
+                                val lang = s.optString("lang").ifEmpty { "Arabic" }
+                                val styled = KawaiiSubs.styledSubtitleUrl(u, lang) ?: u
+                                log("subtitle emit: $lang")
+                                subtitleCallback(SubtitleFile(lang, styled))
+                            }
+                        }
+                    } catch (e: Exception) { logErr("subtitles (non-fatal)", e) }
+                    log("miruro success: $emitted sources")
+                    return@withContext true
                 }
-                if (emitted > 0) return@withContext true
-            } catch (_: Exception) {}
+                log("miruro[$attempt] emitted=0 — trying next")
+            } catch (e: Exception) {
+                logErr("miruro[$attempt]", e)
+            }
         }
 
+        // ── fallback: direct URL pattern ──
+        log("falling back to direct URL")
         callback(newExtractorLink(name, "Kawaii (Direct)",
             "$VIDEO_HOST/video/$showId-ep$epNum", ExtractorLinkType.VIDEO) {
             this.referer = "$mainUrl/"
             quality = Qualities.Unknown.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
         })
-        for ((lang, vttUrl) in listOf(
-            "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
-            "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
-        )) {
-            try {
-                val r = app.get(vttUrl, headers = subHeaders)
-                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
-                    val styled = KawaiiSubs.styledSubtitleUrl(vttUrl, lang) ?: vttUrl
-                    subtitleCallback(SubtitleFile(lang, styled))
-                }
-            } catch (_: Exception) {}
-        }
+        try {
+            for ((lang, vttUrl) in listOf(
+                "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
+                "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
+            )) {
+                try {
+                    val r = app.get(vttUrl, headers = mapOf(
+                        "User-Agent" to UA, "Referer" to "$mainUrl/",
+                        "Origin" to mainUrl, "Accept" to "*/*"
+                    ))
+                    if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
+                        val styled = KawaiiSubs.styledSubtitleUrl(vttUrl, lang) ?: vttUrl
+                        subtitleCallback(SubtitleFile(lang, styled))
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
         true
     }
 }
