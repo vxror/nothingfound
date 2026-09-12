@@ -12,22 +12,28 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * VTT → ASS converter + local server. Fetches the site's Arabic VTT,
- * restyles it with the operator's Arabic typography (Bahij Nassim dialogue,
- * DG Jory songs, sign styles), serves it as .ass on 127.0.0.1.
+ * VTT → styled ASS converter + local server.
  *
- * Font note: styles reference fonts by family name — install the actual
- * .ttf/.otf files into CloudStream's font dir
- * (/data/data/com.lagradost.cloudstream3/files/fonts/) once, and the
- * renderer resolves them. Without them, styling (colors/outline/size)
- * still applies via system fallback; the typeface falls back too.
+ * [v6] fixes:
+ *  - URL ends with /styled.ass → the subtitle loader detects ASS format
+ *    and applies the style block (v5 served extension-less URLs, which
+ *    made the player fall back to default rendering)
+ *  - RTL embedding: every dialogue segment is wrapped in RLE...PDF
+ *    (U+202B/U+202C), the classic Arabic fansub trick — trailing
+ *    punctuation (., !, ?) stays at the END of the line where it belongs
  */
 object KawaiiSubs {
 
     private const val TAG = "KawaiiAnime"
-    private val cache = ConcurrentHashMap<String, String>()   // vtt url -> ass text
+    private val cache = ConcurrentHashMap<String, String>()
 
     private var server: ServerSocket? = null
+
+    // bidi control chars — the RTL fix
+    private const val RLE = '‫'   // U+202B: start RTL embedding
+    private const val PDF = '‬'   // U+202C: close embedding
+    // strip any pre-existing bidi marks from input so we never double-wrap
+    private val BI_DI_CLEAN = Regex("[‪‫‬‭‮‎‏‏\u2066-\u2069\uFEFF\u200b-\u200d]")
 
     private val ASS_HEADER = """
         [Script Info]
@@ -48,7 +54,6 @@ object KawaiiSubs {
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     """.trimIndent()
 
-    /** classify a dialogue line into a style */
     private fun styleFor(text: String): String {
         val t = text.trim()
         return when {
@@ -58,10 +63,14 @@ object KawaiiSubs {
         }
     }
 
-    /** escape ASS text specials (braces and line breaks) */
-    private fun assEscape(s: String): String =
-        s.replace("{", "\\{").replace("}", "\\}")
-            .replace("\n", "\\N")
+    /** escape ASS specials, strip stale bidi marks, then RTL-wrap EVERY segment */
+    private fun assText(text: String): String {
+        val cleaned = BI_DI_CLEAN.replace(text, "")
+            .replace("{", "\\{").replace("}", "}")
+        return cleaned.split('\n')
+            .filter { it.isNotBlank() || cleaned.contains('\n') }
+            .joinToString("\\N") { RLE + it + PDF }
+    }
 
     /** VTT timestamp (00:00:02.070) → ASS timestamp (0:00:02.07) */
     private fun vttToAssTime(t: String): String {
@@ -71,7 +80,7 @@ object KawaiiSubs {
         return "$h:$min:$sec.$cs"
     }
 
-    /** convert full VTT body to ASS events */
+    /** convert full VTT body to styled ASS with RTL embedding */
     fun vttToAss(vtt: String): String {
         val sb = StringBuilder()
         sb.append(ASS_HEADER).append('\n')
@@ -93,7 +102,7 @@ object KawaiiSubs {
                     val text = textLines.joinToString("\n")
                     if (text.isNotEmpty()) {
                         val style = styleFor(text)
-                        sb.append("Dialogue: 0,$start,$end,$style,,0,0,0,,${assEscape(text)}\n")
+                        sb.append("Dialogue: 0,$start,$end,$style,,0,0,0,,${assText(text)}\n")
                     }
                     continue
                 }
@@ -103,7 +112,6 @@ object KawaiiSubs {
         return sb.toString()
     }
 
-    /** fetch the VTT (with the site headers that make it work) and convert */
     private fun fetchAndConvert(vttUrl: String): String? {
         cache[vttUrl]?.let { return it }
         return try {
@@ -114,15 +122,15 @@ object KawaiiSubs {
                 .header("Accept", "*/*")
                 .build()
             app.baseClient.newCall(req).execute().use { res ->
-                if (!res.isSuccessful) { Log.d(TAG, "sub fetch fail ${res.code} for $vttUrl"); return null }
+                if (!res.isSuccessful) { Log.d(TAG, "sub fetch fail ${res.code}"); return null }
                 val body = res.body?.string() ?: return null
                 if (!body.contains("WEBVTT")) return null
                 val ass = vttToAss(body)
                 cache[vttUrl] = ass
-                Log.d(TAG, "sub converted: $vttUrl -> ${ass.length} chars")
+                Log.d(TAG, "sub converted: ${ass.length} chars")
                 ass
             }
-        } catch (e: Exception) { Log.e(TAG, "sub convert error: ${e.message}"); null }
+        } catch (e: Exception) { Log.e(TAG, "sub convert: ${e.message}"); null }
     }
 
     private fun ensureServer(): Int? {
@@ -142,7 +150,7 @@ object KawaiiSubs {
                 }
             }.apply { isDaemon = true; name = "KawaiiSubs" }.start()
             s.localPort
-        } catch (e: Exception) { Log.e(TAG, "sub server fail: ${e.message}"); null }
+        } catch (e: Exception) { Log.e(TAG, "sub server: ${e.message}"); null }
     }
 
     private fun handle(socket: Socket) {
@@ -152,11 +160,18 @@ object KawaiiSubs {
         val parts = requestLine.split(" ")
         if (parts.size < 2) return
         val q = parts[1]
-        if (!q.startsWith("/sub")) {
+        // [v6] route is /styled.ass — the .ass suffix is what makes the
+        // player's subtitle loader treat this as ASS and apply the styles
+        if (!q.startsWith("/styled.ass")) {
             output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
             return
         }
-        val params = q.substringAfter('?').split('&')
+        // drain headers
+        while (true) {
+            val h = input.readLine() ?: break
+            if (h.isEmpty()) break
+        }
+        val params = q.substringAfter('?', "").split('&')
         var vttUrl: String? = null
         var lang = "Arabic"
         for (p in params) {
@@ -174,9 +189,9 @@ object KawaiiSubs {
             output.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray())
             return
         }
-        val bytes = ass.toByteArray()
+        val bytes = ass.toByteArray(Charsets.UTF_8)
         output.write(("HTTP/1.1 200 OK\r\n" +
-                "Content-Type: text/plain; charset=utf-8\r\n" +
+                "Content-Type: application/x-subtitle-ass; charset=utf-8\r\n" +
                 "Content-Length: ${bytes.size}\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +
                 "Connection: close\r\n\r\n").toByteArray())
@@ -185,13 +200,13 @@ object KawaiiSubs {
     }
 
     /**
-     * the one call the provider makes: hand it the site's VTT URL + lang label,
-     * get back a local .ass URL with the styles applied.
+     * the provider's entry point. URL ends in /styled.ass so the player
+     * detects ASS format and renders the style block.
      */
     fun styledSubtitleUrl(vttUrl: String, lang: String): String? {
         val port = ensureServer() ?: return null
         return try {
-            "http://127.0.0.1:$port/sub?u=" + URLEncoder.encode(vttUrl, "UTF-8") +
+            "http://127.0.0.1:$port/styled.ass?u=" + URLEncoder.encode(vttUrl, "UTF-8") +
                 "&lang=" + URLEncoder.encode(lang, "UTF-8")
         } catch (_: Exception) { null }
     }
