@@ -12,15 +12,15 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * VTT → styled ASS converter + local server. [v7/v11]
+ * VTT → styled ASS converter + local server.
  *
- * RTL fix is a character-for-character port of the field-proven fix_rtl2.py:
- *   CLEAN = [\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff\u200b-\u200d]
- *   RLE   = U+202B, PDF = U+202C — every \N segment wrapped as RLE+seg+PDF
+ * RTL fix: character-for-character port of the field-proven fix_rtl2.py —
+ * every \N segment wrapped in RLE (U+202B) ... PDF (U+202C).
  *
- * [v11] ensureServer can NEVER throw to a caller — returns null on failure
- * and the provider falls back to the raw VTT URL. The subtitle machinery
- * is no longer capable of taking down video links, ever.
+ * Fonts: styles reference family names (Bahij Nassim, DG Jory, The Year of
+ * The Camel) which FontInstaller ships into the app's fonts dir from the
+ * extension's assets. Styled rendering requires the fork's player or
+ * mainline's MPV option; ExoPlayer discards ASS styling regardless.
  */
 object KawaiiSubs {
 
@@ -29,7 +29,6 @@ object KawaiiSubs {
 
     private var server: ServerSocket? = null
 
-    // ── bidi constants — exact codepoints from fix_rtl2.py ──
     private const val RLE = '‫'   // U+202B
     private const val PDF = '‬'   // U+202C
 
@@ -161,8 +160,6 @@ object KawaiiSubs {
             }.apply { isDaemon = true; name = "KawaiiSubs" }.start()
             s.localPort
         } catch (e: Exception) {
-            // [v11] never let server startup kill a caller — null means the
-            // provider uses the raw VTT URL and playback proceeds
             Log.e(TAG, "sub server (non-fatal): ${e.message}")
             null
         }
