@@ -12,20 +12,15 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * VTT → styled ASS converter + local server. [v7]
+ * VTT → styled ASS converter + local server. [v7/v11]
  *
  * RTL fix is a character-for-character port of the field-proven fix_rtl2.py:
  *   CLEAN = [\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff\u200b-\u200d]
  *   RLE   = U+202B, PDF = U+202C — every \N segment wrapped as RLE+seg+PDF
- * The v6 attempt hand-wrote its own bidi regex and failed; this one uses
- * the exact codepoints of the python script that demonstrably works.
  *
- * Style note: ASS styles + fonts confirmed working in CloudStream forks
- * that honor user fonts. Mainline CloudStream ignores app-private fonts
- * (Android font sandbox) — colors/outline/geometry still apply via the
- * style block; typeface falls back to system font there. Fonts install
- * into /storage/emulated/0/Android/data/com.lagradost.cloudstream3/files/fonts/
- * where the fork's resolver picks them up.
+ * [v11] ensureServer can NEVER throw to a caller — returns null on failure
+ * and the provider falls back to the raw VTT URL. The subtitle machinery
+ * is no longer capable of taking down video links, ever.
  */
 object KawaiiSubs {
 
@@ -37,15 +32,6 @@ object KawaiiSubs {
     // ── bidi constants — exact codepoints from fix_rtl2.py ──
     private const val RLE = '‫'   // U+202B
     private const val PDF = '‬'   // U+202C
-
-    // exact CLEAN class from the python script, expressed as explicit ranges
-    private val CLEAN_RANGES = listOf(
-        0x200e, 0x200f,                          // LRM, RLM
-        0x202a..0x202e,                          // LRE..PDF embedding controls
-        0x2066..0x2069,                          // LRI..PDI isolate controls
-        0xfeff,                                  // BOM/zero-width no-break space
-        0x200b..0x200d                           // zero-width space, ZWNJ, ZWJ
-    )
 
     private fun cleanBidi(s: String): String {
         val sb = StringBuilder(s.length)
@@ -89,24 +75,15 @@ object KawaiiSubs {
         }
     }
 
-    /**
-     * the python algorithm, exactly:
-     *   text = CLEAN.sub('', text)
-     *   segs = [RLE + s + PDF for s in text.split('\\N')]
-     *   join with '\\N'
-     * escapes ASS braces first (python file was pre-ASS; we come from VTT)
-     */
     private fun assText(text: String): String {
         val cleaned = cleanBidi(text)
             .replace("{", "\\{").replace("}", "}")
-        // split on raw newlines (VTT multi-line cues), wrap EVERY segment
         val segs = cleaned.split('\n')
             .filter { it.isNotEmpty() }
             .map { RLE + it + PDF }
         return segs.joinToString("\\N")
     }
 
-    /** VTT timestamp (00:00:02.070) → ASS timestamp (0:00:02.07) */
     private fun vttToAssTime(t: String): String {
         val m = Regex("""(\d{2}):(\d{2}):(\d{2})\.(\d{3})""").find(t) ?: return t
         val (h, min, sec, ms) = m.destructured
@@ -160,7 +137,7 @@ object KawaiiSubs {
                 if (!body.contains("WEBVTT")) return null
                 val ass = vttToAss(body)
                 cache[vttUrl] = ass
-                Log.d(TAG, "sub converted (v7 rtl-wrap): ${ass.length} chars")
+                Log.d(TAG, "sub converted (rtl-wrap): ${ass.length} chars")
                 ass
             }
         } catch (e: Exception) { Log.e(TAG, "sub convert: ${e.message}"); null }
@@ -183,7 +160,12 @@ object KawaiiSubs {
                 }
             }.apply { isDaemon = true; name = "KawaiiSubs" }.start()
             s.localPort
-        } catch (e: Exception) { Log.e(TAG, "sub server: ${e.message}"); null }
+        } catch (e: Exception) {
+            // [v11] never let server startup kill a caller — null means the
+            // provider uses the raw VTT URL and playback proceeds
+            Log.e(TAG, "sub server (non-fatal): ${e.message}")
+            null
+        }
     }
 
     private fun handle(socket: Socket) {
