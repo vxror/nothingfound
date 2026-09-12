@@ -9,8 +9,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.InetAddress
-import java.net.ServerSocket
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
@@ -35,11 +33,6 @@ class KawaiiAnime : MainAPI() {
         private val translationCache = ConcurrentHashMap<String, String>()
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
 
-        // localhost HTTP server — OkHttp can't open file://, so we serve over 127.0.0.1
-        @Volatile private var serverSocket: ServerSocket? = null
-        @Volatile private var serverPort: Int = 0
-        private val servedFiles = ConcurrentHashMap<String, String>()
-
         private val SECTION_MAP = mapOf(
             "TRENDING"         to "trending",
             "POPULAR"          to "popular",
@@ -48,6 +41,7 @@ class KawaiiAnime : MainAPI() {
             "TOP_RATED"        to "topRated"
         )
 
+        // byte-for-byte copy of the query the site itself sends to /api/anilist
         private val SITE_SEARCH_QUERY: String =
             "\n    query (\$page: Int, \$perPage: Int, \$search: String) {\n" +
             "      Page(page: \$page, perPage: \$perPage) {\n" +
@@ -160,80 +154,6 @@ class KawaiiAnime : MainAPI() {
         "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "ar,en;q=0.9"
     )
-
-    // ── localhost HTTP server ─────────────────────────────────────
-    // OkHttp (used by CloudStream for subtitles) refuses file:// with
-    // "Malformed URL". A tiny 127.0.0.1 HTTP server is the only transport
-    // that both OkHttp and Media3's parser will accept.
-
-    @Synchronized
-    private fun ensureServer(): Int {
-        serverSocket?.let { if (!it.isClosed) return serverPort }
-        return try {
-            val s = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
-            serverSocket = s
-            serverPort = s.localPort
-            Thread {
-                while (!s.isClosed) {
-                    try {
-                        val client = s.accept()
-                        Thread {
-                            try {
-                                val reader = client.getInputStream().bufferedReader(Charsets.ISO_8859_1)
-                                reader.readLine() // request line
-                                while (true) {
-                                    val l = reader.readLine() ?: break
-                                    if (l.isEmpty()) break
-                                }
-                                val first = reader.toString()
-                                // Re-read: extract path from first line properly
-                                // (we lost `first` above — redo below)
-                                val path = "/"
-                                // do real parse
-                                // — handled inline before reader consumed —
-                                val out = client.getOutputStream()
-                                val body = servedFiles[path] ?: servedFiles[extractPath(reader)]
-                                if (body == null) {
-                                    out.write(
-                                        ("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                                            .toByteArray(Charsets.ISO_8859_1)
-                                    )
-                                } else {
-                                    val bytes = body.toByteArray(Charsets.UTF_8)
-                                    val head = "HTTP/1.1 200 OK\r\n" +
-                                               "Content-Type: text/vtt; charset=utf-8\r\n" +
-                                               "Content-Length: ${bytes.size}\r\n" +
-                                               "Connection: close\r\n\r\n"
-                                    out.write(head.toByteArray(Charsets.ISO_8859_1))
-                                    out.write(bytes)
-                                }
-                                out.flush()
-                            } catch (_: Exception) {
-                            } finally {
-                                try { client.close() } catch (_: Exception) {}
-                            }
-                        }.apply { isDaemon = true }.start()
-                    } catch (_: Exception) {}
-                }
-            }.apply { isDaemon = true; name = "kawaii-sub-server" }.start()
-            log("sub server listening on 127.0.0.1:$serverPort")
-            serverPort
-        } catch (e: Exception) {
-            logErr("server start", e); -1
-        }
-    }
-
-    // dummy placeholder — real impl below via serveVtt
-    private fun extractPath(r: java.io.BufferedReader): String = "/"
-
-    private fun serveVtt(content: String, tag: String): String? {
-        val port = ensureServer()
-        if (port <= 0) return null
-        val safe = tag.replace(Regex("[^A-Za-z0-9._-]"), "_").take(48)
-        val path = "/$safe.vtt"
-        servedFiles[path] = content
-        return "http://127.0.0.1:$port$path"
-    }
 
     // ── RSC parser ────────────────────────────────────────────────
 
@@ -410,6 +330,8 @@ class KawaiiAnime : MainAPI() {
             newHomePageResponse(HomePageList(request.name, shows), hasNext = false)
         }
 
+    // ── Search ────────────────────────────────────────────────────
+
     override suspend fun search(query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         val key = query.lowercase().trim()
@@ -500,6 +422,8 @@ class KawaiiAnime : MainAPI() {
         log("search[cache] -> ${out.size}")
         out
     }
+
+    // ── Load ──────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse = withContext(Dispatchers.IO) {
         val id = extractId(url) ?: throw ErrorLoadingException("bad id: $url")
@@ -622,33 +546,10 @@ class KawaiiAnime : MainAPI() {
             .replace("&quot;", "\"").replace("&amp;", "&").replace("&#039;", "'")
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
-    // ── Styled subtitle pipeline ──────────────────────────────────
-    // OkHttp can't open file:// — it throws "Malformed URL". So we serve
-    // the styled VTT from a 127.0.0.1 HTTP server. `.vtt` extension keeps
-    // the mime as text/vtt, Media3 uses the WebVTT parser, subs render.
-
-    private fun addVttStyle(source: String): String {
-        val normalized = source.replace("\r\n", "\n")
-        val idx = normalized.indexOf("WEBVTT")
-        if (idx < 0) return source
-        val after = normalized.substring(idx + "WEBVTT".length).trimStart('\n', ' ', '\t')
-        return buildString {
-            append("WEBVTT\n\n")
-            append("STYLE\n")
-            append("::cue {\n")
-            append("  color: #FFFFFF;\n")
-            append("  background-color: transparent;\n")
-            append("  font-weight: 700;\n")
-            append("}\n\n")
-            append(after)
-            if (!endsWith("\n")) append('\n')
-        }
-    }
-
-    private fun safeName(s: String): String =
-        s.replace(Regex("[^A-Za-z0-9._-]"), "_")
-
     // ── loadLinks ─────────────────────────────────────────────────
+    // Subtitles: pass the site's own VTT URLs straight through. OkHttp fetches
+    // them, Media3's WebVTT parser reads them, they render with the player's
+    // default caption style (white text, black outline).
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -702,22 +603,8 @@ class KawaiiAnime : MainAPI() {
                         val s = subs.optJSONObject(i) ?: continue
                         val u = s.optString("url"); if (u.isBlank()) continue
                         val lang = s.optString("lang").ifEmpty { "Arabic" }
-                        var outUrl = u
-                        if (u.contains(".vtt", ignoreCase = true)) {
-                            try {
-                                val vtt = app.get(u, headers = subHeaders).text
-                                if (vtt.contains("WEBVTT", ignoreCase = true)) {
-                                    val styled = addVttStyle(vtt)
-                                    val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
-                                    serveVtt(styled, tag)?.let {
-                                        outUrl = it
-                                        log("subtitle styled: $lang -> $it")
-                                    }
-                                }
-                            } catch (e: Exception) { logErr("subtitle style", e) }
-                        }
-                        log("subtitle emit: $lang -> ${outUrl.take(80)}")
-                        subtitleCallback(SubtitleFile(lang, outUrl))
+                        log("subtitle emit: $lang -> ${u.take(80)}")
+                        subtitleCallback(SubtitleFile(lang, u))
                     }
                 }
                 if (emitted > 0) return@withContext true
@@ -736,16 +623,8 @@ class KawaiiAnime : MainAPI() {
         )) {
             try {
                 val r = app.get(vttUrl, headers = subHeaders)
-                if (!r.isSuccessful || !r.text.contains("WEBVTT", ignoreCase = true)) continue
-                var outUrl = vttUrl
-                val styled = addVttStyle(r.text)
-                val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
-                serveVtt(styled, tag)?.let {
-                    outUrl = it
-                    log("subtitle styled (fallback): $lang -> $it")
-                }
-                log("subtitle emit (fallback): $lang -> ${outUrl.take(80)}")
-                subtitleCallback(SubtitleFile(lang, outUrl))
+                if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true))
+                    subtitleCallback(SubtitleFile(lang, vttUrl))
             } catch (_: Exception) {}
         }
         true
