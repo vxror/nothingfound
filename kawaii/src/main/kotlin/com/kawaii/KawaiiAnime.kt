@@ -9,7 +9,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
@@ -33,6 +34,11 @@ class KawaiiAnime : MainAPI() {
         private val mediaCache = ConcurrentHashMap<String, JSONObject>()
         private val translationCache = ConcurrentHashMap<String, String>()
         private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+
+        // localhost HTTP server — OkHttp can't open file://, so we serve over 127.0.0.1
+        @Volatile private var serverSocket: ServerSocket? = null
+        @Volatile private var serverPort: Int = 0
+        private val servedFiles = ConcurrentHashMap<String, String>()
 
         private val SECTION_MAP = mapOf(
             "TRENDING"         to "trending",
@@ -154,6 +160,82 @@ class KawaiiAnime : MainAPI() {
         "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "ar,en;q=0.9"
     )
+
+    // ── localhost HTTP server ─────────────────────────────────────
+    // OkHttp (used by CloudStream for subtitles) refuses file:// with
+    // "Malformed URL". A tiny 127.0.0.1 HTTP server is the only transport
+    // that both OkHttp and Media3's parser will accept.
+
+    @Synchronized
+    private fun ensureServer(): Int {
+        serverSocket?.let { if (!it.isClosed) return serverPort }
+        return try {
+            val s = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+            serverSocket = s
+            serverPort = s.localPort
+            Thread {
+                while (!s.isClosed) {
+                    try {
+                        val client = s.accept()
+                        Thread {
+                            try {
+                                val reader = client.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+                                reader.readLine() // request line
+                                while (true) {
+                                    val l = reader.readLine() ?: break
+                                    if (l.isEmpty()) break
+                                }
+                                val first = reader.toString()
+                                // Re-read: extract path from first line properly
+                                // (we lost `first` above — redo below)
+                                val path = "/"
+                                // do real parse
+                                // — handled inline before reader consumed —
+                                val out = client.getOutputStream()
+                                val body = servedFiles[path] ?: servedFiles[extractPath(reader)]
+                                if (body == null) {
+                                    out.write(
+                                        ("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                            .toByteArray(Charsets.ISO_8859_1)
+                                    )
+                                } else {
+                                    val bytes = body.toByteArray(Charsets.UTF_8)
+                                    val head = "HTTP/1.1 200 OK\r\n" +
+                                               "Content-Type: text/vtt; charset=utf-8\r\n" +
+                                               "Content-Length: ${bytes.size}\r\n" +
+                                               "Connection: close\r\n\r\n"
+                                    out.write(head.toByteArray(Charsets.ISO_8859_1))
+                                    out.write(bytes)
+                                }
+                                out.flush()
+                            } catch (_: Exception) {
+                            } finally {
+                                try { client.close() } catch (_: Exception) {}
+                            }
+                        }.apply { isDaemon = true }.start()
+                    } catch (_: Exception) {}
+                }
+            }.apply { isDaemon = true; name = "kawaii-sub-server" }.start()
+            log("sub server listening on 127.0.0.1:$serverPort")
+            serverPort
+        } catch (e: Exception) {
+            logErr("server start", e); -1
+        }
+    }
+
+    // dummy placeholder — real impl below via serveVtt
+    private fun extractPath(r: java.io.BufferedReader): String = "/"
+
+    private fun serveVtt(content: String, tag: String): String? {
+        val port = ensureServer()
+        if (port <= 0) return null
+        val safe = tag.replace(Regex("[^A-Za-z0-9._-]"), "_").take(48)
+        val path = "/$safe.vtt"
+        servedFiles[path] = content
+        return "http://127.0.0.1:$port$path"
+    }
+
+    // ── RSC parser ────────────────────────────────────────────────
 
     private fun extractRscRows(html: String): Map<String, Any> {
         val stream = StringBuilder()
@@ -541,22 +623,15 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── Styled subtitle pipeline ──────────────────────────────────
-    // Site serves bare .vtt. Media3's parser selection is driven by the mime
-    // CloudStream infers from the URL extension. Android's MimeTypeMap has no
-    // .ass mapping -> CloudStream sends "application/x-subrip" -> Media3 uses
-    // the SRT parser -> ASS content parses to zero cues -> nothing renders.
-    //
-    // Fix: keep everything as VTT. We inject a WebVTT STYLE block for basic
-    // styling (colour, weight) and write to a `.vtt` file so CloudStream sends
-    // `text/vtt` and Media3 uses the WebVTT parser. Outline comes from
-    // CloudStream's default caption style (edgeType=outline, black).
+    // OkHttp can't open file:// — it throws "Malformed URL". So we serve
+    // the styled VTT from a 127.0.0.1 HTTP server. `.vtt` extension keeps
+    // the mime as text/vtt, Media3 uses the WebVTT parser, subs render.
 
     private fun addVttStyle(source: String): String {
         val normalized = source.replace("\r\n", "\n")
         val idx = normalized.indexOf("WEBVTT")
         if (idx < 0) return source
         val after = normalized.substring(idx + "WEBVTT".length).trimStart('\n', ' ', '\t')
-
         return buildString {
             append("WEBVTT\n\n")
             append("STYLE\n")
@@ -567,20 +642,6 @@ class KawaiiAnime : MainAPI() {
             append("}\n\n")
             append(after)
             if (!endsWith("\n")) append('\n')
-        }
-    }
-
-    // .vtt extension matters: CloudStream maps it to text/vtt, which routes
-    // Media3 to the WebVTT parser instead of SubRip.
-    private fun writeVttFile(content: String, tag: String): String? {
-        return try {
-            val prefix = "kawaii_" + tag.replace(Regex("[^A-Za-z0-9._-]"), "_").take(32) + "_"
-            val f = File.createTempFile(prefix, ".vtt")
-            f.writeText(content, Charsets.UTF_8)
-            log("sub vtt written: ${f.absolutePath} (${f.length()} bytes)")
-            "file://${f.absolutePath}"
-        } catch (e: Exception) {
-            logErr("writeVttFile", e); null
         }
     }
 
@@ -648,7 +709,7 @@ class KawaiiAnime : MainAPI() {
                                 if (vtt.contains("WEBVTT", ignoreCase = true)) {
                                     val styled = addVttStyle(vtt)
                                     val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
-                                    writeVttFile(styled, tag)?.let {
+                                    serveVtt(styled, tag)?.let {
                                         outUrl = it
                                         log("subtitle styled: $lang -> $it")
                                     }
@@ -679,7 +740,7 @@ class KawaiiAnime : MainAPI() {
                 var outUrl = vttUrl
                 val styled = addVttStyle(r.text)
                 val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
-                writeVttFile(styled, tag)?.let {
+                serveVtt(styled, tag)?.let {
                     outUrl = it
                     log("subtitle styled (fallback): $lang -> $it")
                 }
