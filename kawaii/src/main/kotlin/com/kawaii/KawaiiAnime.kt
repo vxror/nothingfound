@@ -3,10 +3,7 @@ package com.kawaii
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -124,9 +121,6 @@ class KawaiiAnime : MainAPI() {
             "    }\n" +
             "  "
 
-        // [v12] RESTORED — the helper's proven loose parse. v9's strict
-        // /anime/(\d+) form never matched the bare "16498" episode data,
-        // which is exactly what broke loadLinks ("No Links Found").
         fun extractId(raw: String?): Int? {
             if (raw.isNullOrBlank()) return null
             return Regex("""(\d+)""").findAll(raw).lastOrNull()
@@ -160,7 +154,7 @@ class KawaiiAnime : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9"
     )
 
-    // ── null-safe accessors (catalog data — AniList nulls live here) ──
+    // ── null-safe accessors ───────────────────────────────────────
 
     private fun JSONObject.safeStr(key: String): String {
         if (!has(key) || isNull(key)) return ""
@@ -584,8 +578,9 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── loadLinks ─────────────────────────────────────────────────
-    // [v12] showId parse RESTORED to the helper's proven line. Sources first
-    // on the critical path; subtitles fire-and-forget after links secured.
+    // Subtitles are emitted SYNCHRONOUSLY inside loadLinks — before the
+    // function returns — so CloudStream never drops them. The previous
+    // fire-and-forget coroutine raced the return and lost intermittently.
 
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -604,21 +599,25 @@ class KawaiiAnime : MainAPI() {
 
         for (attempt in 1..2) {
             try {
-                val res = app.get("$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub",
+                val res = app.get(
+                    "$mainUrl/api/miruro?anilistId=$showId&ep=$epNum&category=sub",
                     headers = mapOf(
-                        "User-Agent" to UA, "Referer" to "$mainUrl/",
-                        "Accept" to "*/*", "Origin" to mainUrl
-                    ))
-                log("miruro[$attempt] HTTP ${res.code} len=${res.text.length} head=${res.text.take(120)}")
+                        "User-Agent" to UA,
+                        "Referer" to "$mainUrl/",
+                        "Accept" to "*/*",
+                        "Origin" to mainUrl
+                    )
+                )
+                log("miruro[$attempt] HTTP ${res.code} len=${res.text.length}")
                 if (!res.isSuccessful) continue
 
                 val root = JSONObject(res.text)
                 val d = root.optJSONObject("data") ?: root
-                val ref = d.optJSONObject("headers")?.optString("Referer")?.ifBlank { null } ?: "$mainUrl/"
+                val ref = d.optJSONObject("headers")?.optString("Referer")
+                    ?.ifBlank { null } ?: "$mainUrl/"
 
                 var emitted = 0
                 val srcs = d.optJSONArray("sources")
-                log("miruro[$attempt] sources array: ${srcs?.length() ?: "null"}")
                 if (srcs != null) {
                     for (i in 0 until srcs.length()) {
                         val s = srcs.optJSONObject(i) ?: continue
@@ -630,29 +629,38 @@ class KawaiiAnime : MainAPI() {
                             ?: Qualities.Unknown.value
                         callback(newExtractorLink(name, "Kawaii", u,
                             if (m3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            this.referer = ref; this.quality = q
-                            this.headers = mapOf("User-Agent" to UA, "Referer" to ref, "Origin" to mainUrl)
+                            this.referer = ref
+                            this.quality = q
+                            this.headers = mapOf(
+                                "User-Agent" to UA,
+                                "Referer" to ref,
+                                "Origin" to mainUrl
+                            )
                         })
                         emitted++
                     }
                 }
 
                 if (emitted > 0) {
-                    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-                        try {
-                            d.optJSONArray("subtitles")?.let { subs ->
-                                for (i in 0 until subs.length()) {
-                                    val s = subs.optJSONObject(i) ?: continue
-                                    val u = s.optString("url")
-                                    if (u.isBlank() || u == "null") continue
-                                    val lang = s.optString("lang").ifEmpty { "Arabic" }
-                                    val styled = KawaiiSubs.styledSubtitleUrl(u, lang) ?: u
-                                    log("subtitle emit (bg): $lang")
-                                    subtitleCallback(SubtitleFile(lang, styled))
-                                }
+                    // ─── SUBTITLES — synchronous, before return ───────
+                    runCatching {
+                        d.optJSONArray("subtitles")?.let { subs ->
+                            for (i in 0 until subs.length()) {
+                                val s = subs.optJSONObject(i) ?: continue
+                                val u = s.optString("url")
+                                if (u.isBlank() || u == "null") continue
+                                val lang = s.optString("lang").ifEmpty { "Arabic" }
+                                val styled = try {
+                                    KawaiiSubs.styledSubtitleUrl(u, lang)
+                                } catch (e: Exception) {
+                                    logErr("styledSubtitleUrl (using raw)", e); null
+                                } ?: u
+                                log("SUBTITLE CALLBACK: lang=$lang url=$styled")
+                                subtitleCallback(SubtitleFile(lang, styled))
                             }
-                        } catch (e: Exception) { logErr("subtitles (background, non-fatal)", e) }
-                    }
+                        }
+                    }.onFailure { logErr("subtitles (non-fatal)", it) }
+
                     log("miruro success: $emitted sources")
                     return@withContext true
                 }
@@ -669,25 +677,31 @@ class KawaiiAnime : MainAPI() {
             quality = Qualities.Unknown.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
         })
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            try {
-                for ((lang, vttUrl) in listOf(
-                    "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
-                    "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
-                )) {
-                    try {
-                        val r = app.get(vttUrl, headers = mapOf(
-                            "User-Agent" to UA, "Referer" to "$mainUrl/",
-                            "Origin" to mainUrl, "Accept" to "*/*"
-                        ))
-                        if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
-                            val styled = KawaiiSubs.styledSubtitleUrl(vttUrl, lang) ?: vttUrl
-                            subtitleCallback(SubtitleFile(lang, styled))
-                        }
-                    } catch (_: Exception) {}
-                }
-            } catch (_: Exception) {}
-        }
+
+        // Fallback subs — also synchronous
+        runCatching {
+            for ((lang, vttUrl) in listOf(
+                "Arabic"  to "$VIDEO_HOST/subtitle/$showId-ep$epNum-Arabic-0.vtt",
+                "English" to "$VIDEO_HOST/subtitle/$showId-ep$epNum-English-1.vtt"
+            )) {
+                try {
+                    val r = app.get(vttUrl, headers = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to "$mainUrl/",
+                        "Origin" to mainUrl,
+                        "Accept" to "*/*"
+                    ))
+                    if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
+                        val styled = try {
+                            KawaiiSubs.styledSubtitleUrl(vttUrl, lang)
+                        } catch (_: Exception) { null } ?: vttUrl
+                        log("fallback SUBTITLE CALLBACK: lang=$lang url=$styled")
+                        subtitleCallback(SubtitleFile(lang, styled))
+                    }
+                } catch (_: Exception) {}
+            }
+        }.onFailure { logErr("fallback subtitles (non-fatal)", it) }
+
         true
     }
 }
