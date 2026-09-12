@@ -25,9 +25,6 @@ class KawaiiAnime : MainAPI() {
         private const val VIDEO_HOST = "https://video.kawaii-anime.com"
         private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
 
-        private const val STYLE_URL =
-            "https://raw.githubusercontent.com/vxror/nothingfound/refs/heads/main/StyleAsShit/kawaii-style.ass"
-
         @Volatile private var homeFetchedAt = 0L
         private const val HOME_TTL_MS = 10 * 60_000L
         private const val SEARCH_TTL_MS = 24 * 60 * 60_000L
@@ -157,8 +154,6 @@ class KawaiiAnime : MainAPI() {
         "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "ar,en;q=0.9"
     )
-
-    // ── RSC parser ────────────────────────────────────────────────
 
     private fun extractRscRows(html: String): Map<String, Any> {
         val stream = StringBuilder()
@@ -546,76 +541,46 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── Styled subtitle pipeline ──────────────────────────────────
-    // Site serves bare .vtt only. We fetch a style header once from GitHub
-    // ([Script Info] + [V4+ Styles], no [Events]), convert each per-episode
-    // VTT into ASS Dialogue lines, write the result to a temp file via
-    // File.createTempFile (Android routes this to the app's writable cache —
-    // no CloudStream internals required), and hand the player a file:// URL.
+    // Site serves bare .vtt. Media3's parser selection is driven by the mime
+    // CloudStream infers from the URL extension. Android's MimeTypeMap has no
+    // .ass mapping -> CloudStream sends "application/x-subrip" -> Media3 uses
+    // the SRT parser -> ASS content parses to zero cues -> nothing renders.
+    //
+    // Fix: keep everything as VTT. We inject a WebVTT STYLE block for basic
+    // styling (colour, weight) and write to a `.vtt` file so CloudStream sends
+    // `text/vtt` and Media3 uses the WebVTT parser. Outline comes from
+    // CloudStream's default caption style (edgeType=outline, black).
 
-    @Volatile private var styleHeaderCache: String? = null
+    private fun addVttStyle(source: String): String {
+        val normalized = source.replace("\r\n", "\n")
+        val idx = normalized.indexOf("WEBVTT")
+        if (idx < 0) return source
+        val after = normalized.substring(idx + "WEBVTT".length).trimStart('\n', ' ', '\t')
 
-    private suspend fun getStyleHeader(): String? {
-        styleHeaderCache?.let { return it }
-        return try {
-            val r = app.get(STYLE_URL, headers = mapOf("User-Agent" to UA))
-            val body = r.text
-            if (r.isSuccessful && body.contains("[V4+ Styles]") && body.contains("[Script Info]")) {
-                log("style header loaded (${body.length} bytes)")
-                styleHeaderCache = body
-                body
-            } else {
-                log("style header rejected: HTTP ${r.code} len=${body.length} head=${body.take(60)}")
-                null
-            }
-        } catch (e: Exception) {
-            logErr("style fetch", e); null
+        return buildString {
+            append("WEBVTT\n\n")
+            append("STYLE\n")
+            append("::cue {\n")
+            append("  color: #FFFFFF;\n")
+            append("  background-color: transparent;\n")
+            append("  font-weight: 700;\n")
+            append("}\n\n")
+            append(after)
+            if (!endsWith("\n")) append('\n')
         }
     }
 
-    private fun cs(ms: String): String = ms.padEnd(3, '0').substring(0, 2)
-
-    private fun vttToAss(vtt: String, styleHeader: String): String {
-        val sb = StringBuilder(styleHeader)
-        if (!styleHeader.endsWith("\n")) sb.append('\n')
-        sb.append("\n[Events]\n")
-        sb.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
-
-        val lines = vtt.replace("\r\n", "\n").split('\n')
-        val timeRx = Regex(
-            """(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[.,](\d{3})"""
-        )
-        var i = 0
-        while (i < lines.size) {
-            val m = timeRx.find(lines[i])
-            if (m == null) { i++; continue }
-            val g = m.groupValues
-            val start = "${g[1]}:${g[2]}:${g[3]}.${cs(g[4])}"
-            val end   = "${g[5]}:${g[6]}:${g[7]}.${cs(g[8])}"
-            val text = StringBuilder()
-            var j = i + 1
-            while (j < lines.size && lines[j].isNotBlank()) {
-                if (text.isNotEmpty()) text.append("\\N")
-                text.append(lines[j].trim())
-                j++
-            }
-            sb.append("Dialogue: 0,$start,$end,Default,,0,0,0,,$text\n")
-            i = j
-        }
-        return sb.toString()
-    }
-
-    // File.createTempFile uses java.io.tmpdir, which on Android is wired to
-    // the app's writable cache dir. No CloudStream internals needed — sidesteps
-    // the AcraApplication/CloudStreamApp deprecation dance entirely.
-    private fun writeSubFile(content: String, tag: String): String? {
+    // .vtt extension matters: CloudStream maps it to text/vtt, which routes
+    // Media3 to the WebVTT parser instead of SubRip.
+    private fun writeVttFile(content: String, tag: String): String? {
         return try {
             val prefix = "kawaii_" + tag.replace(Regex("[^A-Za-z0-9._-]"), "_").take(32) + "_"
-            val f = File.createTempFile(prefix, ".ass")
+            val f = File.createTempFile(prefix, ".vtt")
             f.writeText(content, Charsets.UTF_8)
-            log("sub file written: ${f.absolutePath} (${f.length()} bytes)")
+            log("sub vtt written: ${f.absolutePath} (${f.length()} bytes)")
             "file://${f.absolutePath}"
         } catch (e: Exception) {
-            logErr("writeSubFile", e); null
+            logErr("writeVttFile", e); null
         }
     }
 
@@ -635,7 +600,6 @@ class KawaiiAnime : MainAPI() {
         val epNum = parts[1]
         log("loadLinks: showId=$showId ep=$epNum")
 
-        val styleHeader = getStyleHeader()
         val subHeaders = mapOf(
             "User-Agent" to UA,
             "Referer" to "$mainUrl/",
@@ -678,17 +642,20 @@ class KawaiiAnime : MainAPI() {
                         val u = s.optString("url"); if (u.isBlank()) continue
                         val lang = s.optString("lang").ifEmpty { "Arabic" }
                         var outUrl = u
-                        if (styleHeader != null && u.contains(".vtt", ignoreCase = true)) {
+                        if (u.contains(".vtt", ignoreCase = true)) {
                             try {
                                 val vtt = app.get(u, headers = subHeaders).text
                                 if (vtt.contains("WEBVTT", ignoreCase = true)) {
-                                    val ass = vttToAss(vtt, styleHeader)
-                                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}")
-                                        ?.let { outUrl = it; log("subtitle styled: $lang") }
+                                    val styled = addVttStyle(vtt)
+                                    val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
+                                    writeVttFile(styled, tag)?.let {
+                                        outUrl = it
+                                        log("subtitle styled: $lang -> $it")
+                                    }
                                 }
                             } catch (e: Exception) { logErr("subtitle style", e) }
                         }
-                        log("subtitle emit: $lang -> ${outUrl.take(60)}")
+                        log("subtitle emit: $lang -> ${outUrl.take(80)}")
                         subtitleCallback(SubtitleFile(lang, outUrl))
                     }
                 }
@@ -710,12 +677,13 @@ class KawaiiAnime : MainAPI() {
                 val r = app.get(vttUrl, headers = subHeaders)
                 if (!r.isSuccessful || !r.text.contains("WEBVTT", ignoreCase = true)) continue
                 var outUrl = vttUrl
-                if (styleHeader != null) {
-                    val ass = vttToAss(r.text, styleHeader)
-                    writeSubFile(ass, "k_${showId}_ep${epNum}_${safeName(lang)}")
-                        ?.let { outUrl = it; log("subtitle styled (fallback): $lang") }
+                val styled = addVttStyle(r.text)
+                val tag = "k_${showId}_ep${epNum}_${safeName(lang)}"
+                writeVttFile(styled, tag)?.let {
+                    outUrl = it
+                    log("subtitle styled (fallback): $lang -> $it")
                 }
-                log("subtitle emit (fallback): $lang -> ${outUrl.take(60)}")
+                log("subtitle emit (fallback): $lang -> ${outUrl.take(80)}")
                 subtitleCallback(SubtitleFile(lang, outUrl))
             } catch (_: Exception) {}
         }
