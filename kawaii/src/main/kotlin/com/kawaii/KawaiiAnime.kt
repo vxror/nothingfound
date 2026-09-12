@@ -578,10 +578,6 @@ class KawaiiAnime : MainAPI() {
             .replace("&mdash;", "—").replace("&ndash;", "–").trim()
 
     // ── loadLinks ─────────────────────────────────────────────────
-    // Subtitles are emitted SYNCHRONOUSLY inside loadLinks — before the
-    // function returns — so CloudStream never drops them. The previous
-    // fire-and-forget coroutine raced the return and lost intermittently.
-
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -650,11 +646,14 @@ class KawaiiAnime : MainAPI() {
                                 val u = s.optString("url")
                                 if (u.isBlank() || u == "null") continue
                                 val lang = s.optString("lang").ifEmpty { "Arabic" }
+                                
+                                // Pass showId and epNum for the translation API
                                 val styled = try {
-                                    KawaiiSubs.styledSubtitleUrl(u, lang)
+                                    KawaiiSubs.styledSubtitleUrl(u, lang, showId, epNum)
                                 } catch (e: Exception) {
                                     logErr("styledSubtitleUrl (using raw)", e); null
                                 } ?: u
+                                
                                 log("SUBTITLE CALLBACK: lang=$lang url=$styled")
                                 subtitleCallback(SubtitleFile(lang, styled))
                             }
@@ -693,7 +692,7 @@ class KawaiiAnime : MainAPI() {
                     ))
                     if (r.isSuccessful && r.text.contains("WEBVTT", ignoreCase = true)) {
                         val styled = try {
-                            KawaiiSubs.styledSubtitleUrl(vttUrl, lang)
+                            KawaiiSubs.styledSubtitleUrl(vttUrl, lang, showId, epNum)
                         } catch (_: Exception) { null } ?: vttUrl
                         log("fallback SUBTITLE CALLBACK: lang=$lang url=$styled")
                         subtitleCallback(SubtitleFile(lang, styled))
