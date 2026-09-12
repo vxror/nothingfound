@@ -12,15 +12,20 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * VTT → styled ASS converter + local server.
+ * VTT → styled ASS converter + local server. [v7]
  *
- * [v6] fixes:
- *  - URL ends with /styled.ass → the subtitle loader detects ASS format
- *    and applies the style block (v5 served extension-less URLs, which
- *    made the player fall back to default rendering)
- *  - RTL embedding: every dialogue segment is wrapped in RLE...PDF
- *    (U+202B/U+202C), the classic Arabic fansub trick — trailing
- *    punctuation (., !, ?) stays at the END of the line where it belongs
+ * RTL fix is a character-for-character port of the field-proven fix_rtl2.py:
+ *   CLEAN = [\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff\u200b-\u200d]
+ *   RLE   = U+202B, PDF = U+202C — every \N segment wrapped as RLE+seg+PDF
+ * The v6 attempt hand-wrote its own bidi regex and failed; this one uses
+ * the exact codepoints of the python script that demonstrably works.
+ *
+ * Style note: ASS styles + fonts confirmed working in CloudStream forks
+ * that honor user fonts. Mainline CloudStream ignores app-private fonts
+ * (Android font sandbox) — colors/outline/geometry still apply via the
+ * style block; typeface falls back to system font there. Fonts install
+ * into /storage/emulated/0/Android/data/com.lagradost.cloudstream3/files/fonts/
+ * where the fork's resolver picks them up.
  */
 object KawaiiSubs {
 
@@ -29,11 +34,32 @@ object KawaiiSubs {
 
     private var server: ServerSocket? = null
 
-    // bidi control chars — the RTL fix
-    private const val RLE = '‫'   // U+202B: start RTL embedding
-    private const val PDF = '‬'   // U+202C: close embedding
-    // strip any pre-existing bidi marks from input so we never double-wrap
-    private val BI_DI_CLEAN = Regex("[‪‫‬‭‮‎‏‏\u2066-\u2069\uFEFF\u200b-\u200d]")
+    // ── bidi constants — exact codepoints from fix_rtl2.py ──
+    private const val RLE = '‫'   // U+202B
+    private const val PDF = '‬'   // U+202C
+
+    // exact CLEAN class from the python script, expressed as explicit ranges
+    private val CLEAN_RANGES = listOf(
+        0x200e, 0x200f,                          // LRM, RLM
+        0x202a..0x202e,                          // LRE..PDF embedding controls
+        0x2066..0x2069,                          // LRI..PDI isolate controls
+        0xfeff,                                  // BOM/zero-width no-break space
+        0x200b..0x200d                           // zero-width space, ZWNJ, ZWJ
+    )
+
+    private fun cleanBidi(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) {
+            val cp = c.code
+            val drop = (cp == 0x200e || cp == 0x200f ||
+                    (cp in 0x202a..0x202e) ||
+                    (cp in 0x2066..0x2069) ||
+                    cp == 0xfeff ||
+                    (cp in 0x200b..0x200d))
+            if (!drop) sb.append(c)
+        }
+        return sb.toString()
+    }
 
     private val ASS_HEADER = """
         [Script Info]
@@ -63,13 +89,21 @@ object KawaiiSubs {
         }
     }
 
-    /** escape ASS specials, strip stale bidi marks, then RTL-wrap EVERY segment */
+    /**
+     * the python algorithm, exactly:
+     *   text = CLEAN.sub('', text)
+     *   segs = [RLE + s + PDF for s in text.split('\\N')]
+     *   join with '\\N'
+     * escapes ASS braces first (python file was pre-ASS; we come from VTT)
+     */
     private fun assText(text: String): String {
-        val cleaned = BI_DI_CLEAN.replace(text, "")
+        val cleaned = cleanBidi(text)
             .replace("{", "\\{").replace("}", "}")
-        return cleaned.split('\n')
-            .filter { it.isNotBlank() || cleaned.contains('\n') }
-            .joinToString("\\N") { RLE + it + PDF }
+        // split on raw newlines (VTT multi-line cues), wrap EVERY segment
+        val segs = cleaned.split('\n')
+            .filter { it.isNotEmpty() }
+            .map { RLE + it + PDF }
+        return segs.joinToString("\\N")
     }
 
     /** VTT timestamp (00:00:02.070) → ASS timestamp (0:00:02.07) */
@@ -80,7 +114,6 @@ object KawaiiSubs {
         return "$h:$min:$sec.$cs"
     }
 
-    /** convert full VTT body to styled ASS with RTL embedding */
     fun vttToAss(vtt: String): String {
         val sb = StringBuilder()
         sb.append(ASS_HEADER).append('\n')
@@ -127,7 +160,7 @@ object KawaiiSubs {
                 if (!body.contains("WEBVTT")) return null
                 val ass = vttToAss(body)
                 cache[vttUrl] = ass
-                Log.d(TAG, "sub converted: ${ass.length} chars")
+                Log.d(TAG, "sub converted (v7 rtl-wrap): ${ass.length} chars")
                 ass
             }
         } catch (e: Exception) { Log.e(TAG, "sub convert: ${e.message}"); null }
@@ -160,13 +193,10 @@ object KawaiiSubs {
         val parts = requestLine.split(" ")
         if (parts.size < 2) return
         val q = parts[1]
-        // [v6] route is /styled.ass — the .ass suffix is what makes the
-        // player's subtitle loader treat this as ASS and apply the styles
         if (!q.startsWith("/styled.ass")) {
             output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
             return
         }
-        // drain headers
         while (true) {
             val h = input.readLine() ?: break
             if (h.isEmpty()) break
@@ -199,10 +229,6 @@ object KawaiiSubs {
         output.flush()
     }
 
-    /**
-     * the provider's entry point. URL ends in /styled.ass so the player
-     * detects ASS format and renders the style block.
-     */
     fun styledSubtitleUrl(vttUrl: String, lang: String): String? {
         val port = ensureServer() ?: return null
         return try {
