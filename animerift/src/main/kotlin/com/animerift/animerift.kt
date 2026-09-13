@@ -65,7 +65,8 @@ class AnimeRift : MainAPI() {
 
     companion object {
         private const val TAG = "AnimeRift"
-        private const val CACHE_VERSION = 2
+        private const val CACHE_VERSION = 3
+        private const val CRED_VERSION = 2
 
         private var fid: String? = null
         private var firebaseToken: String? = null
@@ -77,6 +78,7 @@ class AnimeRift : MainAPI() {
         private var vpnNoticeCount = 0
         private var firebaseFailed = false
         private var cacheVersionSeen = -1
+        private var credVersionSeen = -1
 
         private val providerConfigs = HashMap<String, JsonNode>()
 
@@ -178,34 +180,70 @@ class AnimeRift : MainAPI() {
     }
 
     private fun generateSyntheticDevice(): Pair<String, String> {
+        // widened pool — 20 templates instead of 4
         val brands = listOf(
             Triple("google", "Google", "Pixel 8 Pro"),
+            Triple("google", "Google", "Pixel 8"),
+            Triple("google", "Google", "Pixel 7a"),
             Triple("google", "Google", "Pixel 7"),
+            Triple("samsung", "samsung", "Galaxy S24 Ultra"),
+            Triple("samsung", "samsung", "Galaxy S24"),
             Triple("samsung", "samsung", "Galaxy S23"),
-            Triple("xiaomi", "Xiaomi", "Xiaomi 13")
+            Triple("samsung", "samsung", "Galaxy A54"),
+            Triple("xiaomi", "Xiaomi", "Xiaomi 14"),
+            Triple("xiaomi", "Xiaomi", "Xiaomi 13T"),
+            Triple("xiaomi", "Xiaomi", "Redmi Note 13"),
+            Triple("oneplus", "OnePlus", "OnePlus 12"),
+            Triple("oneplus", "OnePlus", "OnePlus 11"),
+            Triple("oppo", "OPPO", "Find X7"),
+            Triple("vivo", "vivo", "X100 Pro"),
+            Triple("realme", "realme", "realme GT 5"),
+            Triple("asus", "ASUS", "Zenfone 10"),
+            Triple("motorola", "motorola", "Edge 40"),
+            Triple("nokia", "HMD Global", "Nokia X30"),
+            Triple("sony", "Sony", "Xperia 1 V")
         )
         val selected = brands.random()
-        val randomNum = "${Random().nextInt(899999) + 100000}.015"
-        val buildId = "AP2A.240805.$randomNum"
+
+        // per-brand build prefix so deviceOsId and device_info stay consistent
+        val buildPrefix = when (selected.first) {
+            "google" -> "AP2A.240805"
+            "samsung" -> "UP1A.231005"
+            "xiaomi" -> "UKQ1.230917"
+            "oneplus" -> "UP1A.231005"
+            "oppo" -> "SP1A.210812"
+            "vivo" -> "SP1A.210812"
+            "realme" -> "UKQ1.230924"
+            "asus" -> "UP1A.231005"
+            "motorola" -> "U1TS34.18"
+            "nokia" -> "SKQ1.230410"
+            "sony" -> "UP1A.231005"
+            else -> "UP1A.231005"
+        }
+
+        val randomNum = "${Random().nextInt(899999) + 100000}.${(10..99).random()}"
+        val buildId = "$buildPrefix.$randomNum"
         val uniqueTag = UUID.randomUUID().toString().substring(0, 8)
+        val model = selected.third
+        val brandLower = selected.first
 
         val deviceInfo = mapOf(
-            "model" to selected.third,
+            "model" to model,
             "brand" to selected.first,
             "manufacturer" to selected.second,
-            "device" to selected.first,
+            "device" to model.lowercase().replace(" ", "_"),
             "hardware" to "qcom",
-            "product" to selected.first,
+            "product" to model.lowercase().replace(" ", "_"),
             "androidVersion" to "14",
             "sdkInt" to 34,
             "securityPatch" to "2025-01-01",
             "isPhysicalDevice" to true,
-            "supportedAbis" to listOf("arm64-v8a"),
+            "supportedAbis" to listOf("arm64-v8a", "armeabi-v7a", "armeabi"),
             "tags" to "release-keys",
             "type" to "user",
             "buildId" to buildId,
             "host" to "build-server-$uniqueTag",
-            "fingerprint" to "${selected.first}/${selected.third}/${selected.first}:14/$buildId/V.1e9a_$uniqueTag:user/release-keys"
+            "fingerprint" to "$brandLower/$model/$brandLower:14/$buildId/V.1e9a_$uniqueTag:user/release-keys"
         )
         return buildId to mapper.writeValueAsString(deviceInfo)
     }
@@ -320,6 +358,14 @@ class AnimeRift : MainAPI() {
                 log("cache cleared (version bump to $CACHE_VERSION)")
             }
 
+            // credential wipe on version bump — kills stale banned device from disk
+            if (credVersionSeen != CRED_VERSION) {
+                wipeIdentity()
+                firebaseFailed = false
+                credVersionSeen = CRED_VERSION
+                log("credentials wiped (version bump to $CRED_VERSION)")
+            }
+
             if (!firebaseFailed) {
                 try {
                     registerFirebaseInstallation()
@@ -347,11 +393,8 @@ class AnimeRift : MainAPI() {
                 if (gatewayBaseUrl.isNullOrEmpty()) gatewayBaseUrl = defaultApiBase
             }
 
-            try {
-                registerDevice()
-            } catch (e: Exception) {
-                logErr("registerDevice failed — continuing anyway", e)
-            }
+            // registerDevice is now MANDATORY. If it fails, we throw and don't save creds.
+            registerDevice()
 
             synchronized(initLock) {
                 saveToDisk(
@@ -472,7 +515,12 @@ class AnimeRift : MainAPI() {
         )
 
         val json = apiCall(url, "USER.AUTH.DEVICE.REGISTER", "POST", payload)
-        sessionKey = json.get("sessionKey")?.asText()
+
+        val sk = json.get("sessionKey")?.asText()
+        if (sk.isNullOrEmpty()) {
+            throw Exception("registerDevice: no sessionKey issued. response=${json.toString().take(200)}")
+        }
+        sessionKey = sk
         log("device registered under fresh identity")
     }
 
@@ -535,6 +583,16 @@ class AnimeRift : MainAPI() {
                 throw Exception("Bad JSON from $url (HTTP ${response.code}): ${text.take(140)}")
             }
 
+            // DETECT SERVER-SIDE ERROR ENVELOPE — this was the whole problem
+            val errorCode = parsed.get("errorCode")?.asText()
+            if (!errorCode.isNullOrEmpty() && errorCode != "null") {
+                throw Exception("Server errorCode=$errorCode from $url (HTTP ${response.code})")
+            }
+
+            if (!response.isSuccessful) {
+                throw Exception("HTTP ${response.code} from $url: ${text.take(140)}")
+            }
+
             if (ttl > 0) {
                 if (isCacheWorthy(scope, parsed)) {
                     cachePut(key, parsed, ttl)
@@ -547,7 +605,9 @@ class AnimeRift : MainAPI() {
             return parsed
         } catch (e: Exception) {
             val msg = e.message.orEmpty()
-            val isAuthFail = msg.contains("401") || msg.contains("403") || msg.contains("ACCESS_DENIED")
+            val isAuthFail = msg.contains("401") || msg.contains("403") ||
+                msg.contains("ACCESS_DENIED") || msg.contains("DEVICE_SUSPENDED") ||
+                msg.contains("Server errorCode=")
             if (isAuthFail) {
                 consecutiveFailures++
                 if (!isRetry) {
@@ -562,7 +622,7 @@ class AnimeRift : MainAPI() {
                             ensureInitialized(forceRefresh = true)
                         }
                     }
-                    delay(1000)
+                    delay(1500)
                     return apiCall(url, scope, method, body, isRetry = true)
                 }
             }
