@@ -175,6 +175,45 @@ class AnimeRift : MainAPI() {
         return bos.toByteArray()
     }
 
+    // media.rift-streamer.com/videos/watch?t=...&a=1 is a redirector that only
+    // answers with the real stream URL when the anime-rift request headers are present.
+    // do a HEAD with headers, grab Location, return the direct URL so players
+    // that don't forward custom headers (mpv, internal ExoPlayer) can open it.
+    private fun resolveRiftRedirect(url: String, headers: Map<String, String>): String? {
+        return try {
+            val hb = okhttp3.Headers.Builder()
+            headers.filterKeys {
+                val k = it.lowercase()
+                k != "range" && k != "host"
+            }.forEach { (k, v) -> hb.add(k, v) }
+
+            val client = app.baseClient.newBuilder()
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .build()
+
+            val req = okhttp3.Request.Builder()
+                .url(url)
+                .headers(hb.build())
+                .head()
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                if (resp.isRedirect) {
+                    resp.header("Location")?.let { loc ->
+                        // Location can be relative; resolve against original URL
+                        try {
+                            java.net.URI(url).resolve(loc).toString()
+                        } catch (_: Exception) { loc }
+                    }
+                } else null
+            }
+        } catch (e: Exception) {
+            logErr("resolveRiftRedirect", e)
+            null
+        }
+    }
+
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
         synchronized(initLock) {
             if (rotateIdentity) {
@@ -696,24 +735,42 @@ class AnimeRift : MainAPI() {
                                     "Accept" to "*/*",
                                     "Range" to "bytes=0-",
                                     "Connection" to "close",
-                                    "Icy-MetaData" to "1"
+                                    "Icy-MetaData" to "1",
+                                    // rift-streamer redirector gate
+                                    "X-request-source" to "anime-rift",
+                                    "X-streamer-version" to "1.0.0",
+                                    "X-request-action" to "watch"
                                 )
                                 customHeaders["Host"] = try {
                                     java.net.URI(videoUrl).host
-                                } catch (_: Exception) { "media-1.rift-content.com" }
+                                } catch (_: Exception) { "media.rift-streamer.com" }
 
                                 directLinkJson.get("http_headers")?.fields()?.forEach { (k, v) ->
                                     customHeaders[k] = v.asText()
                                 }
 
+                                // if the URL is the rift-streamer redirector, resolve it
+                                // to the direct CDN URL so header-less players can open it
+                                val resolvedUrl: String = if (videoUrl.contains("media.rift-streamer.com/videos/watch")) {
+                                    resolveRiftRedirect(videoUrl, customHeaders) ?: videoUrl
+                                } else videoUrl
+
+                                val finalHeaders: Map<String, String> =
+                                    if (resolvedUrl != videoUrl) {
+                                        // direct CDN URL — headers aren't required, keep it minimal
+                                        mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
+                                    } else {
+                                        customHeaders
+                                    }
+
                                 callback.invoke(
                                     newExtractorLink(
                                         source = name,
                                         name = "$serverName [$subTitle] - $quality",
-                                        url = videoUrl,
+                                        url = resolvedUrl,
                                     ) {
                                         this.quality = extractQuality(quality)
-                                        this.headers = customHeaders
+                                        this.headers = finalHeaders
                                     }
                                 )
                                 emittedCount.incrementAndGet()
