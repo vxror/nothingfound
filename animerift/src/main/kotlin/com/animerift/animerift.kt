@@ -6,10 +6,14 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -43,6 +47,8 @@ class AnimeRift : MainAPI() {
 
     companion object {
         private const val TAG = "AnimeRift"
+        private const val PREFETCH_TTL_MS = 3 * 60 * 1000L
+
         private var fid: String? = null
         private var firebaseToken: String? = null
         private var gatewayBaseUrl: String? = null
@@ -58,6 +64,34 @@ class AnimeRift : MainAPI() {
         private var consecutiveFailures = 0
         private var lastRequestAt = 0L
         private val initLock = Any()
+
+        // prefetch machinery
+        private val prefetchScope = CoroutineScope(
+            Dispatchers.IO + SupervisorJob() + CoroutineName("AnimeRift-prefetch")
+        )
+        private val prefetchLock = Any()
+        private val prefetchedLinks = HashMap<String, PrefetchEntry>()
+        private var currentAnimeEpisodes: List<String> = emptyList()
+        private var currentAnimeId: String = ""
+        private val inFlightPrefetches = HashSet<String>()
+
+        data class ResolvedLink(
+            val serverName: String,
+            val subTitle: String,
+            val quality: String,
+            val url: String,
+            val headers: Map<String, String>
+        )
+
+        data class ResolvedBundle(
+            val links: List<ResolvedLink>,
+            val subtitles: List<SubtitleFile>
+        )
+
+        data class PrefetchEntry(
+            val bundle: ResolvedBundle,
+            val createdAt: Long
+        )
 
         private fun getCacheFile(): File {
             val tmp = System.getProperty("java.io.tmpdir") ?: "."
@@ -97,6 +131,16 @@ class AnimeRift : MainAPI() {
             syntheticBuildId = null
             syntheticDeviceInfoJson = null
             Log.d(TAG, "identity wiped — next call mints a fresh device")
+        }
+
+        private fun pruneStalePrefetch() {
+            val cutoff = System.currentTimeMillis() - PREFETCH_TTL_MS
+            synchronized(prefetchLock) {
+                val it = prefetchedLinks.entries.iterator()
+                while (it.hasNext()) {
+                    if (it.next().value.createdAt < cutoff) it.remove()
+                }
+            }
         }
     }
 
@@ -175,10 +219,6 @@ class AnimeRift : MainAPI() {
         return bos.toByteArray()
     }
 
-    // media.rift-streamer.com/videos/watch?t=...&a=1 is a redirector that only
-    // answers with the real stream URL when the anime-rift request headers are present.
-    // do a HEAD with headers, grab Location, return the direct URL so players
-    // that don't forward custom headers (mpv, internal ExoPlayer) can open it.
     private fun resolveRiftRedirect(url: String, headers: Map<String, String>): String? {
         return try {
             val hb = okhttp3.Headers.Builder()
@@ -201,10 +241,7 @@ class AnimeRift : MainAPI() {
             client.newCall(req).execute().use { resp ->
                 if (resp.isRedirect) {
                     resp.header("Location")?.let { loc ->
-                        // Location can be relative; resolve against original URL
-                        try {
-                            java.net.URI(url).resolve(loc).toString()
-                        } catch (_: Exception) { loc }
+                        try { java.net.URI(url).resolve(loc).toString() } catch (_: Exception) { loc }
                     }
                 } else null
             }
@@ -561,6 +598,7 @@ class AnimeRift : MainAPI() {
         }
 
         val episodesList = mutableListOf<Episode>()
+        val orderedData = mutableListOf<String>()
         try {
             val epJson = apiCall(
                 "$apiBase/library/episodes/$animeId?sort_by_latest=1&with_arcs=true&with_favorites=true",
@@ -568,8 +606,11 @@ class AnimeRift : MainAPI() {
             )
             epJson.get("items")?.forEach { ep ->
                 val epNumber = ep.get("episode_number")?.asInt() ?: 1
+                val epId = ep.get("_id")?.asText() ?: ""
+                val dataStr = "$animeId|$epId|$epNumber"
+                orderedData.add(dataStr)
                 episodesList.add(
-                    newEpisode(data = "$animeId|${ep.get("_id")?.asText() ?: ""}|$epNumber") {
+                    newEpisode(data = dataStr) {
                         this.name = "الحلقة $epNumber"
                         this.episode = epNumber
                         this.season = 1
@@ -578,6 +619,14 @@ class AnimeRift : MainAPI() {
                 )
             }
         } catch (e: Exception) { logErr("episodes", e) }
+
+        synchronized(prefetchLock) {
+            currentAnimeId = animeId
+            currentAnimeEpisodes = orderedData.toList()
+            // drop stale prefetch from any other show
+            prefetchedLinks.keys.removeIf { !it.startsWith("$animeId|") }
+            inFlightPrefetches.removeIf { !it.startsWith("$animeId|") }
+        }
 
         val ratingFloat = item.get("myAnimeList_rating")?.asDouble()?.toFloat()
 
@@ -601,6 +650,253 @@ class AnimeRift : MainAPI() {
         }
     }
 
+    // ---- link resolution (shared by loadLinks + prefetch) ----
+
+    private suspend fun resolveBundle(
+        animeId: String,
+        episodeId: String,
+        episodeNumber: Int
+    ): ResolvedBundle {
+        val links = mutableListOf<ResolvedLink>()
+        val subtitles = mutableListOf<SubtitleFile>()
+
+        val sourcesJson = apiCall(
+            "$apiBase/library/episode/sources",
+            "ANIME.LIBRARY.EPISODES.SOURCES.ALL",
+            method = "POST",
+            body = mapOf("animeId" to animeId, "episodeId" to episodeId, "episode_number" to episodeNumber)
+        )
+        val items = sourcesJson.get("items") ?: return ResolvedBundle(emptyList(), emptyList())
+
+        synchronized(providerConfigs) {
+            providerConfigs.clear()
+            sourcesJson.get("configs")?.forEach { c ->
+                c.get("server_key")?.asText()?.let { key -> providerConfigs[key] = c }
+            }
+        }
+        log("sources: ${items.size()} items, ${providerConfigs.size} configs")
+
+        fun providerRank(provider: String): Int {
+            val cfg = providerConfigs[provider]
+            val serverPriority = cfg?.get("priority")?.asInt()
+            val localIdx = listOf("rift-streamer", "cr2", "streamtape").indexOf(provider)
+            return when {
+                serverPriority != null && serverPriority > 0 -> serverPriority
+                localIdx != -1 -> localIdx + 10
+                else -> 99
+            }
+        }
+
+        val filteredItems = items.filter { src ->
+            val subTitle = src.get("sub_title")?.asText() ?: ""
+            subTitle.startsWith("ar_") || subTitle.isEmpty()
+        }.ifEmpty { items.toList() }
+
+        val byProvider = filteredItems.groupBy { it.get("provider")?.asText() ?: "" }
+        val topProviders = byProvider.keys
+            .sortedBy { providerRank(it) }
+            .take(8)
+        val sortedItems = topProviders.flatMap { byProvider[it] ?: emptyList() }
+
+        log("providers: ${topProviders.joinToString(",")} → ${sortedItems.size} items")
+
+        val semaphore = Semaphore(4)
+        val subLock = Any()
+        val linkLock = Any()
+
+        suspend fun processSource(src: JsonNode) {
+            val hostId = src.get("_id")?.asText() ?: return
+            val serverName = src.get("server_name")?.asText() ?: "Server"
+            val provider = src.get("provider")?.asText() ?: ""
+            val subTitle = src.get("sub_title")?.asText() ?: ""
+
+            val loadingDuration = providerConfigs[provider]?.get("loadingDuration")?.asInt() ?: 0
+            if (loadingDuration in 1..15) delay(loadingDuration * 100L)
+
+            val qualitiesNode = src.get("qualities")
+            val qualitiesList = if (qualitiesNode != null && qualitiesNode.isArray && qualitiesNode.size() > 0) {
+                qualitiesNode.map { it.asText() }.sortedByDescending { extractQuality(it) }
+            } else listOf("720P")
+
+            for (quality in qualitiesList) {
+                try {
+                    val canPlayJson = apiCall(
+                        "$apiBase/library/episode/source/can_play",
+                        "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
+                        method = "POST",
+                        body = mapOf(
+                            "episodeId" to episodeId,
+                            "hostId" to hostId,
+                            "is_download" to isDownloadRequest(),
+                            "event_name" to "play_episode_unlocked"
+                        )
+                    )
+                    val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
+
+                    try {
+                        apiCall(
+                            "$apiBase/ads_manager/claim",
+                            "USER.ADS_MANAGER.CLAIMS",
+                            method = "PUT",
+                            body = mapOf(
+                                "event_name" to "play_episode_unlocked",
+                                "hostId" to hostId,
+                                "episodeId" to episodeId,
+                                "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
+                                "reward_result" to "not_filled",
+                                "streamingServerKey" to provider,
+                                "is_optional" to false,
+                                "is_reward" to true
+                            )
+                        )
+                    } catch (_: Exception) {}
+
+                    val directLinkJson = apiCall(
+                        "$apiBase/library/episode/source/direct_link",
+                        "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
+                        method = "POST",
+                        body = mapOf(
+                            "id" to hostId,
+                            "quality" to quality,
+                            "with_internal_player" to "1",
+                            "sessionId" to sessionId
+                        )
+                    )
+
+                    directLinkJson.get("tracks")?.forEach { track ->
+                        val trackUrl = track.get("file")?.asText() ?: track.get("url")?.asText()
+                        val trackLang = track.get("label")?.asText()
+                            ?: track.get("language")?.asText() ?: "Arabic"
+                        if (!trackUrl.isNullOrEmpty()) {
+                            synchronized(subLock) { subtitles.add(SubtitleFile(trackLang, trackUrl)) }
+                        }
+                    }
+
+                    if (directLinkJson.get("url_response")?.asBoolean() == true) {
+                        val videoUrl = directLinkJson.get("videoUrl")?.asText()
+                        if (!videoUrl.isNullOrEmpty()) {
+                            val customHeaders = mutableMapOf(
+                                "User-Agent" to "libmpv",
+                                "Accept" to "*/*",
+                                "Range" to "bytes=0-",
+                                "Connection" to "close",
+                                "Icy-MetaData" to "1",
+                                "X-request-source" to "anime-rift",
+                                "X-streamer-version" to "1.0.0",
+                                "X-request-action" to "watch"
+                            )
+                            customHeaders["Host"] = try {
+                                java.net.URI(videoUrl).host
+                            } catch (_: Exception) { "media.rift-streamer.com" }
+
+                            directLinkJson.get("http_headers")?.fields()?.forEach { (k, v) ->
+                                customHeaders[k] = v.asText()
+                            }
+
+                            val resolvedUrl: String = if (videoUrl.contains("media.rift-streamer.com/videos/watch")) {
+                                resolveRiftRedirect(videoUrl, customHeaders) ?: videoUrl
+                            } else videoUrl
+
+                            val finalHeaders: Map<String, String> =
+                                if (resolvedUrl != videoUrl) {
+                                    mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
+                                } else {
+                                    customHeaders
+                                }
+
+                            synchronized(linkLock) {
+                                links.add(
+                                    ResolvedLink(
+                                        serverName = serverName,
+                                        subTitle = subTitle,
+                                        quality = quality,
+                                        url = resolvedUrl,
+                                        headers = finalHeaders
+                                    )
+                                )
+                            }
+                        }
+                    } else if (directLinkJson.get("ticket_response")?.asBoolean() == true) {
+                        val fileId = directLinkJson.get("fileId")?.asText() ?: ""
+                        val ticket = directLinkJson.get("ticket")?.asText() ?: ""
+                        val waitTimeSeconds = directLinkJson.get("wait_time")?.asLong() ?: 5L
+
+                        if (fileId.isNotEmpty() && ticket.isNotEmpty()) {
+                            delay(waitTimeSeconds * 1000 + 500)
+
+                            val tapeApiUrl = "https://api.streamtape.com/file/dl?file=$fileId&ticket=$ticket"
+                            var tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
+                            if (tapeRes.get("status")?.asInt() != 200) {
+                                delay(2000)
+                                tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
+                            }
+                            val tapeDirectUrl = tapeRes.get("result")?.get("url")?.asText()
+                            if (!tapeDirectUrl.isNullOrEmpty()) {
+                                synchronized(linkLock) {
+                                    links.add(
+                                        ResolvedLink(
+                                            serverName = serverName,
+                                            subTitle = subTitle,
+                                            quality = quality,
+                                            url = tapeDirectUrl,
+                                            headers = mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    logErr("server $serverName/$quality", e)
+                }
+            }
+        }
+
+        supervisorScope {
+            sortedItems.map { src ->
+                async(Dispatchers.IO) { semaphore.withPermit { processSource(src) } }
+            }.awaitAll()
+        }
+
+        return ResolvedBundle(links.toList(), subtitles.toList())
+    }
+
+    // ---- prefetch ----
+
+    private fun triggerPrefetchNext(currentData: String) {
+        val nextData = synchronized(prefetchLock) {
+            val idx = currentAnimeEpisodes.indexOf(currentData)
+            if (idx < 0 || idx + 1 >= currentAnimeEpisodes.size) return
+            currentAnimeEpisodes[idx + 1]
+        }
+        synchronized(prefetchLock) {
+            if (prefetchedLinks.containsKey(nextData)) return
+            if (inFlightPrefetches.contains(nextData)) return
+            inFlightPrefetches.add(nextData)
+        }
+
+        prefetchScope.launch {
+            try {
+                val parts = nextData.split('|')
+                if (parts.size < 2) return@launch
+                val animeId = parts[0]
+                val epId = parts[1]
+                val epNum = parts.getOrNull(2)?.toIntOrNull() ?: 1
+
+                val bundle = resolveBundle(animeId, epId, epNum)
+                synchronized(prefetchLock) {
+                    pruneStalePrefetch()
+                    prefetchedLinks[nextData] = PrefetchEntry(bundle, System.currentTimeMillis())
+                    inFlightPrefetches.remove(nextData)
+                }
+                log("prefetched ${bundle.links.size} links for $nextData")
+            } catch (e: Exception) {
+                logErr("prefetch $nextData", e)
+                synchronized(prefetchLock) { inFlightPrefetches.remove(nextData) }
+            }
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -614,211 +910,53 @@ class AnimeRift : MainAPI() {
             val episodeId = parts[1]
             val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
 
-            val sourcesJson = apiCall(
-                "$apiBase/library/episode/sources",
-                "ANIME.LIBRARY.EPISODES.SOURCES.ALL",
-                method = "POST",
-                body = mapOf("animeId" to animeId, "episodeId" to episodeId, "episode_number" to episodeNumber)
-            )
-            val items = sourcesJson.get("items") ?: return@withContext false
-
-            synchronized(providerConfigs) {
-                providerConfigs.clear()
-                sourcesJson.get("configs")?.forEach { c ->
-                    c.get("server_key")?.asText()?.let { key -> providerConfigs[key] = c }
-                }
-            }
-            log("sources: ${items.size()} items, ${providerConfigs.size} configs")
-
-            fun providerRank(provider: String): Int {
-                val cfg = providerConfigs[provider]
-                val serverPriority = cfg?.get("priority")?.asInt()
-                val localIdx = listOf("rift-streamer", "cr2", "streamtape").indexOf(provider)
-                return when {
-                    serverPriority != null && serverPriority > 0 -> serverPriority
-                    localIdx != -1 -> localIdx + 10
-                    else -> 99
-                }
+            // cache hit path
+            val cached = synchronized(prefetchLock) {
+                val e = prefetchedLinks.remove(data)
+                if (e != null && System.currentTimeMillis() - e.createdAt < PREFETCH_TTL_MS) e else null
             }
 
-            val filteredItems = items.filter { src ->
-                val subTitle = src.get("sub_title")?.asText() ?: ""
-                subTitle.startsWith("ar_") || subTitle.isEmpty()
-            }.ifEmpty { items.toList() }
-
-            // group by provider so multi-quality hosts (rift-streamer) aren't
-            // starved by per-quality hosts (cr2/streamtape) eating all the slots
-            val byProvider = filteredItems.groupBy { it.get("provider")?.asText() ?: "" }
-            val topProviders = byProvider.keys
-                .sortedBy { providerRank(it) }
-                .take(4)
-            val sortedItems = topProviders.flatMap { byProvider[it] ?: emptyList() }
-
-            log("providers: ${topProviders.joinToString(",")} → ${sortedItems.size} items")
-
-            val semaphore = Semaphore(4)
-            val emittedCount = java.util.concurrent.atomic.AtomicInteger(0)
-
-            suspend fun processSource(src: JsonNode) {
-                val hostId = src.get("_id")?.asText() ?: return
-                val serverName = src.get("server_name")?.asText() ?: "Server"
-                val provider = src.get("provider")?.asText() ?: ""
-                val subTitle = src.get("sub_title")?.asText() ?: ""
-
-                val loadingDuration = providerConfigs[provider]?.get("loadingDuration")?.asInt() ?: 0
-                if (loadingDuration in 1..15) delay(loadingDuration * 100L)
-
-                val qualitiesNode = src.get("qualities")
-                val qualitiesList = if (qualitiesNode != null && qualitiesNode.isArray && qualitiesNode.size() > 0) {
-                    qualitiesNode.map { it.asText() }.sortedByDescending { extractQuality(it) }
-                } else listOf("720P")
-
-                for (quality in qualitiesList) {
-                    try {
-                        val canPlayJson = apiCall(
-                            "$apiBase/library/episode/source/can_play",
-                            "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
-                            method = "POST",
-                            body = mapOf(
-                                "episodeId" to episodeId,
-                                "hostId" to hostId,
-                                "is_download" to isDownloadRequest(),
-                                "event_name" to "play_episode_unlocked"
-                            )
-                        )
-                        val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
-
-                        try {
-                            apiCall(
-                                "$apiBase/ads_manager/claim",
-                                "USER.ADS_MANAGER.CLAIMS",
-                                method = "PUT",
-                                body = mapOf(
-                                    "event_name" to "play_episode_unlocked",
-                                    "hostId" to hostId,
-                                    "episodeId" to episodeId,
-                                    "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
-                                    "reward_result" to "not_filled",
-                                    "streamingServerKey" to provider,
-                                    "is_optional" to false,
-                                    "is_reward" to true
-                                )
-                            )
-                        } catch (_: Exception) {}
-
-                        val directLinkJson = apiCall(
-                            "$apiBase/library/episode/source/direct_link",
-                            "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
-                            method = "POST",
-                            body = mapOf(
-                                "id" to hostId,
-                                "quality" to quality,
-                                "with_internal_player" to "1",
-                                "sessionId" to sessionId
-                            )
-                        )
-
-                        directLinkJson.get("tracks")?.forEach { track ->
-                            val trackUrl = track.get("file")?.asText() ?: track.get("url")?.asText()
-                            val trackLang = track.get("label")?.asText()
-                                ?: track.get("language")?.asText() ?: "Arabic"
-                            if (!trackUrl.isNullOrEmpty()) {
-                                subtitleCallback(SubtitleFile(trackLang, trackUrl))
-                            }
+            if (cached != null) {
+                log("using prefetched bundle for $data (${cached.bundle.links.size} links)")
+                cached.bundle.subtitles.forEach { subtitleCallback(it) }
+                cached.bundle.links.forEach { rl ->
+                    callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = "${rl.serverName} [${rl.subTitle}] - ${rl.quality}",
+                            url = rl.url,
+                        ) {
+                            this.quality = extractQuality(rl.quality)
+                            this.headers = rl.headers
                         }
+                    )
+                }
+                triggerPrefetchNext(data)
+                return@withContext cached.bundle.links.isNotEmpty()
+            }
 
-                        if (directLinkJson.get("url_response")?.asBoolean() == true) {
-                            val videoUrl = directLinkJson.get("videoUrl")?.asText()
-                            if (!videoUrl.isNullOrEmpty()) {
-                                val customHeaders = mutableMapOf(
-                                    "User-Agent" to "libmpv",
-                                    "Accept" to "*/*",
-                                    "Range" to "bytes=0-",
-                                    "Connection" to "close",
-                                    "Icy-MetaData" to "1",
-                                    // rift-streamer redirector gate
-                                    "X-request-source" to "anime-rift",
-                                    "X-streamer-version" to "1.0.0",
-                                    "X-request-action" to "watch"
-                                )
-                                customHeaders["Host"] = try {
-                                    java.net.URI(videoUrl).host
-                                } catch (_: Exception) { "media.rift-streamer.com" }
+            // cold path
+            val bundle = resolveBundle(animeId, episodeId, episodeNumber)
 
-                                directLinkJson.get("http_headers")?.fields()?.forEach { (k, v) ->
-                                    customHeaders[k] = v.asText()
-                                }
-
-                                // if the URL is the rift-streamer redirector, resolve it
-                                // to the direct CDN URL so header-less players can open it
-                                val resolvedUrl: String = if (videoUrl.contains("media.rift-streamer.com/videos/watch")) {
-                                    resolveRiftRedirect(videoUrl, customHeaders) ?: videoUrl
-                                } else videoUrl
-
-                                val finalHeaders: Map<String, String> =
-                                    if (resolvedUrl != videoUrl) {
-                                        // direct CDN URL — headers aren't required, keep it minimal
-                                        mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
-                                    } else {
-                                        customHeaders
-                                    }
-
-                                callback.invoke(
-                                    newExtractorLink(
-                                        source = name,
-                                        name = "$serverName [$subTitle] - $quality",
-                                        url = resolvedUrl,
-                                    ) {
-                                        this.quality = extractQuality(quality)
-                                        this.headers = finalHeaders
-                                    }
-                                )
-                                emittedCount.incrementAndGet()
-                            }
-                        } else if (directLinkJson.get("ticket_response")?.asBoolean() == true) {
-                            val fileId = directLinkJson.get("fileId")?.asText() ?: ""
-                            val ticket = directLinkJson.get("ticket")?.asText() ?: ""
-                            val waitTimeSeconds = directLinkJson.get("wait_time")?.asLong() ?: 5L
-
-                            if (fileId.isNotEmpty() && ticket.isNotEmpty()) {
-                                delay(waitTimeSeconds * 1000 + 500)
-
-                                val tapeApiUrl = "https://api.streamtape.com/file/dl?file=$fileId&ticket=$ticket"
-                                var tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
-                                if (tapeRes.get("status")?.asInt() != 200) {
-                                    delay(2000)
-                                    tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
-                                }
-                                val tapeDirectUrl = tapeRes.get("result")?.get("url")?.asText()
-                                if (!tapeDirectUrl.isNullOrEmpty()) {
-                                    callback.invoke(
-                                        newExtractorLink(
-                                            source = name,
-                                            name = "$serverName [$subTitle] - $quality",
-                                            url = tapeDirectUrl,
-                                        ) {
-                                            this.quality = extractQuality(quality)
-                                            this.headers = mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
-                                        }
-                                    )
-                                    emittedCount.incrementAndGet()
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        logErr("server $serverName/$quality", e)
+            bundle.subtitles.forEach { subtitleCallback(it) }
+            bundle.links.forEach { rl ->
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = "${rl.serverName} [${rl.subTitle}] - ${rl.quality}",
+                        url = rl.url,
+                    ) {
+                        this.quality = extractQuality(rl.quality)
+                        this.headers = rl.headers
                     }
-                }
+                )
             }
 
-            supervisorScope {
-                sortedItems.map { src ->
-                    async(Dispatchers.IO) { semaphore.withPermit { processSource(src) } }
-                }.awaitAll()
-            }
+            log("loadLinks done: ${bundle.links.size} links emitted")
 
-            log("loadLinks done: ${emittedCount.get()} links emitted")
-            return@withContext emittedCount.get() > 0
+            triggerPrefetchNext(data)
+
+            return@withContext bundle.links.isNotEmpty()
         } catch (e: Exception) {
             logErr("loadLinks", e)
             return@withContext false
