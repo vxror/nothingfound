@@ -67,9 +67,10 @@ class AnimeRift : MainAPI() {
 
     companion object {
         private const val TAG = "AnimeRift"
-        private const val CACHE_VERSION = 4
-        private const val CRED_VERSION = 3
+        private const val CACHE_VERSION = 6
+        private const val CRED_VERSION = 5
         private const val MAX_ROTATION_ATTEMPTS = 3
+        private const val PREFETCH_TTL_MS = 5 * 60 * 1000L
 
         private var fid: String? = null
         private var firebaseToken: String? = null
@@ -78,7 +79,6 @@ class AnimeRift : MainAPI() {
         private var deviceId: String? = null
         private var syntheticBuildId: String? = null
         private var syntheticDeviceInfoJson: String? = null
-        private var vpnNoticeCount = 0
         private var firebaseFailed = false
         private var cacheVersionSeen = -1
         private var credVersionSeen = -1
@@ -89,9 +89,13 @@ class AnimeRift : MainAPI() {
         private var rotationAttempts = 0
         private var lastRequestAt = 0L
         private val initMutex = Mutex()
+        private val rotationMutex = Mutex()
+        private val throttleMutex = Mutex()
 
         @Volatile private var cooldownUntil = 0L
         @Volatile private var rateLimitHits = 0
+        @Volatile private var last429At = 0L
+        @Volatile private var lastRotationAt = 0L
 
         private val jsonCache = object : LinkedHashMap<String, CacheEntry>(300, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?) = size > 300
@@ -103,8 +107,6 @@ class AnimeRift : MainAPI() {
             Dispatchers.IO + SupervisorJob() + CoroutineName("AnimeRift-prefetch")
         )
         @Volatile private var episodeOrder: List<String> = emptyList()
-
-        private const val PREFETCH_TTL_MS = 5 * 60 * 1000L
 
         private val TTL_BY_SCOPE = mapOf(
             "ANIME.LIBRARY.HOME_CONTENT" to 5 * 60 * 1000L,
@@ -134,6 +136,8 @@ class AnimeRift : MainAPI() {
             return e.node
         }
 
+        @Synchronized private fun cachePeek(key: String): JsonNode? = jsonCache[key]?.node
+
         @Synchronized private fun cachePut(key: String, node: JsonNode, ttl: Long) {
             jsonCache[key] = CacheEntry(node, System.currentTimeMillis() + ttl)
         }
@@ -150,9 +154,16 @@ class AnimeRift : MainAPI() {
             }
         }
 
+        // FIX: java.io.tmpdir is not writable on Android. Try AcraApplication
+        // context first (CloudStream's Application class), then CommonActivity,
+        // then a private File fallback.
         private fun getCacheFile(): File {
-            val tmp = System.getProperty("java.io.tmpdir") ?: "."
-            return File(tmp, "anime_rift_session_store.json")
+            val dir = runCatching {
+                com.lagradost.cloudstream3.AcraApplication.context?.cacheDir
+            }.getOrNull() ?: runCatching {
+                com.lagradost.cloudstream3.CommonActivity.activity?.cacheDir
+            }.getOrNull() ?: File(System.getProperty("java.io.tmpdir") ?: ".")
+            return File(dir, "anime_rift_session_store.json")
         }
 
         private fun saveToDisk(data: Map<String, String>) {
@@ -356,33 +367,56 @@ class AnimeRift : MainAPI() {
     )
 
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
-        initMutex.withLock {
-            if (isCoolingDown()) {
-                val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
-                throw Exception("cooldown active, skipping init (${remain}s remaining)")
+        if (isCoolingDown()) {
+            if (!forceRefresh &&
+                !fid.isNullOrEmpty() && !deviceId.isNullOrEmpty() &&
+                !firebaseToken.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty()
+            ) {
+                return
             }
+            val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
+            throw Exception("cooldown active (${remain}s remaining)")
+        }
 
-            if (rotateIdentity) {
-                wipeIdentity()
-                firebaseFailed = false
-            }
-
-            if (!forceRefresh) {
-                if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
-                    !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
-
-                loadFromDisk()?.let { disk ->
-                    fid = disk["fid"]
-                    firebaseToken = disk["firebaseToken"]
-                    gatewayBaseUrl = disk["gatewayBaseUrl"].takeIf { !it.isNullOrEmpty() } ?: defaultApiBase
-                    deviceId = disk["deviceId"]
-                    sessionKey = disk["sessionKey"]
-                    syntheticBuildId = disk["syntheticBuildId"]
-                    syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
-                    if (!fid.isNullOrEmpty() && !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
+        if (rotateIdentity) {
+            rotationMutex.withLock {
+                val now = System.currentTimeMillis()
+                if (now - lastRotationAt < 60_000L &&
+                    !fid.isNullOrEmpty() && !deviceId.isNullOrEmpty() && !firebaseToken.isNullOrEmpty()) {
+                    log("skip rotation — recent rotation ${(now - lastRotationAt) / 1000}s ago")
+                    return
                 }
+                if (!forceRefresh && !fid.isNullOrEmpty() && !deviceId.isNullOrEmpty() &&
+                    !firebaseToken.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty()) {
+                    return
+                }
+                wipeIdentity()
+                lastRotationAt = now
+                firebaseFailed = false
+                doTheActualInit()
             }
+            return
+        }
 
+        if (!forceRefresh) {
+            if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
+                !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
+            loadFromDisk()?.let { disk ->
+                fid = disk["fid"]
+                firebaseToken = disk["firebaseToken"]
+                gatewayBaseUrl = disk["gatewayBaseUrl"].takeIf { !it.isNullOrEmpty() } ?: defaultApiBase
+                deviceId = disk["deviceId"]
+                sessionKey = disk["sessionKey"]
+                syntheticBuildId = disk["syntheticBuildId"]
+                syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
+                if (!fid.isNullOrEmpty() && !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
+            }
+        }
+        initMutex.withLock { doTheActualInit() }
+    }
+
+    private suspend fun doTheActualInit() {
+        withContext(Dispatchers.IO) {
             if (cacheVersionSeen != CACHE_VERSION) {
                 cacheClear()
                 cacheVersionSeen = CACHE_VERSION
@@ -437,7 +471,6 @@ class AnimeRift : MainAPI() {
                 )
             )
             consecutiveFailures = 0
-            rateLimitHits = 0
             rotationAttempts = 0
         }
     }
@@ -551,7 +584,13 @@ class AnimeRift : MainAPI() {
 
         if (response.code == 429 || text.contains("\"statusCode\":429") || text.contains("Too Many Requests")) {
             rateLimitHits++
-            val backoff = minOf(60L * rateLimitHits, 600L)
+            last429At = System.currentTimeMillis()
+            val backoff = when (rateLimitHits) {
+                1 -> 60L
+                2 -> 180L
+                3 -> 420L
+                else -> 900L
+            }
             enterCooldown(backoff, "register 429 (hits=$rateLimitHits)")
             throw Exception("register: HTTP 429 (rate limited, cooldown ${backoff}s)")
         }
@@ -559,7 +598,9 @@ class AnimeRift : MainAPI() {
         if (text.isBlank()) throw Exception("register: empty response (HTTP ${response.code})")
         if (text.trimStart().startsWith("<")) throw Exception("register: non-JSON (HTTP ${response.code})")
 
-        val json = try { mapper.readTree(text) } catch (e: Exception) {
+        val json = try {
+            mapper.readTree(text)
+        } catch (e: Exception) {
             throw Exception("register: bad JSON (HTTP ${response.code}): ${text.take(140)}")
         }
 
@@ -583,7 +624,13 @@ class AnimeRift : MainAPI() {
         url: String, scope: String, method: String = "GET",
         body: Map<String, Any?>? = null, isRetry: Boolean = false
     ): JsonNode {
+        val key = cacheKey(method.uppercase(), url, body)
+
         if (isCoolingDown()) {
+            cachePeek(key)?.let {
+                log("cooldown active — serving stale cache ($scope)")
+                return it
+            }
             val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
             throw Exception("cooldown active (${remain}s remaining)")
         }
@@ -591,21 +638,26 @@ class AnimeRift : MainAPI() {
         ensureInitialized()
 
         val ttl = ttlFor(scope)
-        val key = cacheKey(method.uppercase(), url, body)
 
         if (ttl > 0) {
             cacheGet(key)?.let {
-                log("cache hit ${scope}")
+                log("cache hit $scope")
                 return it
             }
         }
 
-        val since = System.currentTimeMillis() - lastRequestAt
-        if (since in 0 until 120) delay(120 - since)
-        lastRequestAt = System.currentTimeMillis()
+        throttleMutex.withLock {
+            val gap = 700L + Random().nextInt(400)
+            val since = System.currentTimeMillis() - lastRequestAt
+            if (since in 0 until gap) delay(gap - since)
+            lastRequestAt = System.currentTimeMillis()
+        }
 
-        // re-check after throttle wait
         if (isCoolingDown()) {
+            cachePeek(key)?.let {
+                log("cooldown active (pre-request) — serving stale cache ($scope)")
+                return it
+            }
             val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
             throw Exception("cooldown active (pre-request, ${remain}s remaining)")
         }
@@ -622,10 +674,15 @@ class AnimeRift : MainAPI() {
 
             val text = response.text
 
-            // 429 detection FIRST — before any other parsing
             if (response.code == 429 || text.contains("\"statusCode\":429") || text.contains("Too Many Requests")) {
                 rateLimitHits++
-                val backoff = minOf(60L * rateLimitHits, 600L)
+                last429At = System.currentTimeMillis()
+                val backoff = when (rateLimitHits) {
+                    1 -> 60L
+                    2 -> 180L
+                    3 -> 420L
+                    else -> 900L
+                }
                 enterCooldown(backoff, "apiCall 429 (hits=$rateLimitHits)")
                 throw Exception("HTTP 429 from $url: ${text.take(140)}")
             }
@@ -650,8 +707,9 @@ class AnimeRift : MainAPI() {
                 throw Exception("HTTP ${response.code} from $url: ${text.take(140)}")
             }
 
-            // success — reset counters
-            rateLimitHits = 0
+            if (rateLimitHits > 0 && System.currentTimeMillis() - last429At > 20 * 60_000L) {
+                rateLimitHits = 0
+            }
             consecutiveFailures = 0
             rotationAttempts = 0
 
@@ -659,7 +717,7 @@ class AnimeRift : MainAPI() {
                 if (isCacheWorthy(scope, parsed)) {
                     cachePut(key, parsed, ttl)
                 } else {
-                    log("skip cache (empty content) ${scope}")
+                    log("skip cache (empty content) $scope")
                 }
             }
 
@@ -667,21 +725,13 @@ class AnimeRift : MainAPI() {
         } catch (e: Exception) {
             val msg = e.message.orEmpty()
 
-            // 429 / cooldown — do NOT touch identity, no retry
             if (msg.contains("429") || msg.contains("Too Many Requests") ||
                 msg.contains("cooldown active")) {
-                if (!msg.contains("cooldown active") && !msg.contains("register: HTTP 429")) {
-                    rateLimitHits++
-                    val backoff = minOf(60L * rateLimitHits, 600L)
-                    enterCooldown(backoff, "catch 429")
-                }
                 throw e
             }
 
-            // genuine auth failure
             val isAuthFail = msg.contains("401") || msg.contains("403") ||
-                msg.contains("ACCESS_DENIED") || msg.contains("DEVICE_SUSPENDED") ||
-                msg.contains("Server errorCode=")
+                msg.contains("ACCESS_DENIED") || msg.contains("DEVICE_SUSPENDED")
 
             if (isAuthFail && !isRetry) {
                 consecutiveFailures++
@@ -713,16 +763,6 @@ class AnimeRift : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
-
-        if (vpnNoticeCount < 3) {
-            vpnNoticeCount++
-            try {
-                com.lagradost.cloudstream3.CommonActivity.showToast(
-                    "⚠️ تنبيه: يُرجى استخدام VPN لتجنب حظر عنوان الـ IP الخاص بك",
-                    android.widget.Toast.LENGTH_LONG
-                )
-            } catch (_: Exception) {}
-        }
 
         ensureInitialized()
         val json = apiCall("$apiBase/library/home_content?with_genres=true", "ANIME.LIBRARY.HOME_CONTENT")
@@ -828,9 +868,6 @@ class AnimeRift : MainAPI() {
         val it = prefetchCache.keys.iterator()
         while (it.hasNext()) if (!it.next().startsWith("$animeId|")) it.remove()
 
-        // warm only episode 1
-        warmPrefetch(orderedData.take(1))
-
         val ratingFloat = item.get("myAnimeList_rating")?.asDouble()?.toFloat()
 
         return newAnimeLoadResponse(
@@ -854,8 +891,8 @@ class AnimeRift : MainAPI() {
     }
 
     private fun warmPrefetch(targets: List<String>) {
-        if (isCoolingDown()) {
-            log("prefetch skipped (cooldown)")
+        if (isCoolingDown() || rateLimitHits > 0) {
+            log("prefetch skipped (cooldown / recent 429)")
             return
         }
         for (data in targets) {
@@ -922,14 +959,16 @@ class AnimeRift : MainAPI() {
         }.ifEmpty { items.toList() }
 
         val byProvider = filteredItems.groupBy { it.get("provider")?.asText() ?: "" }
-        val topProviders = byProvider.keys.sortedBy { providerRank(it) }.take(8)
+        val topProviders = byProvider.keys.sortedBy { providerRank(it) }.take(3)
         val sortedItems = topProviders.flatMap { byProvider[it] ?: emptyList() }
 
         log("providers: ${topProviders.joinToString(",")} → ${sortedItems.size} items")
 
-        val semaphore = Semaphore(4)
+        val semaphore = Semaphore(1)
 
         suspend fun processSource(src: JsonNode) {
+            if (isCoolingDown()) return
+
             val hostId = src.get("_id")?.asText() ?: return
             val serverName = src.get("server_name")?.asText() ?: "Server"
             val provider = src.get("provider")?.asText() ?: ""
@@ -943,138 +982,138 @@ class AnimeRift : MainAPI() {
                 qualitiesNode.map { it.asText() }.sortedByDescending { extractQuality(it) }
             } else listOf("720P")
 
-            for (quality in qualitiesList) {
+            val quality = qualitiesList.first()
+
+            try {
+                val canPlayJson = apiCall(
+                    "$apiBase/library/episode/source/can_play",
+                    "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
+                    method = "POST",
+                    body = mapOf(
+                        "episodeId" to episodeId,
+                        "hostId" to hostId,
+                        "is_download" to false,
+                        "event_name" to "play_episode_unlocked"
+                    )
+                )
+                val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
+
                 try {
-                    val canPlayJson = apiCall(
-                        "$apiBase/library/episode/source/can_play",
-                        "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
-                        method = "POST",
+                    apiCall(
+                        "$apiBase/ads_manager/claim",
+                        "USER.ADS_MANAGER.CLAIMS",
+                        method = "PUT",
                         body = mapOf(
-                            "episodeId" to episodeId,
+                            "event_name" to "play_episode_unlocked",
                             "hostId" to hostId,
-                            "is_download" to false,
-                            "event_name" to "play_episode_unlocked"
+                            "episodeId" to episodeId,
+                            "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
+                            "reward_result" to "not_filled",
+                            "streamingServerKey" to provider,
+                            "is_optional" to false,
+                            "is_reward" to true
                         )
                     )
-                    val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
+                } catch (_: Exception) {}
 
-                    try {
-                        apiCall(
-                            "$apiBase/ads_manager/claim",
-                            "USER.ADS_MANAGER.CLAIMS",
-                            method = "PUT",
-                            body = mapOf(
-                                "event_name" to "play_episode_unlocked",
-                                "hostId" to hostId,
-                                "episodeId" to episodeId,
-                                "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
-                                "reward_result" to "not_filled",
-                                "streamingServerKey" to provider,
-                                "is_optional" to false,
-                                "is_reward" to true
-                            )
-                        )
-                    } catch (_: Exception) {}
-
-                    val directLinkJson = apiCall(
-                        "$apiBase/library/episode/source/direct_link",
-                        "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
-                        method = "POST",
-                        body = mapOf(
-                            "id" to hostId,
-                            "quality" to quality,
-                            "with_internal_player" to "1",
-                            "sessionId" to sessionId
-                        )
+                val directLinkJson = apiCall(
+                    "$apiBase/library/episode/source/direct_link",
+                    "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
+                    method = "POST",
+                    body = mapOf(
+                        "id" to hostId,
+                        "quality" to quality,
+                        "with_internal_player" to "1",
+                        "sessionId" to sessionId
                     )
+                )
 
-                    directLinkJson.get("tracks")?.forEach { track ->
-                        val trackUrl = track.get("file")?.asText() ?: track.get("url")?.asText()
-                        val trackLang = track.get("label")?.asText()
-                            ?: track.get("language")?.asText() ?: "Arabic"
-                        if (!trackUrl.isNullOrEmpty()) {
-                            synchronized(subtitles) { subtitles.add(SubtitleFile(trackLang, trackUrl)) }
-                        }
+                directLinkJson.get("tracks")?.forEach { track ->
+                    val trackUrl = track.get("file")?.asText() ?: track.get("url")?.asText()
+                    val trackLang = track.get("label")?.asText()
+                        ?: track.get("language")?.asText() ?: "Arabic"
+                    if (!trackUrl.isNullOrEmpty()) {
+                        synchronized(subtitles) { subtitles.add(SubtitleFile(trackLang, trackUrl)) }
                     }
+                }
 
-                    if (directLinkJson.get("url_response")?.asBoolean() == true) {
-                        val videoUrl = directLinkJson.get("videoUrl")?.asText()
-                        if (!videoUrl.isNullOrEmpty()) {
-                            val customHeaders = mutableMapOf(
-                                "User-Agent" to "libmpv",
-                                "Accept" to "*/*",
-                                "Range" to "bytes=0-",
-                                "Connection" to "close",
-                                "Icy-MetaData" to "1",
-                                "X-request-source" to "anime-rift",
-                                "X-streamer-version" to "1.0.0",
-                                "X-request-action" to "watch"
-                            )
-                            customHeaders["Host"] = try {
-                                java.net.URI(videoUrl).host
-                            } catch (_: Exception) { "media.rift-streamer.com" }
+                if (directLinkJson.get("url_response")?.asBoolean() == true) {
+                    val videoUrl = directLinkJson.get("videoUrl")?.asText()
+                    if (!videoUrl.isNullOrEmpty()) {
+                        val customHeaders = mutableMapOf(
+                            "User-Agent" to "libmpv",
+                            "Accept" to "*/*",
+                            "Range" to "bytes=0-",
+                            "Connection" to "close",
+                            "Icy-MetaData" to "1",
+                            "X-request-source" to "anime-rift",
+                            "X-streamer-version" to "1.0.0",
+                            "X-request-action" to "watch"
+                        )
+                        customHeaders["Host"] = try {
+                            java.net.URI(videoUrl).host
+                        } catch (_: Exception) { "media.rift-streamer.com" }
 
-                            directLinkJson.get("http_headers")?.fields()?.forEach { (k, v) ->
-                                customHeaders[k] = v.asText()
+                        directLinkJson.get("http_headers")?.fields()?.forEach { (k, v) ->
+                            customHeaders[k] = v.asText()
+                        }
+
+                        val resolvedUrl: String = if (videoUrl.contains("media.rift-streamer.com/videos/watch")) {
+                            resolveRiftRedirect(videoUrl, customHeaders) ?: videoUrl
+                        } else videoUrl
+
+                        val finalHeaders: Map<String, String> =
+                            if (resolvedUrl != videoUrl) {
+                                mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
+                            } else {
+                                customHeaders
                             }
 
-                            val resolvedUrl: String = if (videoUrl.contains("media.rift-streamer.com/videos/watch")) {
-                                resolveRiftRedirect(videoUrl, customHeaders) ?: videoUrl
-                            } else videoUrl
+                        synchronized(links) {
+                            links.add(
+                                RLink(
+                                    serverName = serverName,
+                                    subTitle = subTitle,
+                                    quality = quality,
+                                    url = resolvedUrl,
+                                    headers = finalHeaders
+                                )
+                            )
+                        }
+                    }
+                } else if (directLinkJson.get("ticket_response")?.asBoolean() == true) {
+                    val fileId = directLinkJson.get("fileId")?.asText() ?: ""
+                    val ticket = directLinkJson.get("ticket")?.asText() ?: ""
+                    val waitTimeSeconds = directLinkJson.get("wait_time")?.asLong() ?: 5L
 
-                            val finalHeaders: Map<String, String> =
-                                if (resolvedUrl != videoUrl) {
-                                    mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
-                                } else {
-                                    customHeaders
-                                }
+                    if (fileId.isNotEmpty() && ticket.isNotEmpty()) {
+                        delay(waitTimeSeconds * 1000 + 500)
 
+                        val tapeApiUrl = "https://api.streamtape.com/file/dl?file=$fileId&ticket=$ticket"
+                        var tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
+                        if (tapeRes.get("status")?.asInt() != 200) {
+                            delay(2000)
+                            tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
+                        }
+                        val tapeDirectUrl = tapeRes.get("result")?.get("url")?.asText()
+                        if (!tapeDirectUrl.isNullOrEmpty()) {
                             synchronized(links) {
                                 links.add(
                                     RLink(
                                         serverName = serverName,
                                         subTitle = subTitle,
                                         quality = quality,
-                                        url = resolvedUrl,
-                                        headers = finalHeaders
+                                        url = tapeDirectUrl,
+                                        headers = mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
                                     )
                                 )
                             }
                         }
-                    } else if (directLinkJson.get("ticket_response")?.asBoolean() == true) {
-                        val fileId = directLinkJson.get("fileId")?.asText() ?: ""
-                        val ticket = directLinkJson.get("ticket")?.asText() ?: ""
-                        val waitTimeSeconds = directLinkJson.get("wait_time")?.asLong() ?: 5L
-
-                        if (fileId.isNotEmpty() && ticket.isNotEmpty()) {
-                            delay(waitTimeSeconds * 1000 + 500)
-
-                            val tapeApiUrl = "https://api.streamtape.com/file/dl?file=$fileId&ticket=$ticket"
-                            var tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
-                            if (tapeRes.get("status")?.asInt() != 200) {
-                                delay(2000)
-                                tapeRes = app.get(tapeApiUrl).parsed<JsonNode>()
-                            }
-                            val tapeDirectUrl = tapeRes.get("result")?.get("url")?.asText()
-                            if (!tapeDirectUrl.isNullOrEmpty()) {
-                                synchronized(links) {
-                                    links.add(
-                                        RLink(
-                                            serverName = serverName,
-                                            subTitle = subTitle,
-                                            quality = quality,
-                                            url = tapeDirectUrl,
-                                            headers = mapOf("User-Agent" to "libmpv", "Accept" to "*/*")
-                                        )
-                                    )
-                                }
-                            }
-                        }
                     }
-                } catch (e: Exception) {
-                    logErr("server $serverName/$quality", e)
-                    if (isCoolingDown()) return
                 }
+            } catch (e: Exception) {
+                logErr("server $serverName/$quality", e)
+                if (isCoolingDown()) return
             }
         }
 
@@ -1128,7 +1167,6 @@ class AnimeRift : MainAPI() {
 
             val idx = episodeOrder.indexOf(data)
             if (idx >= 0) {
-                // prefetch ONLY the next episode (window=1)
                 episodeOrder.getOrNull(idx + 1)?.let { warmPrefetch(listOf(it)) }
             }
 
