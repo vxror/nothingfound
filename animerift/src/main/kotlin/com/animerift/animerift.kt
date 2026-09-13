@@ -24,27 +24,24 @@ import javax.crypto.spec.SecretKeySpec
 
 class AnimeRift : MainAPI() {
 
+    // display-only domain (CloudStream opens this in browser)
     override var mainUrl = "https://gateway.anime-rift.com"
+
+    // actual API root — everything is under /api/v4
+    private val defaultApiBase = "https://gateway.anime-rift.com/api/v4"
+
     override var name = "AnimeRift"
     override var lang = "ar"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Signature NOT verified on the API layer (proven: HTTP 200 with garbage token).
-    // Any string works for integrity. Registration is the only stricter endpoint.
     private val JWT_SECRET = "RIFT_JWT_SECRET_PLACEHOLDER"
     private val FIREBASE_API_KEY = "AIzaSyBiLkiGEm7ruugny3tDFHEZvqli8yv1k7I"
-
-    // Try the second OAuth client hash first — first one was rejected by FIS.
-    // If Firebase still 400s, ensureInitialized falls back to a synthetic FID
-    // and the gateway accepts it (proven: HTTP 201 with synthetic fid).
     private val FIREBASE_APP_ID = "1:536921039715:android:ri3okhhk7t0gbh6k70n4v7dh8da8nd8b"
     private val FIREBASE_PROJECT_ID = "anime-rift-4142e"
     private val FIREBASE_SENDER_ID = "536921039715"
-
     private val ANDROID_PACKAGE = "com.riftapps.animerift"
-    // cert registered with Firebase — matches the original signer, NOT the kill apk signer
     private val ANDROID_CERT = "AF40CE82A52AA4107F311D8B9727D01C8D02250B"
 
     companion object {
@@ -61,7 +58,6 @@ class AnimeRift : MainAPI() {
 
         private val providerConfigs = HashMap<String, JsonNode>()
 
-        // ban-resistance state
         private var consecutiveFailures = 0
         private var lastRequestAt = 0L
         private val initLock = Any()
@@ -95,7 +91,6 @@ class AnimeRift : MainAPI() {
             } catch (_: Exception) { null }
         }
 
-        // full identity wipe — a banned fid/fcm/device never gets reused
         private fun wipeIdentity() {
             try { getCacheFile().delete() } catch (_: Exception) {}
             fid = null
@@ -109,6 +104,7 @@ class AnimeRift : MainAPI() {
     }
 
     private val mapper = ObjectMapper()
+    private val apiBase: String get() = gatewayBaseUrl ?: defaultApiBase
 
     private fun log(msg: String) { Log.d(TAG, msg) }
     private fun logErr(s: String, e: Throwable) { Log.e(TAG, "$s: ${e.message}") }
@@ -184,7 +180,10 @@ class AnimeRift : MainAPI() {
 
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
         synchronized(initLock) {
-            if (rotateIdentity) wipeIdentity()
+            if (rotateIdentity) {
+                wipeIdentity()
+                firebaseFailed = false
+            }
 
             if (!forceRefresh) {
                 if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
@@ -193,39 +192,24 @@ class AnimeRift : MainAPI() {
                 loadFromDisk()?.let { disk ->
                     fid = disk["fid"]
                     firebaseToken = disk["firebaseToken"]
-                    gatewayBaseUrl = disk["gatewayBaseUrl"]
+                    gatewayBaseUrl = disk["gatewayBaseUrl"].takeIf { !it.isNullOrEmpty() } ?: defaultApiBase
                     deviceId = disk["deviceId"]
                     sessionKey = disk["sessionKey"]
                     syntheticBuildId = disk["syntheticBuildId"]
                     syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
-                    if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
-                        !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
-                }
-            } else if (!rotateIdentity) {
-                // forceRefresh without rotation: try cached identity first
-                loadFromDisk()?.let { disk ->
-                    if (!disk["fid"].isNullOrEmpty() && !disk["firebaseToken"].isNullOrEmpty()) {
-                        fid = disk["fid"]
-                        firebaseToken = disk["firebaseToken"]
-                        gatewayBaseUrl = disk["gatewayBaseUrl"]
-                        deviceId = disk["deviceId"]
-                        sessionKey = disk["sessionKey"]
-                        syntheticBuildId = disk["syntheticBuildId"]
-                        syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
-                        return
-                    }
+                    if (!fid.isNullOrEmpty() && !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
                 }
             }
         }
 
         withContext(Dispatchers.IO) {
-            // FID: try Firebase, fall back to synthetic. Gateway accepts synthetic (proven).
+            // FID: one shot at Firebase, synthetic on any failure
             if (!firebaseFailed) {
                 try {
                     registerFirebaseInstallation()
                     log("firebase fid ok: $fid")
                 } catch (e: Exception) {
-                    logErr("firebase install failed — using synthetic fid", e)
+                    logErr("firebase failed — using synthetic fid", e)
                     firebaseFailed = true
                     fid = generateSyntheticFid()
                     firebaseToken = "synthetic:${System.currentTimeMillis()}"
@@ -235,32 +219,24 @@ class AnimeRift : MainAPI() {
                 firebaseToken = "synthetic:${System.currentTimeMillis()}"
             }
 
-            // RemoteConfig: optional — default to mainUrl on failure
-            try {
-                fetchRemoteConfig()
-            } catch (e: Exception) {
-                logErr("remoteconfig failed — using mainUrl", e)
-                gatewayBaseUrl = mainUrl
+            // gateway base — only attempt RemoteConfig when Firebase worked
+            if (firebaseFailed) {
+                gatewayBaseUrl = defaultApiBase
+            } else {
+                try {
+                    fetchRemoteConfig()
+                } catch (e: Exception) {
+                    logErr("remoteconfig failed — default api base", e)
+                    gatewayBaseUrl = defaultApiBase
+                }
+                if (gatewayBaseUrl.isNullOrEmpty()) gatewayBaseUrl = defaultApiBase
             }
 
+            // register device — non-fatal, gateway accepts anonymous calls too
             try {
                 registerDevice()
             } catch (e: Exception) {
-                logErr("registerDevice failed", e)
-                // fall back to disk if we have anything usable
-                loadFromDisk()?.let { disk ->
-                    if (!disk["fid"].isNullOrEmpty() && !disk["firebaseToken"].isNullOrEmpty()) {
-                        fid = disk["fid"]
-                        firebaseToken = disk["firebaseToken"]
-                        gatewayBaseUrl = disk["gatewayBaseUrl"] ?: mainUrl
-                        deviceId = disk["deviceId"]
-                        sessionKey = disk["sessionKey"]
-                        syntheticBuildId = disk["syntheticBuildId"]
-                        syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
-                        return@withContext
-                    }
-                }
-                throw e
+                logErr("registerDevice failed — continuing anyway", e)
             }
 
             synchronized(initLock) {
@@ -268,7 +244,7 @@ class AnimeRift : MainAPI() {
                     mapOf(
                         "fid" to (fid ?: ""),
                         "firebaseToken" to (firebaseToken ?: ""),
-                        "gatewayBaseUrl" to (gatewayBaseUrl ?: mainUrl),
+                        "gatewayBaseUrl" to (gatewayBaseUrl ?: defaultApiBase),
                         "deviceId" to (deviceId ?: ""),
                         "sessionKey" to (sessionKey ?: ""),
                         "syntheticBuildId" to (syntheticBuildId ?: "BP2A.250605.015"),
@@ -284,51 +260,40 @@ class AnimeRift : MainAPI() {
         val url = "https://firebaseinstallations.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/installations"
         val payloadStr = """{"fid":"","appId":"$FIREBASE_APP_ID","authVersion":"FIS_v2","sdkVersion":"a:19.1.0"}"""
 
-        var lastError: Exception? = null
-        repeat(3) { attempt ->
-            try {
-                val request = okhttp3.Request.Builder()
-                    .url(url)
-                    .post(gzipCompress(payloadStr).toRequestBody("application/json; charset=UTF-8".toMediaType()))
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("Accept", "application/json")
-                    .addHeader("Content-Encoding", "gzip")
-                    .addHeader("Cache-Control", "no-cache")
-                    .addHeader("X-Android-Package", ANDROID_PACKAGE)
-                    .addHeader("X-Android-Cert", ANDROID_CERT)
-                    .addHeader("x-goog-api-key", FIREBASE_API_KEY)
-                    .addHeader("x-firebase-client", "H4sIAAAAAAAA_6tWykhNLCpJSk0sKVayio7VUSpLLSrOzM9TslIyUqoFAFyivEQfAAAA")
-                    .addHeader("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240805.015)")
-                    .build()
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .post(gzipCompress(payloadStr).toRequestBody("application/json; charset=UTF-8".toMediaType()))
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Accept", "application/json")
+            .addHeader("Content-Encoding", "gzip")
+            .addHeader("Cache-Control", "no-cache")
+            .addHeader("X-Android-Package", ANDROID_PACKAGE)
+            .addHeader("X-Android-Cert", ANDROID_CERT)
+            .addHeader("x-goog-api-key", FIREBASE_API_KEY)
+            .addHeader("x-firebase-client", "H4sIAAAAAAAA_6tWykhNLCpJSk0sKVayio7VUSpLLSrOzM9TslIyUqoFAFyivEQfAAAA")
+            .addHeader("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240805.015)")
+            .build()
 
-                app.baseClient.newCall(request).execute().use { response ->
-                    val body = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        val errMsg = runCatching {
-                            mapper.readTree(body).get("error")?.get("message")?.asText()
-                        }.getOrNull()
-                        throw Exception("Firebase HTTP ${response.code}: ${errMsg ?: body.take(200)}")
-                    }
-
-                    val json = mapper.readTree(body)
-                    val fidNode = json.get("fid")
-                    val tokenNode = json.get("authToken")?.get("token")
-
-                    if (fidNode == null || fidNode.isNull || tokenNode == null || tokenNode.isNull) {
-                        throw Exception("Firebase response missing fid/authToken: ${body.take(300)}")
-                    }
-
-                    fid = fidNode.asText()
-                    firebaseToken = tokenNode.asText()
-                    return
-                }
-            } catch (e: Exception) {
-                lastError = e
-                Log.e(TAG, "registerFirebaseInstallation attempt ${attempt + 1} failed: ${e.message}")
-                if (attempt < 2) Thread.sleep((attempt + 1) * 1500L)
+        app.baseClient.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val errMsg = runCatching {
+                    mapper.readTree(body).get("error")?.get("message")?.asText()
+                }.getOrNull()
+                throw Exception("Firebase HTTP ${response.code}: ${errMsg ?: body.take(200)}")
             }
+
+            val json = mapper.readTree(body)
+            val fidNode = json.get("fid")
+            val tokenNode = json.get("authToken")?.get("token")
+
+            if (fidNode == null || fidNode.isNull || tokenNode == null || tokenNode.isNull) {
+                throw Exception("Firebase response missing fid/authToken: ${body.take(300)}")
+            }
+
+            fid = fidNode.asText()
+            firebaseToken = tokenNode.asText()
         }
-        throw lastError ?: Exception("Firebase installation failed after retries")
     }
 
     private suspend fun fetchRemoteConfig() {
@@ -353,22 +318,27 @@ class AnimeRift : MainAPI() {
         )
 
         val response = app.post(url, headers = headers, json = payload)
+        val text = response.text
         if (!response.isSuccessful) {
             Log.e(TAG, "RemoteConfig HTTP ${response.code}")
-            gatewayBaseUrl = mainUrl
+            gatewayBaseUrl = defaultApiBase
             return
         }
-        val json = response.parsed<JsonNode>()
+        if (text.trimStart().startsWith("<")) {
+            gatewayBaseUrl = defaultApiBase
+            return
+        }
+        val json = mapper.readTree(text)
         gatewayBaseUrl = json.get("entries")
             ?.get("anime_rift_android_gateway_base_url_v4")
             ?.asText()
             ?.replace("\"", "")
-            ?: mainUrl
+            ?.takeIf { it.isNotEmpty() }
+            ?: defaultApiBase
     }
 
     private suspend fun registerDevice() {
-        val baseUrl = gatewayBaseUrl ?: mainUrl
-        val url = "$baseUrl/auth/register/device"
+        val url = "$apiBase/auth/register/device"
         deviceId = "${fid ?: ""}:${generateFcmToken()}"
         val (buildId, deviceInfoJson) = generateSyntheticDevice()
         syntheticBuildId = buildId
@@ -398,7 +368,6 @@ class AnimeRift : MainAPI() {
     ): JsonNode {
         ensureInitialized()
 
-        // pacing — 150ms minimum gap between requests. rate-limit/ban insurance
         val since = System.currentTimeMillis() - lastRequestAt
         if (since in 0 until 150) delay(150 - since)
         lastRequestAt = System.currentTimeMillis()
@@ -429,7 +398,19 @@ class AnimeRift : MainAPI() {
                 "PUT" -> app.put(url, headers = headers, json = body)
                 else -> app.get(url, headers = headers)
             }
-            val parsed = response.parsed<JsonNode>()
+
+            val text = response.text
+            if (text.isBlank()) throw Exception("Empty response from $url (HTTP ${response.code})")
+            if (text.trimStart().startsWith("<")) {
+                throw Exception("Non-JSON response from $url (HTTP ${response.code}): ${text.take(140)}")
+            }
+
+            val parsed = try {
+                mapper.readTree(text)
+            } catch (e: Exception) {
+                throw Exception("Bad JSON from $url (HTTP ${response.code}): ${text.take(140)}")
+            }
+
             consecutiveFailures = 0
             return parsed
         } catch (e: Exception) {
@@ -439,7 +420,6 @@ class AnimeRift : MainAPI() {
                 consecutiveFailures++
                 if (!isRetry) {
                     when {
-                        // two strikes → rotate to a completely new device identity
                         consecutiveFailures >= 2 -> {
                             log("auth failed x$consecutiveFailures → rotating identity")
                             ensureInitialized(forceRefresh = true, rotateIdentity = true)
@@ -452,7 +432,6 @@ class AnimeRift : MainAPI() {
                     delay(1000)
                     return apiCall(url, scope, method, body, isRetry = true)
                 }
-                throw e
             }
             throw e
         }
@@ -472,8 +451,7 @@ class AnimeRift : MainAPI() {
         }
 
         ensureInitialized()
-        val baseUrl = gatewayBaseUrl ?: mainUrl
-        val json = apiCall("$baseUrl/library/home_content?with_genres=true", "ANIME.LIBRARY.HOME_CONTENT")
+        val json = apiCall("$apiBase/library/home_content?with_genres=true", "ANIME.LIBRARY.HOME_CONTENT")
 
         val homeLists = mutableListOf<HomePageList>()
         json.get("sections")?.forEach { section ->
@@ -484,7 +462,7 @@ class AnimeRift : MainAPI() {
                 list.add(
                     newAnimeSearchResponse(
                         name = item.get("title")?.asText() ?: "",
-                        url = "$mainUrl/api/v4/library/details/${item.get("_id")?.asText()}"
+                        url = "$defaultApiBase/library/details/${item.get("_id")?.asText()}"
                     ) {
                         posterUrl = item.get("medium_picture")?.asText() ?: item.get("main_picture")?.asText()
                         year = item.get("release_year")?.asInt()
@@ -501,9 +479,8 @@ class AnimeRift : MainAPI() {
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         ensureInitialized()
-        val baseUrl = gatewayBaseUrl ?: mainUrl
         val apiPage = (page - 1).coerceAtLeast(0)
-        val url = "$baseUrl/library/search?page=$apiPage&sort_by=release_year&sort_direction=1&text_direction=jp"
+        val url = "$apiBase/library/search?page=$apiPage&sort_by=release_year&sort_direction=1&text_direction=jp"
 
         return try {
             val json = apiCall(url, "ANIME.LIBRARY.SEARCH", method = "POST", body = mapOf("query" to query))
@@ -515,7 +492,7 @@ class AnimeRift : MainAPI() {
                 results.add(
                     newAnimeSearchResponse(
                         name = item.get("title")?.asText() ?: "",
-                        url = "$mainUrl/api/v4/library/details/${item.get("_id")?.asText()}"
+                        url = "$defaultApiBase/library/details/${item.get("_id")?.asText()}"
                     ) {
                         posterUrl = item.get("medium_picture")?.asText() ?: item.get("main_picture")?.asText()
                         year = item.get("release_year")?.asInt()
@@ -532,9 +509,8 @@ class AnimeRift : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         ensureInitialized()
-        val baseUrl = gatewayBaseUrl ?: mainUrl
         val animeId = url.substringAfterLast("/")
-        val json = apiCall("$baseUrl/library/details/$animeId", "ANIME.LIBRARY.DETAILS")
+        val json = apiCall("$apiBase/library/details/$animeId", "ANIME.LIBRARY.DETAILS")
         val item = json.get("item") ?: throw ErrorLoadingException("Failed to load anime details")
 
         val allRelated = mutableListOf<AnimeSearchResponse>()
@@ -543,7 +519,7 @@ class AnimeRift : MainAPI() {
             allRelated.add(
                 newAnimeSearchResponse(
                     name = rec.get("title")?.asText() ?: "",
-                    url = "$mainUrl/api/v4/library/details/${rec.get("_id")?.asText()}"
+                    url = "$defaultApiBase/library/details/${rec.get("_id")?.asText()}"
                 ) {
                     posterUrl = rec.get("main_picture")?.asText()
                     score = recRating?.let { Score.from10(it) }
@@ -554,7 +530,7 @@ class AnimeRift : MainAPI() {
         val episodesList = mutableListOf<Episode>()
         try {
             val epJson = apiCall(
-                "$baseUrl/library/episodes/$animeId?sort_by_latest=1&with_arcs=true&with_favorites=true",
+                "$apiBase/library/episodes/$animeId?sort_by_latest=1&with_arcs=true&with_favorites=true",
                 "ANIME.LIBRARY.EPISODES.ALL"
             )
             epJson.get("items")?.forEach { ep ->
@@ -605,9 +581,8 @@ class AnimeRift : MainAPI() {
             val episodeId = parts[1]
             val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
 
-            val baseUrl = gatewayBaseUrl ?: mainUrl
             val sourcesJson = apiCall(
-                "$baseUrl/library/episode/sources",
+                "$apiBase/library/episode/sources",
                 "ANIME.LIBRARY.EPISODES.SOURCES.ALL",
                 method = "POST",
                 body = mapOf("animeId" to animeId, "episodeId" to episodeId, "episode_number" to episodeNumber)
@@ -622,7 +597,6 @@ class AnimeRift : MainAPI() {
             }
             log("sources: ${items.size()} items, ${providerConfigs.size} configs")
 
-            // server's own priority first, local preference as tie-breaker
             fun providerRank(provider: String): Int {
                 val cfg = providerConfigs[provider]
                 val serverPriority = cfg?.get("priority")?.asInt()
@@ -652,12 +626,9 @@ class AnimeRift : MainAPI() {
                 val provider = src.get("provider")?.asText() ?: ""
                 val subTitle = src.get("sub_title")?.asText() ?: ""
 
-                // honor the server's own loadingDuration for this provider
                 val loadingDuration = providerConfigs[provider]?.get("loadingDuration")?.asInt() ?: 0
                 if (loadingDuration in 1..15) delay(loadingDuration * 100L)
 
-                // each host lists its OWN valid qualities — iterate them exactly.
-                // requesting a quality the host doesn't offer → QUALITY_NOT_AVAILABLE
                 val qualitiesNode = src.get("qualities")
                 val qualitiesList = if (qualitiesNode != null && qualitiesNode.isArray && qualitiesNode.size() > 0) {
                     qualitiesNode.map { it.asText() }.sortedByDescending { extractQuality(it) }
@@ -666,7 +637,7 @@ class AnimeRift : MainAPI() {
                 for (quality in qualitiesList) {
                     try {
                         val canPlayJson = apiCall(
-                            "$baseUrl/library/episode/source/can_play",
+                            "$apiBase/library/episode/source/can_play",
                             "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
                             method = "POST",
                             body = mapOf(
@@ -678,10 +649,9 @@ class AnimeRift : MainAPI() {
                         )
                         val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
 
-                        // ads claim — best effort, soft gate (server 202s any result)
                         try {
                             apiCall(
-                                "$baseUrl/ads_manager/claim",
+                                "$apiBase/ads_manager/claim",
                                 "USER.ADS_MANAGER.CLAIMS",
                                 method = "PUT",
                                 body = mapOf(
@@ -698,7 +668,7 @@ class AnimeRift : MainAPI() {
                         } catch (_: Exception) {}
 
                         val directLinkJson = apiCall(
-                            "$baseUrl/library/episode/source/direct_link",
+                            "$apiBase/library/episode/source/direct_link",
                             "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
                             method = "POST",
                             body = mapOf(
@@ -749,7 +719,6 @@ class AnimeRift : MainAPI() {
                                 emittedCount.incrementAndGet()
                             }
                         } else if (directLinkJson.get("ticket_response")?.asBoolean() == true) {
-                            // streamtape ticket flow
                             val fileId = directLinkJson.get("fileId")?.asText() ?: ""
                             val ticket = directLinkJson.get("ticket")?.asText() ?: ""
                             val waitTimeSeconds = directLinkJson.get("wait_time")?.asLong() ?: 5L
@@ -799,12 +768,7 @@ class AnimeRift : MainAPI() {
         }
     }
 
-    private fun isDownloadRequest(): Boolean {
-        // CloudStream doesn't expose download intent directly in loadLinks;
-        // the app's own flow uses is_download=false for streaming. keep false —
-        // direct_link serves the same content either way.
-        return false
-    }
+    private fun isDownloadRequest(): Boolean = false
 
     private fun extractQuality(resolution: String?): Int {
         if (resolution == null) return Qualities.Unknown.value
