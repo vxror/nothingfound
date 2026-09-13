@@ -6,10 +6,15 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -19,6 +24,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -41,6 +48,24 @@ class AnimeRift : MainAPI() {
     private val ANDROID_PACKAGE = "com.riftapps.animerift"
     private val ANDROID_CERT = "AF40CE82A52AA4107F311D8B9727D01C8D02250B"
 
+    // ---- inline helper types ----
+
+    private data class RLink(
+        val serverName: String,
+        val subTitle: String,
+        val quality: String,
+        val url: String,
+        val headers: Map<String, String>
+    )
+
+    private data class RBundle(
+        val links: List<RLink>,
+        val subtitles: List<SubtitleFile>,
+        val createdAt: Long
+    )
+
+    private data class CacheEntry(val node: JsonNode, val expiresAt: Long)
+
     companion object {
         private const val TAG = "AnimeRift"
 
@@ -60,8 +85,52 @@ class AnimeRift : MainAPI() {
         private var lastRequestAt = 0L
         private val initLock = Any()
 
-        private val jsonCache = AnimeRiftCache(maxEntries = 300)
-        private val prefetcher = AnimeRiftPrefetcher(TAG, ttlMs = 5 * 60 * 1000L, windowSize = 2)
+        private val jsonCache = object : LinkedHashMap<String, CacheEntry>(300, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?) = size > 300
+        }
+
+        private val prefetchCache = ConcurrentHashMap<String, RBundle>()
+        private val prefetchInFlight = ConcurrentHashMap<String, Job>()
+        private val prefetchScope = CoroutineScope(
+            Dispatchers.IO + SupervisorJob() + CoroutineName("AnimeRift-prefetch")
+        )
+        @Volatile private var episodeOrder: List<String> = emptyList()
+
+        private const val PREFETCH_TTL_MS = 5 * 60 * 1000L
+
+        private val TTL_BY_SCOPE = mapOf(
+            "ANIME.LIBRARY.HOME_CONTENT" to 5 * 60 * 1000L,
+            "ANIME.LIBRARY.SEARCH" to 3 * 60 * 1000L,
+            "ANIME.LIBRARY.DETAILS" to 10 * 60 * 1000L,
+            "ANIME.LIBRARY.EPISODES.ALL" to 10 * 60 * 1000L,
+            "ANIME.LIBRARY.EPISODES.SOURCES.ALL" to 90 * 1000L,
+            "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY" to 0L,
+            "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK" to 0L,
+            "USER.ADS_MANAGER.CLAIMS" to 0L,
+            "USER.AUTH.DEVICE.REGISTER" to 0L
+        )
+
+        private fun ttlFor(scope: String): Long = TTL_BY_SCOPE[scope] ?: 0L
+
+        private fun cacheKey(method: String, url: String, body: Map<String, Any?>?): String {
+            val bodyPart = body?.entries?.sortedBy { it.key }
+                ?.joinToString("&") { "${it.key}=${it.value}" } ?: ""
+            return "$method|$url|$bodyPart"
+        }
+
+        @Synchronized private fun cacheGet(key: String): JsonNode? {
+            val e = jsonCache[key] ?: return null
+            if (System.currentTimeMillis() > e.expiresAt) {
+                jsonCache.remove(key); return null
+            }
+            return e.node
+        }
+
+        @Synchronized private fun cachePut(key: String, node: JsonNode, ttl: Long) {
+            jsonCache[key] = CacheEntry(node, System.currentTimeMillis() + ttl)
+        }
+
+        @Synchronized private fun cacheClear() = jsonCache.clear()
 
         private fun getCacheFile(): File {
             val tmp = System.getProperty("java.io.tmpdir") ?: "."
@@ -69,9 +138,7 @@ class AnimeRift : MainAPI() {
         }
 
         private fun saveToDisk(data: Map<String, String>) {
-            try {
-                getCacheFile().writeText(ObjectMapper().writeValueAsString(data))
-            } catch (_: Exception) {}
+            try { getCacheFile().writeText(ObjectMapper().writeValueAsString(data)) } catch (_: Exception) {}
         }
 
         private fun loadFromDisk(): Map<String, String>? {
@@ -94,12 +161,8 @@ class AnimeRift : MainAPI() {
 
         private fun wipeIdentity() {
             try { getCacheFile().delete() } catch (_: Exception) {}
-            fid = null
-            firebaseToken = null
-            sessionKey = null
-            deviceId = null
-            syntheticBuildId = null
-            syntheticDeviceInfoJson = null
+            fid = null; firebaseToken = null; sessionKey = null; deviceId = null
+            syntheticBuildId = null; syntheticDeviceInfoJson = null
             Log.d(TAG, "identity wiped — next call mints a fresh device")
         }
     }
@@ -236,13 +299,6 @@ class AnimeRift : MainAPI() {
         }
 
         withContext(Dispatchers.IO) {
-            AnimeRiftHttp.prewarm(
-                "gateway.anime-rift.com",
-                "media.rift-streamer.com",
-                "media-1.rift-content.com",
-                "firebaseinstallations.googleapis.com"
-            )
-
             if (!firebaseFailed) {
                 try {
                     registerFirebaseInstallation()
@@ -405,12 +461,12 @@ class AnimeRift : MainAPI() {
     ): JsonNode {
         ensureInitialized()
 
-        val ttl = AnimeRiftCache.ttlFor(scope)
-        val key = AnimeRiftCache.cacheKey(method.uppercase(), url, body)
+        val ttl = ttlFor(scope)
+        val key = cacheKey(method.uppercase(), url, body)
 
         if (ttl > 0) {
-            jsonCache.get(key)?.let {
-                log("cache hit ${scope} ...${url.takeLast(48)}")
+            cacheGet(key)?.let {
+                log("cache hit ${scope}")
                 return it
             }
         }
@@ -458,7 +514,7 @@ class AnimeRift : MainAPI() {
                 throw Exception("Bad JSON from $url (HTTP ${response.code}): ${text.take(140)}")
             }
 
-            if (ttl > 0) jsonCache.put(key, parsed, ttl)
+            if (ttl > 0) cachePut(key, parsed, ttl)
 
             consecutiveFailures = 0
             return parsed
@@ -471,7 +527,7 @@ class AnimeRift : MainAPI() {
                     when {
                         consecutiveFailures >= 2 -> {
                             log("auth failed x$consecutiveFailures → rotating identity")
-                            jsonCache.clear()
+                            cacheClear()
                             ensureInitialized(forceRefresh = true, rotateIdentity = true)
                         }
                         else -> {
@@ -600,11 +656,13 @@ class AnimeRift : MainAPI() {
             }
         } catch (e: Exception) { logErr("episodes", e) }
 
-        prefetcher.setEpisodeOrder(animeId, orderedData)
-        prefetcher.triggerAll { data ->
-            val p = data.split('|')
-            if (p.size < 2) null else resolveBundle(p[0], p[1], p.getOrNull(2)?.toIntOrNull() ?: 1)
-        }
+        // update episode order for prefetcher, clear stale prefetches for other shows
+        episodeOrder = orderedData.toList()
+        val it = prefetchCache.keys.iterator()
+        while (it.hasNext()) if (!it.next().startsWith("$animeId|")) it.remove()
+
+        // fire-and-forget: warm ep 1 and ep 2 in background
+        warmPrefetch(orderedData.take(2))
 
         val ratingFloat = item.get("myAnimeList_rating")?.asDouble()?.toFloat()
 
@@ -628,12 +686,36 @@ class AnimeRift : MainAPI() {
         }
     }
 
+    private fun warmPrefetch(targets: List<String>) {
+        for (data in targets) {
+            if (prefetchCache.containsKey(data)) continue
+            if (prefetchInFlight.containsKey(data)) continue
+
+            val job = prefetchScope.launch {
+                try {
+                    val p = data.split('|')
+                    if (p.size < 2) return@launch
+                    val b = resolveBundle(p[0], p[1], p.getOrNull(2)?.toIntOrNull() ?: 1)
+                    if (b.links.isNotEmpty()) {
+                        prefetchCache[data] = b.copy(createdAt = System.currentTimeMillis())
+                        log("prefetched ${b.links.size} links for $data")
+                    }
+                } catch (e: Exception) {
+                    logErr("prefetch $data", e)
+                } finally {
+                    prefetchInFlight.remove(data)
+                }
+            }
+            prefetchInFlight[data] = job
+        }
+    }
+
     private suspend fun resolveBundle(
         animeId: String,
         episodeId: String,
         episodeNumber: Int
-    ): AnimeRiftBundle {
-        val links = mutableListOf<AnimeRiftLink>()
+    ): RBundle {
+        val links = mutableListOf<RLink>()
         val subtitles = mutableListOf<SubtitleFile>()
 
         val sourcesJson = apiCall(
@@ -642,7 +724,7 @@ class AnimeRift : MainAPI() {
             method = "POST",
             body = mapOf("animeId" to animeId, "episodeId" to episodeId, "episode_number" to episodeNumber)
         )
-        val items = sourcesJson.get("items") ?: return AnimeRiftBundle(emptyList(), emptyList(), 0L)
+        val items = sourcesJson.get("items") ?: return RBundle(emptyList(), emptyList(), 0L)
 
         synchronized(providerConfigs) {
             providerConfigs.clear()
@@ -669,16 +751,12 @@ class AnimeRift : MainAPI() {
         }.ifEmpty { items.toList() }
 
         val byProvider = filteredItems.groupBy { it.get("provider")?.asText() ?: "" }
-        val topProviders = byProvider.keys
-            .sortedBy { providerRank(it) }
-            .take(8)
+        val topProviders = byProvider.keys.sortedBy { providerRank(it) }.take(8)
         val sortedItems = topProviders.flatMap { byProvider[it] ?: emptyList() }
 
         log("providers: ${topProviders.joinToString(",")} → ${sortedItems.size} items")
 
         val semaphore = Semaphore(4)
-        val subLock = Any()
-        val linkLock = Any()
 
         suspend fun processSource(src: JsonNode) {
             val hostId = src.get("_id")?.asText() ?: return
@@ -703,7 +781,7 @@ class AnimeRift : MainAPI() {
                         body = mapOf(
                             "episodeId" to episodeId,
                             "hostId" to hostId,
-                            "is_download" to isDownloadRequest(),
+                            "is_download" to false,
                             "event_name" to "play_episode_unlocked"
                         )
                     )
@@ -744,7 +822,7 @@ class AnimeRift : MainAPI() {
                         val trackLang = track.get("label")?.asText()
                             ?: track.get("language")?.asText() ?: "Arabic"
                         if (!trackUrl.isNullOrEmpty()) {
-                            synchronized(subLock) { subtitles.add(SubtitleFile(trackLang, trackUrl)) }
+                            synchronized(subtitles) { subtitles.add(SubtitleFile(trackLang, trackUrl)) }
                         }
                     }
 
@@ -780,9 +858,9 @@ class AnimeRift : MainAPI() {
                                     customHeaders
                                 }
 
-                            synchronized(linkLock) {
+                            synchronized(links) {
                                 links.add(
-                                    AnimeRiftLink(
+                                    RLink(
                                         serverName = serverName,
                                         subTitle = subTitle,
                                         quality = quality,
@@ -808,9 +886,9 @@ class AnimeRift : MainAPI() {
                             }
                             val tapeDirectUrl = tapeRes.get("result")?.get("url")?.asText()
                             if (!tapeDirectUrl.isNullOrEmpty()) {
-                                synchronized(linkLock) {
+                                synchronized(links) {
                                     links.add(
-                                        AnimeRiftLink(
+                                        RLink(
                                             serverName = serverName,
                                             subTitle = subTitle,
                                             quality = quality,
@@ -834,7 +912,7 @@ class AnimeRift : MainAPI() {
             }.awaitAll()
         }
 
-        return AnimeRiftBundle(links.toList(), subtitles.toList(), 0L)
+        return RBundle(links.toList(), subtitles.toList(), System.currentTimeMillis())
     }
 
     override suspend fun loadLinks(
@@ -850,14 +928,18 @@ class AnimeRift : MainAPI() {
             val episodeId = parts[1]
             val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
 
-            val cached = prefetcher.cached(data)
-            val bundle = cached ?: run {
+            // cache hit? drain and use
+            val cached = prefetchCache.remove(data)
+            val valid = cached != null && (System.currentTimeMillis() - cached.createdAt) < PREFETCH_TTL_MS
+
+            val bundle = if (valid) {
+                log("loadLinks prefetch: ${cached!!.links.size} links")
+                cached
+            } else {
                 val b = resolveBundle(animeId, episodeId, episodeNumber)
-                prefetcher.store(data, b)
+                log("loadLinks cold: ${b.links.size} links")
                 b
             }
-
-            log("loadLinks ${if (cached != null) "prefetch" else "cold"}: ${bundle.links.size} links")
 
             bundle.subtitles.forEach { subtitleCallback(it) }
             bundle.links.forEach { rl ->
@@ -873,9 +955,12 @@ class AnimeRift : MainAPI() {
                 )
             }
 
-            prefetcher.triggerAround(data) { d ->
-                val p = d.split('|')
-                if (p.size < 2) null else resolveBundle(p[0], p[1], p.getOrNull(2)?.toIntOrNull() ?: 1)
+            // prefetch next two episodes
+            val idx = episodeOrder.indexOf(data)
+            if (idx >= 0) {
+                val nexts = mutableListOf<String>()
+                for (off in 1..2) episodeOrder.getOrNull(idx + off)?.let { nexts.add(it) }
+                warmPrefetch(nexts)
             }
 
             return@withContext bundle.links.isNotEmpty()
@@ -884,8 +969,6 @@ class AnimeRift : MainAPI() {
             return@withContext false
         }
     }
-
-    private fun isDownloadRequest(): Boolean = false
 
     private fun extractQuality(resolution: String?): Int {
         if (resolution == null) return Qualities.Unknown.value
