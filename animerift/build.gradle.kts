@@ -2,7 +2,7 @@ version = 1
 
 cloudstream {
     description = "Use VPN"
-    authors = listOf("Abodabodd")
+    authors = listOf("vxror")
     language = "ar"
 
     status = 1
