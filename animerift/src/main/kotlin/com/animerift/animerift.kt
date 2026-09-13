@@ -760,13 +760,19 @@ class AnimeRift : MainAPI() {
                 if (consecutiveFailures >= 2) {
                     log("auth failed x$consecutiveFailures → rotating identity")
                     cacheClear()
-                    runCatching { ensureInitialized(forceRefresh = true, rotateIdentity = true) }
-                        .exceptionOrNull()?.let { logErr("rotation init", it) }
+                    try {
+                        ensureInitialized(forceRefresh = true, rotateIdentity = true)
+                    } catch (initErr: Exception) {
+                        logErr("rotation init", initErr)
+                    }
                     delay(2500)
                 } else {
                     log("auth failed → re-init same identity")
-                    runCatching { ensureInitialized(forceRefresh = true) }
-                        .exceptionOrNull()?.let { logErr("re-init", it) }
+                    try {
+                        ensureInitialized(forceRefresh = true)
+                    } catch (initErr: Exception) {
+                        logErr("re-init", initErr)
+                    }
                     delay(1500)
                 }
 
