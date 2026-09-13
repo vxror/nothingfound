@@ -16,7 +16,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -65,8 +67,9 @@ class AnimeRift : MainAPI() {
 
     companion object {
         private const val TAG = "AnimeRift"
-        private const val CACHE_VERSION = 3
-        private const val CRED_VERSION = 2
+        private const val CACHE_VERSION = 4
+        private const val CRED_VERSION = 3
+        private const val MAX_ROTATION_ATTEMPTS = 3
 
         private var fid: String? = null
         private var firebaseToken: String? = null
@@ -83,8 +86,12 @@ class AnimeRift : MainAPI() {
         private val providerConfigs = HashMap<String, JsonNode>()
 
         private var consecutiveFailures = 0
+        private var rotationAttempts = 0
         private var lastRequestAt = 0L
-        private val initLock = Any()
+        private val initMutex = Mutex()
+
+        @Volatile private var cooldownUntil = 0L
+        @Volatile private var rateLimitHits = 0
 
         private val jsonCache = object : LinkedHashMap<String, CacheEntry>(300, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?) = size > 300
@@ -133,6 +140,16 @@ class AnimeRift : MainAPI() {
 
         @Synchronized private fun cacheClear() = jsonCache.clear()
 
+        private fun isCoolingDown(): Boolean = System.currentTimeMillis() < cooldownUntil
+
+        private fun enterCooldown(seconds: Long, reason: String) {
+            val until = System.currentTimeMillis() + seconds * 1000L
+            if (until > cooldownUntil) {
+                cooldownUntil = until
+                Log.w(TAG, "cooldown ${seconds}s — $reason")
+            }
+        }
+
         private fun getCacheFile(): File {
             val tmp = System.getProperty("java.io.tmpdir") ?: "."
             return File(tmp, "anime_rift_session_store.json")
@@ -164,7 +181,7 @@ class AnimeRift : MainAPI() {
             try { getCacheFile().delete() } catch (_: Exception) {}
             fid = null; firebaseToken = null; sessionKey = null; deviceId = null
             syntheticBuildId = null; syntheticDeviceInfoJson = null
-            Log.d(TAG, "identity wiped — next call mints a fresh device")
+            Log.d(TAG, "identity wiped")
         }
     }
 
@@ -180,7 +197,6 @@ class AnimeRift : MainAPI() {
     }
 
     private fun generateSyntheticDevice(): Pair<String, String> {
-        // widened pool — 20 templates instead of 4
         val brands = listOf(
             Triple("google", "Google", "Pixel 8 Pro"),
             Triple("google", "Google", "Pixel 8"),
@@ -205,7 +221,6 @@ class AnimeRift : MainAPI() {
         )
         val selected = brands.random()
 
-        // per-brand build prefix so deviceOsId and device_info stay consistent
         val buildPrefix = when (selected.first) {
             "google" -> "AP2A.240805"
             "samsung" -> "UP1A.231005"
@@ -313,22 +328,40 @@ class AnimeRift : MainAPI() {
 
     private fun isCacheWorthy(scope: String, node: JsonNode): Boolean {
         return when (scope) {
-            "ANIME.LIBRARY.HOME_CONTENT" ->
-                (node.get("sections")?.size() ?: 0) > 0
-            "ANIME.LIBRARY.DETAILS" ->
-                node.get("item")?.isObject == true
-            "ANIME.LIBRARY.EPISODES.ALL" ->
-                (node.get("items")?.size() ?: 0) > 0
-            "ANIME.LIBRARY.SEARCH" ->
-                (node.get("items")?.size() ?: 0) > 0
-            "ANIME.LIBRARY.EPISODES.SOURCES.ALL" ->
-                (node.get("items")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.HOME_CONTENT" -> (node.get("sections")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.DETAILS" -> node.get("item")?.isObject == true
+            "ANIME.LIBRARY.EPISODES.ALL" -> (node.get("items")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.SEARCH" -> (node.get("items")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.EPISODES.SOURCES.ALL" -> (node.get("items")?.size() ?: 0) > 0
             else -> true
         }
     }
 
+    private fun buildHeaders(integrityToken: String): Map<String, String> = mapOf(
+        "x-device-os-id" to (syntheticBuildId ?: "AP2A.240805.015"),
+        "user-agent" to "Dart/3.10 (dart:io)",
+        "x-device-release-version" to "3.13.5",
+        "x-firebase-app-check" to "null",
+        "authorization" to "Bearer null",
+        "content-type" to "application/json; charset=UTF-8",
+        "x-installation-source" to "IS_INSTALLED_FROM_OTHER_SOURCE",
+        "integrity" to "Bearer $integrityToken",
+        "accept" to "application/json",
+        "x-firebase-id" to (fid ?: ""),
+        "x-device-id" to (deviceId ?: ""),
+        "x-device-timezone" to generateDeviceTimezone(),
+        "x-device-language" to "ar",
+        "x-platform" to "Mobile",
+        "x-os" to "android"
+    )
+
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
-        synchronized(initLock) {
+        initMutex.withLock {
+            if (isCoolingDown()) {
+                val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
+                throw Exception("cooldown active, skipping init (${remain}s remaining)")
+            }
+
             if (rotateIdentity) {
                 wipeIdentity()
                 firebaseFailed = false
@@ -349,21 +382,18 @@ class AnimeRift : MainAPI() {
                     if (!fid.isNullOrEmpty() && !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
                 }
             }
-        }
 
-        withContext(Dispatchers.IO) {
             if (cacheVersionSeen != CACHE_VERSION) {
                 cacheClear()
                 cacheVersionSeen = CACHE_VERSION
-                log("cache cleared (version bump to $CACHE_VERSION)")
+                log("cache cleared (v$CACHE_VERSION)")
             }
 
-            // credential wipe on version bump — kills stale banned device from disk
             if (credVersionSeen != CRED_VERSION) {
                 wipeIdentity()
                 firebaseFailed = false
                 credVersionSeen = CRED_VERSION
-                log("credentials wiped (version bump to $CRED_VERSION)")
+                log("credentials wiped (v$CRED_VERSION)")
             }
 
             if (!firebaseFailed) {
@@ -371,7 +401,7 @@ class AnimeRift : MainAPI() {
                     registerFirebaseInstallation()
                     log("firebase fid ok: $fid")
                 } catch (e: Exception) {
-                    logErr("firebase failed — using synthetic fid", e)
+                    logErr("firebase failed — synthetic fid", e)
                     firebaseFailed = true
                     fid = generateSyntheticFid()
                     firebaseToken = "synthetic:${System.currentTimeMillis()}"
@@ -387,29 +417,28 @@ class AnimeRift : MainAPI() {
                 try {
                     fetchRemoteConfig()
                 } catch (e: Exception) {
-                    logErr("remoteconfig failed — default api base", e)
+                    logErr("remoteconfig failed", e)
                     gatewayBaseUrl = defaultApiBase
                 }
                 if (gatewayBaseUrl.isNullOrEmpty()) gatewayBaseUrl = defaultApiBase
             }
 
-            // registerDevice is now MANDATORY. If it fails, we throw and don't save creds.
-            registerDevice()
+            registerDeviceRaw()
 
-            synchronized(initLock) {
-                saveToDisk(
-                    mapOf(
-                        "fid" to (fid ?: ""),
-                        "firebaseToken" to (firebaseToken ?: ""),
-                        "gatewayBaseUrl" to (gatewayBaseUrl ?: defaultApiBase),
-                        "deviceId" to (deviceId ?: ""),
-                        "sessionKey" to (sessionKey ?: ""),
-                        "syntheticBuildId" to (syntheticBuildId ?: "BP2A.250605.015"),
-                        "syntheticDeviceInfoJson" to (syntheticDeviceInfoJson ?: "{}")
-                    )
+            saveToDisk(
+                mapOf(
+                    "fid" to (fid ?: ""),
+                    "firebaseToken" to (firebaseToken ?: ""),
+                    "gatewayBaseUrl" to (gatewayBaseUrl ?: defaultApiBase),
+                    "deviceId" to (deviceId ?: ""),
+                    "sessionKey" to (sessionKey ?: ""),
+                    "syntheticBuildId" to (syntheticBuildId ?: "BP2A.250605.015"),
+                    "syntheticDeviceInfoJson" to (syntheticDeviceInfoJson ?: "{}")
                 )
-                consecutiveFailures = 0
-            }
+            )
+            consecutiveFailures = 0
+            rateLimitHits = 0
+            rotationAttempts = 0
         }
     }
 
@@ -445,7 +474,7 @@ class AnimeRift : MainAPI() {
             val tokenNode = json.get("authToken")?.get("token")
 
             if (fidNode == null || fidNode.isNull || tokenNode == null || tokenNode.isNull) {
-                throw Exception("Firebase response missing fid/authToken: ${body.take(300)}")
+                throw Exception("Firebase missing fid/authToken")
             }
 
             fid = fidNode.asText()
@@ -494,7 +523,7 @@ class AnimeRift : MainAPI() {
             ?: defaultApiBase
     }
 
-    private suspend fun registerDevice() {
+    private suspend fun registerDeviceRaw() {
         val url = "$apiBase/auth/register/device"
         deviceId = "${fid ?: ""}:${generateFcmToken()}"
         val (buildId, deviceInfoJson) = generateSyntheticDevice()
@@ -514,12 +543,38 @@ class AnimeRift : MainAPI() {
             "install_mode" to 2
         )
 
-        val json = apiCall(url, "USER.AUTH.DEVICE.REGISTER", "POST", payload)
+        val integrityToken = generateIntegrityToken("USER.AUTH.DEVICE.REGISTER")
+        val headers = buildHeaders(integrityToken)
+
+        val response = app.post(url, headers = headers, json = payload)
+        val text = response.text
+
+        if (response.code == 429 || text.contains("\"statusCode\":429") || text.contains("Too Many Requests")) {
+            rateLimitHits++
+            val backoff = minOf(60L * rateLimitHits, 600L)
+            enterCooldown(backoff, "register 429 (hits=$rateLimitHits)")
+            throw Exception("register: HTTP 429 (rate limited, cooldown ${backoff}s)")
+        }
+
+        if (text.isBlank()) throw Exception("register: empty response (HTTP ${response.code})")
+        if (text.trimStart().startsWith("<")) throw Exception("register: non-JSON (HTTP ${response.code})")
+
+        val json = try { mapper.readTree(text) } catch (e: Exception) {
+            throw Exception("register: bad JSON (HTTP ${response.code}): ${text.take(140)}")
+        }
+
+        val errorCode = json.get("errorCode")?.asText()
+        if (!errorCode.isNullOrEmpty() && errorCode != "null") {
+            throw Exception("register: errorCode=$errorCode (HTTP ${response.code})")
+        }
+
+        if (!response.isSuccessful) {
+            throw Exception("register: HTTP ${response.code}: ${text.take(140)}")
+        }
 
         val sk = json.get("sessionKey")?.asText()
-        if (sk.isNullOrEmpty()) {
-            throw Exception("registerDevice: no sessionKey issued. response=${json.toString().take(200)}")
-        }
+        if (sk.isNullOrEmpty()) throw Exception("register: no sessionKey")
+
         sessionKey = sk
         log("device registered under fresh identity")
     }
@@ -528,6 +583,11 @@ class AnimeRift : MainAPI() {
         url: String, scope: String, method: String = "GET",
         body: Map<String, Any?>? = null, isRetry: Boolean = false
     ): JsonNode {
+        if (isCoolingDown()) {
+            val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
+            throw Exception("cooldown active (${remain}s remaining)")
+        }
+
         ensureInitialized()
 
         val ttl = ttlFor(scope)
@@ -544,25 +604,14 @@ class AnimeRift : MainAPI() {
         if (since in 0 until 120) delay(120 - since)
         lastRequestAt = System.currentTimeMillis()
 
-        val integrityToken = generateIntegrityToken(scope)
+        // re-check after throttle wait
+        if (isCoolingDown()) {
+            val remain = (cooldownUntil - System.currentTimeMillis()) / 1000
+            throw Exception("cooldown active (pre-request, ${remain}s remaining)")
+        }
 
-        val headers = mapOf(
-            "x-device-os-id" to (syntheticBuildId ?: "AP2A.240805.015"),
-            "user-agent" to "Dart/3.10 (dart:io)",
-            "x-device-release-version" to "3.13.5",
-            "x-firebase-app-check" to "null",
-            "authorization" to "Bearer null",
-            "content-type" to "application/json; charset=UTF-8",
-            "x-installation-source" to "IS_INSTALLED_FROM_OTHER_SOURCE",
-            "integrity" to "Bearer $integrityToken",
-            "accept" to "application/json",
-            "x-firebase-id" to (fid ?: ""),
-            "x-device-id" to (deviceId ?: ""),
-            "x-device-timezone" to generateDeviceTimezone(),
-            "x-device-language" to "ar",
-            "x-platform" to "Mobile",
-            "x-os" to "android"
-        )
+        val integrityToken = generateIntegrityToken(scope)
+        val headers = buildHeaders(integrityToken)
 
         try {
             val response = when (method.uppercase()) {
@@ -572,6 +621,15 @@ class AnimeRift : MainAPI() {
             }
 
             val text = response.text
+
+            // 429 detection FIRST — before any other parsing
+            if (response.code == 429 || text.contains("\"statusCode\":429") || text.contains("Too Many Requests")) {
+                rateLimitHits++
+                val backoff = minOf(60L * rateLimitHits, 600L)
+                enterCooldown(backoff, "apiCall 429 (hits=$rateLimitHits)")
+                throw Exception("HTTP 429 from $url: ${text.take(140)}")
+            }
+
             if (text.isBlank()) throw Exception("Empty response from $url (HTTP ${response.code})")
             if (text.trimStart().startsWith("<")) {
                 throw Exception("Non-JSON response from $url (HTTP ${response.code}): ${text.take(140)}")
@@ -583,7 +641,6 @@ class AnimeRift : MainAPI() {
                 throw Exception("Bad JSON from $url (HTTP ${response.code}): ${text.take(140)}")
             }
 
-            // DETECT SERVER-SIDE ERROR ENVELOPE — this was the whole problem
             val errorCode = parsed.get("errorCode")?.asText()
             if (!errorCode.isNullOrEmpty() && errorCode != "null") {
                 throw Exception("Server errorCode=$errorCode from $url (HTTP ${response.code})")
@@ -593,6 +650,11 @@ class AnimeRift : MainAPI() {
                 throw Exception("HTTP ${response.code} from $url: ${text.take(140)}")
             }
 
+            // success — reset counters
+            rateLimitHits = 0
+            consecutiveFailures = 0
+            rotationAttempts = 0
+
             if (ttl > 0) {
                 if (isCacheWorthy(scope, parsed)) {
                     cachePut(key, parsed, ttl)
@@ -601,31 +663,50 @@ class AnimeRift : MainAPI() {
                 }
             }
 
-            consecutiveFailures = 0
             return parsed
         } catch (e: Exception) {
             val msg = e.message.orEmpty()
+
+            // 429 / cooldown — do NOT touch identity, no retry
+            if (msg.contains("429") || msg.contains("Too Many Requests") ||
+                msg.contains("cooldown active")) {
+                if (!msg.contains("cooldown active") && !msg.contains("register: HTTP 429")) {
+                    rateLimitHits++
+                    val backoff = minOf(60L * rateLimitHits, 600L)
+                    enterCooldown(backoff, "catch 429")
+                }
+                throw e
+            }
+
+            // genuine auth failure
             val isAuthFail = msg.contains("401") || msg.contains("403") ||
                 msg.contains("ACCESS_DENIED") || msg.contains("DEVICE_SUSPENDED") ||
                 msg.contains("Server errorCode=")
-            if (isAuthFail) {
+
+            if (isAuthFail && !isRetry) {
                 consecutiveFailures++
-                if (!isRetry) {
-                    when {
-                        consecutiveFailures >= 2 -> {
-                            log("auth failed x$consecutiveFailures → rotating identity")
-                            cacheClear()
-                            ensureInitialized(forceRefresh = true, rotateIdentity = true)
-                        }
-                        else -> {
-                            log("auth failed → re-init same identity")
-                            ensureInitialized(forceRefresh = true)
-                        }
-                    }
-                    delay(1500)
-                    return apiCall(url, scope, method, body, isRetry = true)
+                rotationAttempts++
+
+                if (rotationAttempts > MAX_ROTATION_ATTEMPTS) {
+                    enterCooldown(300, "rotation limit exceeded")
+                    log("rotation limit reached — 5min cooldown")
+                    throw e
                 }
+
+                if (consecutiveFailures >= 2) {
+                    log("auth failed x$consecutiveFailures → rotating identity")
+                    cacheClear()
+                    enterCooldown(15, "post-rotation pause")
+                    ensureInitialized(forceRefresh = true, rotateIdentity = true)
+                } else {
+                    log("auth failed → re-init same identity")
+                    ensureInitialized(forceRefresh = true)
+                }
+
+                delay(3000)
+                return apiCall(url, scope, method, body, isRetry = true)
             }
+
             throw e
         }
     }
@@ -747,7 +828,8 @@ class AnimeRift : MainAPI() {
         val it = prefetchCache.keys.iterator()
         while (it.hasNext()) if (!it.next().startsWith("$animeId|")) it.remove()
 
-        warmPrefetch(orderedData.take(2))
+        // warm only episode 1
+        warmPrefetch(orderedData.take(1))
 
         val ratingFloat = item.get("myAnimeList_rating")?.asDouble()?.toFloat()
 
@@ -772,6 +854,10 @@ class AnimeRift : MainAPI() {
     }
 
     private fun warmPrefetch(targets: List<String>) {
+        if (isCoolingDown()) {
+            log("prefetch skipped (cooldown)")
+            return
+        }
         for (data in targets) {
             if (prefetchCache.containsKey(data)) continue
             if (prefetchInFlight.containsKey(data)) continue
@@ -987,6 +1073,7 @@ class AnimeRift : MainAPI() {
                     }
                 } catch (e: Exception) {
                     logErr("server $serverName/$quality", e)
+                    if (isCoolingDown()) return
                 }
             }
         }
@@ -1041,9 +1128,8 @@ class AnimeRift : MainAPI() {
 
             val idx = episodeOrder.indexOf(data)
             if (idx >= 0) {
-                val nexts = mutableListOf<String>()
-                for (off in 1..2) episodeOrder.getOrNull(idx + off)?.let { nexts.add(it) }
-                warmPrefetch(nexts)
+                // prefetch ONLY the next episode (window=1)
+                episodeOrder.getOrNull(idx + 1)?.let { warmPrefetch(listOf(it)) }
             }
 
             return@withContext bundle.links.isNotEmpty()
