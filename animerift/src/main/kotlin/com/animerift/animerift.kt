@@ -35,8 +35,16 @@ class AnimeRift : MainAPI() {
     // Any string works for integrity. Registration is the only stricter endpoint.
     private val JWT_SECRET = "RIFT_JWT_SECRET_PLACEHOLDER"
     private val FIREBASE_API_KEY = "AIzaSyBiLkiGEm7ruugny3tDFHEZvqli8yv1k7I"
-    private val FIREBASE_APP_ID = "RIFT_FIREBASE_APP_ID_PLACEHOLDER"
+
+    // Try the second OAuth client hash first — first one was rejected by FIS.
+    // If Firebase still 400s, ensureInitialized falls back to a synthetic FID
+    // and the gateway accepts it (proven: HTTP 201 with synthetic fid).
+    private val FIREBASE_APP_ID = "1:536921039715:android:ri3okhhk7t0gbh6k70n4v7dh8da8nd8b"
+    private val FIREBASE_PROJECT_ID = "anime-rift-4142e"
+    private val FIREBASE_SENDER_ID = "536921039715"
+
     private val ANDROID_PACKAGE = "com.riftapps.animerift"
+    // cert registered with Firebase — matches the original signer, NOT the kill apk signer
     private val ANDROID_CERT = "AF40CE82A52AA4107F311D8B9727D01C8D02250B"
 
     companion object {
@@ -49,6 +57,7 @@ class AnimeRift : MainAPI() {
         private var syntheticBuildId: String? = null
         private var syntheticDeviceInfoJson: String? = null
         private var vpnNoticeCount = 0
+        private var firebaseFailed = false
 
         private val providerConfigs = HashMap<String, JsonNode>()
 
@@ -103,6 +112,11 @@ class AnimeRift : MainAPI() {
 
     private fun log(msg: String) { Log.d(TAG, msg) }
     private fun logErr(s: String, e: Throwable) { Log.e(TAG, "$s: ${e.message}") }
+
+    private fun generateSyntheticFid(): String {
+        val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        return (1..22).map { chars.random() }.joinToString("")
+    }
 
     private fun generateSyntheticDevice(): Pair<String, String> {
         val brands = listOf(
@@ -170,15 +184,13 @@ class AnimeRift : MainAPI() {
 
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
         synchronized(initLock) {
-            // ban recovery: wipe BEFORE re-init so a banned fid is never reused
             if (rotateIdentity) wipeIdentity()
 
             if (!forceRefresh) {
                 if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
                     !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
 
-                val disk = loadFromDisk()
-                if (disk != null) {
+                loadFromDisk()?.let { disk ->
                     fid = disk["fid"]
                     firebaseToken = disk["firebaseToken"]
                     gatewayBaseUrl = disk["gatewayBaseUrl"]
@@ -189,13 +201,68 @@ class AnimeRift : MainAPI() {
                     if (!fid.isNullOrEmpty() && !gatewayBaseUrl.isNullOrEmpty() &&
                         !firebaseToken.isNullOrEmpty() && !deviceId.isNullOrEmpty()) return
                 }
+            } else if (!rotateIdentity) {
+                // forceRefresh without rotation: try cached identity first
+                loadFromDisk()?.let { disk ->
+                    if (!disk["fid"].isNullOrEmpty() && !disk["firebaseToken"].isNullOrEmpty()) {
+                        fid = disk["fid"]
+                        firebaseToken = disk["firebaseToken"]
+                        gatewayBaseUrl = disk["gatewayBaseUrl"]
+                        deviceId = disk["deviceId"]
+                        sessionKey = disk["sessionKey"]
+                        syntheticBuildId = disk["syntheticBuildId"]
+                        syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
+                        return
+                    }
+                }
             }
         }
 
         withContext(Dispatchers.IO) {
-            registerFirebaseInstallation()
-            fetchRemoteConfig()
-            registerDevice()
+            // FID: try Firebase, fall back to synthetic. Gateway accepts synthetic (proven).
+            if (!firebaseFailed) {
+                try {
+                    registerFirebaseInstallation()
+                    log("firebase fid ok: $fid")
+                } catch (e: Exception) {
+                    logErr("firebase install failed — using synthetic fid", e)
+                    firebaseFailed = true
+                    fid = generateSyntheticFid()
+                    firebaseToken = "synthetic:${System.currentTimeMillis()}"
+                }
+            } else {
+                fid = generateSyntheticFid()
+                firebaseToken = "synthetic:${System.currentTimeMillis()}"
+            }
+
+            // RemoteConfig: optional — default to mainUrl on failure
+            try {
+                fetchRemoteConfig()
+            } catch (e: Exception) {
+                logErr("remoteconfig failed — using mainUrl", e)
+                gatewayBaseUrl = mainUrl
+            }
+
+            try {
+                registerDevice()
+            } catch (e: Exception) {
+                logErr("registerDevice failed", e)
+                // fall back to disk if we have anything usable
+                loadFromDisk()?.let { disk ->
+                    if (!disk["fid"].isNullOrEmpty() && !disk["firebaseToken"].isNullOrEmpty()) {
+                        fid = disk["fid"]
+                        firebaseToken = disk["firebaseToken"]
+                        gatewayBaseUrl = disk["gatewayBaseUrl"] ?: mainUrl
+                        deviceId = disk["deviceId"]
+                        sessionKey = disk["sessionKey"]
+                        syntheticBuildId = disk["syntheticBuildId"]
+                        syntheticDeviceInfoJson = disk["syntheticDeviceInfoJson"]
+                        return@withContext
+                    }
+                }
+                throw e
+            }
+
             synchronized(initLock) {
                 saveToDisk(
                     mapOf(
@@ -214,32 +281,58 @@ class AnimeRift : MainAPI() {
     }
 
     private fun registerFirebaseInstallation() {
-        val url = "https://firebaseinstallations.googleapis.com/v1/projects/anime-rift-4142e/installations"
+        val url = "https://firebaseinstallations.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/installations"
         val payloadStr = """{"fid":"","appId":"$FIREBASE_APP_ID","authVersion":"FIS_v2","sdkVersion":"a:19.1.0"}"""
 
-        val request = okhttp3.Request.Builder()
-            .url(url)
-            .post(gzipCompress(payloadStr).toRequestBody("application/json; charset=UTF-8".toMediaType()))
-            .addHeader("Content-Type", "application/json")
-            .addHeader("Accept", "application/json")
-            .addHeader("Content-Encoding", "gzip")
-            .addHeader("Cache-Control", "no-cache")
-            .addHeader("X-Android-Package", ANDROID_PACKAGE)
-            .addHeader("X-Android-Cert", ANDROID_CERT)
-            .addHeader("x-goog-api-key", FIREBASE_API_KEY)
-            .addHeader("x-firebase-client", "H4sIAAAAAAAA_6tWykhNLCpJSk0sKVayio7VUSpLLSrOzM9TslIyUqoFAFyivEQfAAAA")
-            .addHeader("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240805.015)")
-            .build()
+        var lastError: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                val request = okhttp3.Request.Builder()
+                    .url(url)
+                    .post(gzipCompress(payloadStr).toRequestBody("application/json; charset=UTF-8".toMediaType()))
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("Accept", "application/json")
+                    .addHeader("Content-Encoding", "gzip")
+                    .addHeader("Cache-Control", "no-cache")
+                    .addHeader("X-Android-Package", ANDROID_PACKAGE)
+                    .addHeader("X-Android-Cert", ANDROID_CERT)
+                    .addHeader("x-goog-api-key", FIREBASE_API_KEY)
+                    .addHeader("x-firebase-client", "H4sIAAAAAAAA_6tWykhNLCpJSk0sKVayio7VUSpLLSrOzM9TslIyUqoFAFyivEQfAAAA")
+                    .addHeader("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240805.015)")
+                    .build()
 
-        val response = app.baseClient.newCall(request).execute()
-        val body = response.body?.string() ?: throw Exception("No response from Firebase")
-        val json = mapper.readTree(body)
-        fid = json.get("fid").asText()
-        firebaseToken = json.get("authToken").get("token").asText()
+                app.baseClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val errMsg = runCatching {
+                            mapper.readTree(body).get("error")?.get("message")?.asText()
+                        }.getOrNull()
+                        throw Exception("Firebase HTTP ${response.code}: ${errMsg ?: body.take(200)}")
+                    }
+
+                    val json = mapper.readTree(body)
+                    val fidNode = json.get("fid")
+                    val tokenNode = json.get("authToken")?.get("token")
+
+                    if (fidNode == null || fidNode.isNull || tokenNode == null || tokenNode.isNull) {
+                        throw Exception("Firebase response missing fid/authToken: ${body.take(300)}")
+                    }
+
+                    fid = fidNode.asText()
+                    firebaseToken = tokenNode.asText()
+                    return
+                }
+            } catch (e: Exception) {
+                lastError = e
+                Log.e(TAG, "registerFirebaseInstallation attempt ${attempt + 1} failed: ${e.message}")
+                if (attempt < 2) Thread.sleep((attempt + 1) * 1500L)
+            }
+        }
+        throw lastError ?: Exception("Firebase installation failed after retries")
     }
 
     private suspend fun fetchRemoteConfig() {
-        val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/536921039715/namespaces/firebase:fetch"
+        val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$FIREBASE_SENDER_ID/namespaces/firebase:fetch"
         val payload = mapOf(
             "appVersion" to "3.13.5",
             "appInstanceIdToken" to (firebaseToken ?: ""),
@@ -258,9 +351,19 @@ class AnimeRift : MainAPI() {
             "X-Goog-Firebase-Installations-Auth" to (firebaseToken ?: ""),
             "Content-Type" to "application/json"
         )
-        val json = app.post(url, headers = headers, json = payload).parsed<JsonNode>()
+
+        val response = app.post(url, headers = headers, json = payload)
+        if (!response.isSuccessful) {
+            Log.e(TAG, "RemoteConfig HTTP ${response.code}")
+            gatewayBaseUrl = mainUrl
+            return
+        }
+        val json = response.parsed<JsonNode>()
         gatewayBaseUrl = json.get("entries")
-            ?.get("anime_rift_android_gateway_base_url_v4")?.asText()?.replace("\"", "") ?: mainUrl
+            ?.get("anime_rift_android_gateway_base_url_v4")
+            ?.asText()
+            ?.replace("\"", "")
+            ?: mainUrl
     }
 
     private suspend fun registerDevice() {
@@ -295,8 +398,7 @@ class AnimeRift : MainAPI() {
     ): JsonNode {
         ensureInitialized()
 
-        // pacing — 150ms minimum gap between requests. rate-limit/ban insurance,
-        // proven necessary the hard way (IP blocked after ~50 burst requests)
+        // pacing — 150ms minimum gap between requests. rate-limit/ban insurance
         val since = System.currentTimeMillis() - lastRequestAt
         if (since in 0 until 150) delay(150 - since)
         lastRequestAt = System.currentTimeMillis()
