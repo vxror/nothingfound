@@ -25,7 +25,6 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -48,8 +47,6 @@ class AnimeRift : MainAPI() {
     private val ANDROID_PACKAGE = "com.riftapps.animerift"
     private val ANDROID_CERT = "AF40CE82A52AA4107F311D8B9727D01C8D02250B"
 
-    // ---- inline helper types ----
-
     private data class RLink(
         val serverName: String,
         val subTitle: String,
@@ -68,6 +65,7 @@ class AnimeRift : MainAPI() {
 
     companion object {
         private const val TAG = "AnimeRift"
+        private const val CACHE_VERSION = 2
 
         private var fid: String? = null
         private var firebaseToken: String? = null
@@ -78,6 +76,7 @@ class AnimeRift : MainAPI() {
         private var syntheticDeviceInfoJson: String? = null
         private var vpnNoticeCount = 0
         private var firebaseFailed = false
+        private var cacheVersionSeen = -1
 
         private val providerConfigs = HashMap<String, JsonNode>()
 
@@ -274,6 +273,22 @@ class AnimeRift : MainAPI() {
         }
     }
 
+    private fun isCacheWorthy(scope: String, node: JsonNode): Boolean {
+        return when (scope) {
+            "ANIME.LIBRARY.HOME_CONTENT" ->
+                (node.get("sections")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.DETAILS" ->
+                node.get("item")?.isObject == true
+            "ANIME.LIBRARY.EPISODES.ALL" ->
+                (node.get("items")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.SEARCH" ->
+                (node.get("items")?.size() ?: 0) > 0
+            "ANIME.LIBRARY.EPISODES.SOURCES.ALL" ->
+                (node.get("items")?.size() ?: 0) > 0
+            else -> true
+        }
+    }
+
     private suspend fun ensureInitialized(forceRefresh: Boolean = false, rotateIdentity: Boolean = false) {
         synchronized(initLock) {
             if (rotateIdentity) {
@@ -299,6 +314,12 @@ class AnimeRift : MainAPI() {
         }
 
         withContext(Dispatchers.IO) {
+            if (cacheVersionSeen != CACHE_VERSION) {
+                cacheClear()
+                cacheVersionSeen = CACHE_VERSION
+                log("cache cleared (version bump to $CACHE_VERSION)")
+            }
+
             if (!firebaseFailed) {
                 try {
                     registerFirebaseInstallation()
@@ -514,7 +535,13 @@ class AnimeRift : MainAPI() {
                 throw Exception("Bad JSON from $url (HTTP ${response.code}): ${text.take(140)}")
             }
 
-            if (ttl > 0) cachePut(key, parsed, ttl)
+            if (ttl > 0) {
+                if (isCacheWorthy(scope, parsed)) {
+                    cachePut(key, parsed, ttl)
+                } else {
+                    log("skip cache (empty content) ${scope}")
+                }
+            }
 
             consecutiveFailures = 0
             return parsed
@@ -656,12 +683,10 @@ class AnimeRift : MainAPI() {
             }
         } catch (e: Exception) { logErr("episodes", e) }
 
-        // update episode order for prefetcher, clear stale prefetches for other shows
         episodeOrder = orderedData.toList()
         val it = prefetchCache.keys.iterator()
         while (it.hasNext()) if (!it.next().startsWith("$animeId|")) it.remove()
 
-        // fire-and-forget: warm ep 1 and ep 2 in background
         warmPrefetch(orderedData.take(2))
 
         val ratingFloat = item.get("myAnimeList_rating")?.asDouble()?.toFloat()
@@ -928,7 +953,6 @@ class AnimeRift : MainAPI() {
             val episodeId = parts[1]
             val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
 
-            // cache hit? drain and use
             val cached = prefetchCache.remove(data)
             val valid = cached != null && (System.currentTimeMillis() - cached.createdAt) < PREFETCH_TTL_MS
 
@@ -955,7 +979,6 @@ class AnimeRift : MainAPI() {
                 )
             }
 
-            // prefetch next two episodes
             val idx = episodeOrder.indexOf(data)
             if (idx >= 0) {
                 val nexts = mutableListOf<String>()
