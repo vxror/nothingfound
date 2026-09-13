@@ -45,9 +45,6 @@ class AnimeRift : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // JWT_SECRET: any string — signature proven unverified on the API layer.
-    // FIREBASE_APP_ID: real extracted value; if firebase rejects it, the
-    // synthetic-fid fallback takes over and the gateway doesn't care.
     private val JWT_SECRET = "RIFT_JWT_SECRET_PLACEHOLDER"
     private val FIREBASE_API_KEY = "AIzaSyBiLkiGEm7ruugny3tDFHEZvqli8yv1k7I"
     private val FIREBASE_APP_ID = "1:536921039715:android:ri3okhhk7t0gbh6k70n4v7dh8da8nd8b"
@@ -158,7 +155,6 @@ class AnimeRift : MainAPI() {
             }
         }
 
-        // [SYNC] context fallback — CommonActivity only (CloudStreamApp not in all API versions)
         private fun getCacheFile(): File {
             val dir = runCatching {
                 CommonActivity.activity?.cacheDir
@@ -402,7 +398,7 @@ class AnimeRift : MainAPI() {
         }
     }
 
-    // [SYNC] blocking OkHttp — firebase install auth, no suspend needed
+    // [SYNC] blocking OkHttp — firebase install auth
     private fun registerFirebaseInstallation() {
         val url = "https://firebaseinstallations.googleapis.com/v1/projects/$FIREBASE_PROJECT_ID/installations"
         val payloadStr = """{"fid":"","appId":"$FIREBASE_APP_ID","authVersion":"FIS_v2","sdkVersion":"a:19.1.0"}"""
@@ -655,12 +651,12 @@ class AnimeRift : MainAPI() {
         }
     }
 
-    // [SUSPEND] member function on purpose — suspend modifier can't get stripped in a merge
+    // [SUSPEND] — DeepSeek fix: callback params are now SUSPEND lambdas
     private suspend fun processSource(
         src: JsonNode,
         episodeId: String,
-        onLink: (RLink) -> Unit,
-        onSub: (SubtitleFile) -> Unit
+        onLink: suspend (RLink) -> Unit,
+        onSub: suspend (SubtitleFile) -> Unit
     ) {
         if (isCoolingDown()) return
         val hostId = src.get("_id")?.asText() ?: return
@@ -682,7 +678,7 @@ class AnimeRift : MainAPI() {
             )
             val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
 
-            // ads claim: fire-and-forget inside a launch (suspend lambda), never blocking playback
+            // ads claim: fire-and-forget inside a launch (suspend lambda)
             prefetchScope.launch {
                 try {
                     apiCall(
@@ -753,10 +749,11 @@ class AnimeRift : MainAPI() {
         }
     }
 
-    // [SUSPEND]
+    // [SUSPEND] — DeepSeek fix: suspend callback params here too
     private suspend fun resolveBundle(
         animeId: String, episodeId: String, episodeNumber: Int,
-        onLink: (RLink) -> Unit, onSub: (SubtitleFile) -> Unit
+        onLink: suspend (RLink) -> Unit,
+        onSub: suspend (SubtitleFile) -> Unit
     ) {
         val sourcesJson = apiCall(
             "$apiBase/library/episode/sources", "ANIME.LIBRARY.EPISODES.SOURCES.ALL", method = "POST",
@@ -783,7 +780,7 @@ class AnimeRift : MainAPI() {
         }
     }
 
-    // [SUSPEND] override — streams links to the player the instant each resolves
+    // [SUSPEND] override — DeepSeek fix: onLink/onSub are now suspend lambdas
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
@@ -792,7 +789,7 @@ class AnimeRift : MainAPI() {
         val animeId = parts[0]; val episodeId = parts[1]; val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
         val emitted = AtomicInteger(0)
 
-        val onLink: (RLink) -> Unit = { rl ->
+        val onLink: suspend (RLink) -> Unit = { rl ->
             callback.invoke(newExtractorLink(
                 source = name, name = "${rl.serverName} [${rl.subTitle}] - ${rl.quality}", url = rl.url
             ) {
@@ -800,7 +797,7 @@ class AnimeRift : MainAPI() {
             })
             emitted.incrementAndGet()
         }
-        val onSub: (SubtitleFile) -> Unit = { subtitleCallback(it) }
+        val onSub: suspend (SubtitleFile) -> Unit = { subtitleCallback(it) }
 
         try {
             val cached = prefetchCache.remove(data)
