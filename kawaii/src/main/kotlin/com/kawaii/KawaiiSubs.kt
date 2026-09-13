@@ -2,37 +2,41 @@ package com.kawaii
 
 import android.util.Log
 import com.lagradost.cloudstream3.app
-import okhttp3.Request
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLEncoder
-import java.util.UUID
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * KawaiiSubs
- *
- * Full replacement subtitle engine:
- * - Fetches raw VTT with the correct site headers.
- * - Uses /api/translate-sub to produce Arabic from the English VTT.
- * - Converts VTT to styled ASS with the field-proven RTL wrapping.
- * - Serves the generated ASS from a local loopback HTTP server.
- * - The generated URL ends with .ass so players can infer the format.
- */
 object KawaiiSubs {
-
     private const val TAG = "KawaiiSubs"
     private const val MAIN_URL = "https://kawaiianime.cc"
-    private const val UA =
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
+    private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"
 
-    private val assCache = ConcurrentHashMap<String, String>()
+    // Fixed port block so URLs survive app restarts and link-cache replays.
+    private const val BASE_PORT = 41739
+    private const val PORT_SPAN = 5
+
+    // key (base64 payload) -> ASS bytes
+    private val warmCache = ConcurrentHashMap<String, ByteArray>()
+    private val pending = ConcurrentHashMap.newKeySet<String>()
+
     private var server: ServerSocket? = null
     private val serverLock = Any()
+    private var serverPort = 0
 
-    // Exact RTL codepoints used by the known-good fix_rtl2.py logic.
+    private val subScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private const val WAIT_MS = 10_000L
+
     private const val RLE = '\u202B'
     private const val PDF = '\u202C'
 
@@ -55,181 +59,302 @@ object KawaiiSubs {
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     """.trimIndent()
 
-    // ───────────────────────────────────────────────────────────────
-    // Public API
-    // ───────────────────────────────────────────────────────────────
+    // ── server ────────────────────────────────────────────────────
 
-    /**
-     * Styles the raw VTT without translation.
-     * Used for the original English track.
-     */
-    fun rawStyledUrl(vttUrl: String): String? {
-        val vtt = fetchVtt(vttUrl) ?: return null
-        val ass = vttToAss(vtt)
-        return serveAss(ass)
+    fun ensureServer(): Int {
+        synchronized(serverLock) {
+            server?.takeIf { !it.isClosed }?.let { return it.localPort }
+            for (p in BASE_PORT until BASE_PORT + PORT_SPAN) {
+                try {
+                    val s = ServerSocket(p, 50, InetAddress.getByName("127.0.0.1"))
+                    server = s
+                    serverPort = p
+
+                    Thread {
+                        while (!s.isClosed) {
+                            try {
+                                val socket = s.accept()
+                                Thread { handle(socket) }.apply { isDaemon = true }.start()
+                            } catch (_: Exception) {}
+                        }
+                    }.apply { isDaemon = true; name = "KawaiiSubServer" }.start()
+
+                    return p
+                } catch (_: Exception) {
+                    // port taken, try next
+                }
+            }
+            Log.e(TAG, "ensureServer: all ports $BASE_PORT..${BASE_PORT + PORT_SPAN - 1} failed")
+            return -1
+        }
     }
 
-    /**
-     * Translates the raw VTT using /api/translate-sub, then styles it.
-     * Returns null if translation does not produce a valid WEBVTT payload.
-     */
-    fun translatedStyledUrl(
-        vttUrl: String,
+    private fun handle(socket: Socket) {
+        try {
+            val input = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val output = socket.getOutputStream()
+            val requestLine = input.readLine() ?: return
+            val parts = requestLine.split(" ")
+            if (parts.size < 2) return
+            val path = parts[1]
+
+            while (true) {
+                val h = input.readLine() ?: break
+                if (h.isEmpty()) break
+            }
+
+            if (!path.startsWith("/sub/")) {
+                output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                return
+            }
+
+            val key = path.substringAfter("/sub/", "").substringBefore("?").substringBefore(".ass")
+            if (key.isBlank()) {
+                output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                return
+            }
+
+            var data = warmCache[key]
+
+            // If a pre-warm coroutine is in flight, wait for it.
+            if (data == null && pending.contains(key)) {
+                val start = System.currentTimeMillis()
+                while (System.currentTimeMillis() - start < WAIT_MS) {
+                    data = warmCache[key]
+                    if (data != null || !pending.contains(key)) break
+                    Thread.sleep(50)
+                }
+            }
+
+            // Cold key (stale replay / process restarted): fetch synchronously here.
+            if (data == null && pending.add(key)) {
+                try {
+                    val fields = decodeKey(key)
+                    if (fields != null) {
+                        val ass = fetchAndConvert(fields.vttUrl, fields.showId, fields.epNum, fields.titles, fields.translate)
+                        if (ass != null) {
+                            data = ass.toByteArray(Charsets.UTF_8)
+                            warmCache[key] = data
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "handle on-demand fetch", e)
+                } finally {
+                    pending.remove(key)
+                }
+            }
+
+            if (data == null) {
+                // 503 is retryable for ExoPlayer/mpv; 404 kills the track forever.
+                output.write("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                return
+            }
+
+            val header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/x-subtitle-ass; charset=utf-8\r\n" +
+                "Content-Length: ${data.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n"
+            output.write(header.toByteArray())
+            output.write(data)
+            output.flush()
+        } catch (e: Exception) {
+            Log.e(TAG, "handle", e)
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    // ── public entry ──────────────────────────────────────────────
+
+    fun prepareSubtitle(
+        rawUrl: String,
+        lang: String,
         showId: String,
         epNum: String,
-        titles: List<String>
+        titles: List<String>,
+        tryTranslate: Boolean
     ): String? {
-        val ass = fetchTranslatedAss(vttUrl, showId, epNum, titles) ?: return null
-        return serveAss(ass)
-    }
+        val port = ensureServer()
+        if (port == -1) return null
 
-    // ───────────────────────────────────────────────────────────────
-    // Network
-    // ───────────────────────────────────────────────────────────────
+        val key = encodeKey(rawUrl, showId, epNum, titles.firstOrNull().orEmpty(), tryTranslate)
 
-    private fun vttRequest(url: String): Request {
-        return Request.Builder()
-            .url(url)
-            .header("User-Agent", UA)
-            .header("Referer", "$MAIN_URL/")
-            .header("DNT", "1")
-            .header("Accept", "*/*")
-            .header("sec-ch-ua", "\"Chromium\";v=\"148\", \"Quetta\";v=\"148\", \"Not/A)Brand\";v=\"99\"")
-            .header("sec-ch-ua-mobile", "?1")
-            .header("sec-ch-ua-platform", "\"Android\"")
-            .build()
-    }
-
-    private fun translationRequest(url: String, showId: String, epNum: String): Request {
-        return Request.Builder()
-            .url(url)
-            .header("accept", "*/*")
-            .header("accept-language", "en-US,en;q=0.9")
-            .header("dnt", "1")
-            .header("priority", "u=1, i")
-            .header("referer", "$MAIN_URL/watch/$showId?num=$epNum")
-            .header("sec-ch-ua", "\"Chromium\";v=\"148\", \"Quetta\";v=\"148\", \"Not/A)Brand\";v=\"99\"")
-            .header("sec-ch-ua-mobile", "?1")
-            .header("sec-ch-ua-platform", "\"Android\"")
-            .header("sec-fetch-dest", "empty")
-            .header("sec-fetch-mode", "cors")
-            .header("sec-fetch-site", "same-origin")
-            .header("sec-gpc", "1")
-            .header("user-agent", UA)
-            .header("Origin", MAIN_URL)
-            .build()
-    }
-
-    private fun fetchVtt(url: String): String? {
-        return try {
-            app.baseClient.newCall(vttRequest(url)).execute().use { res ->
-                if (!res.isSuccessful) {
-                    Log.d(TAG, "fetchVtt failed HTTP ${res.code} for $url")
-                    return null
+        if (!warmCache.containsKey(key) && pending.add(key)) {
+            subScope.launch {
+                try {
+                    val ass = fetchAndConvert(rawUrl, showId, epNum, titles, tryTranslate)
+                    if (ass != null) {
+                        warmCache[key] = ass.toByteArray(Charsets.UTF_8)
+                        Log.d(TAG, "subtitle ready [${if (tryTranslate) "ar" else "raw"}] key=${key.take(12)}")
+                    } else {
+                        Log.d(TAG, "subtitle fetch failed [${if (tryTranslate) "ar" else "raw"}] $rawUrl")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "prepareSubtitle", e)
+                } finally {
+                    pending.remove(key)
                 }
-
-                val body = res.body?.string() ?: return null
-                if (body.contains("WEBVTT") && body.contains("-->")) body else null
             }
+        }
+
+        return "http://127.0.0.1:$port/sub/$key.ass"
+    }
+
+    /** Remote last-resort URL (works without custom headers, proven by probe). */
+    fun remoteTranslateUrl(vttUrl: String, epNum: String, title: String): String {
+        val encUrl = URLEncoder.encode(vttUrl, "UTF-8")
+        val encTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        return "$MAIN_URL/api/translate-sub?url=$encUrl&v=$epNum&title=$encTitle"
+    }
+
+    // ── key codec ─────────────────────────────────────────────────
+
+    private class KeyFields(
+        val vttUrl: String,
+        val showId: String,
+        val epNum: String,
+        val titles: List<String>,
+        val translate: Boolean
+    )
+
+    private fun encodeKey(vttUrl: String, showId: String, epNum: String, title: String, translate: Boolean): String {
+        val payload = listOf(if (translate) "ar" else "raw", showId, epNum, title, vttUrl).joinToString("|")
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(payload.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun decodeKey(key: String): KeyFields? {
+        return try {
+            val payload = String(Base64.getUrlDecoder().decode(key), Charsets.UTF_8)
+            val f = payload.split("|", limit = 5)
+            if (f.size < 5) return null
+            KeyFields(
+                vttUrl = f[4],
+                showId = f[1],
+                epNum = f[2],
+                titles = listOf(f[3]).filter { it.isNotBlank() },
+                translate = f[0] == "ar"
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "fetchVtt exception: ${e.message}")
             null
         }
     }
 
-    private fun fetchTranslatedAss(
-        vttUrl: String,
-        showId: String,
-        epNum: String,
-        titles: List<String>
-    ): String? {
-        val candidates = titleCandidates(titles)
-        if (candidates.isEmpty()) {
-            Log.d(TAG, "No title candidates for translation API")
-            return null
-        }
-
-        val encodedVtt = try {
-            URLEncoder.encode(vttUrl, "UTF-8")
-        } catch (e: Exception) {
-            Log.e(TAG, "URL encode failed: ${e.message}")
-            return null
-        }
-
-        for (title in candidates) {
-            try {
-                val encodedTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
-                val url = "$MAIN_URL/api/translate-sub?url=$encodedVtt&v=$epNum&title=$encodedTitle"
-
-                app.baseClient.newCall(translationRequest(url, showId, epNum)).execute().use { res ->
-                    if (!res.isSuccessful) {
-                        Log.d(TAG, "translate HTTP ${res.code} title='$title'")
-                        return@use
-                    }
-
-                    val body = res.body?.string() ?: return@use
-                    if (body.contains("WEBVTT") && body.contains("-->")) {
-                        Log.d(TAG, "translate success title='$title' len=${body.length}")
-                        return vttToAss(body)
-                    }
-
-                    Log.d(TAG, "translate response not VTT title='$title' len=${body.length}")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "translate exception title='$title': ${e.message}")
-            }
-        }
-
-        return null
-    }
+    // ── network (2 attempts each — device DNS is flaky per logs) ──
 
     private fun titleCandidates(titles: List<String>): List<String> {
         val out = ArrayList<String>()
-
         for (raw in titles) {
             val t = raw.trim()
             if (t.isBlank()) continue
-
             out.add(t)
-
-            val upper = t.uppercase()
-            if (upper != t) out.add(upper)
-
-            val collapsed = t.replace(Regex("\\s+"), " ")
-            if (collapsed != t) out.add(collapsed)
-
-            val collapsedUpper = collapsed.uppercase()
-            if (collapsedUpper != collapsed) out.add(collapsedUpper)
+            out.add(t.uppercase())
         }
-
-        return out.distinct().take(8)
+        if (out.isEmpty()) out.add("")
+        return out.distinct().take(6)
     }
 
-    // ───────────────────────────────────────────────────────────────
-    // VTT → ASS
-    // ───────────────────────────────────────────────────────────────
+    private suspend fun fetchAndConvert(
+        rawUrl: String,
+        showId: String,
+        epNum: String,
+        titles: List<String>,
+        tryTranslate: Boolean
+    ): String? {
+        if (tryTranslate) {
+            for (title in titleCandidates(titles)) {
+                val vtt = fetchTranslation(rawUrl, showId, epNum, title)
+                if (vtt != null) return vttToAss(vtt)
+            }
+            return null
+        }
+        return fetchRawVtt(rawUrl)?.let { vttToAss(it) }
+    }
+
+    private suspend fun fetchTranslation(vttUrl: String, showId: String, epNum: String, title: String): String? {
+        val encUrl = URLEncoder.encode(vttUrl, "UTF-8")
+        val encTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        val url = "$MAIN_URL/api/translate-sub?url=$encUrl&v=$epNum&title=$encTitle"
+
+        repeat(2) { attempt ->
+            try {
+                val res = app.get(
+                    url,
+                    headers = mapOf(
+                        "accept" to "*/*",
+                        "accept-language" to "en-US,en;q=0.9",
+                        "dnt" to "1",
+                        "priority" to "u=1, i",
+                        "referer" to "$MAIN_URL/watch/$showId?num=$epNum",
+                        "sec-ch-ua" to "\"Chromium\";v=\"148\", \"Quetta\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+                        "sec-ch-ua-mobile" to "?1",
+                        "sec-ch-ua-platform" to "\"Android\"",
+                        "sec-fetch-dest" to "empty",
+                        "sec-fetch-mode" to "cors",
+                        "sec-fetch-site" to "same-origin",
+                        "sec-gpc" to "1",
+                        "user-agent" to UA
+                    )
+                )
+                if (res.isSuccessful && res.text.contains("WEBVTT")) return res.text
+            } catch (e: Exception) {
+                Log.e(TAG, "fetchTranslation attempt=$attempt", e)
+            }
+            if (attempt == 0) delay(400)
+        }
+        return null
+    }
+
+    private suspend fun fetchRawVtt(vttUrl: String): String? {
+        repeat(2) { attempt ->
+            try {
+                val res = app.get(
+                    vttUrl,
+                    headers = mapOf(
+                        "sec-ch-ua-platform" to "\"Android\"",
+                        "Referer" to "$MAIN_URL/",
+                        "User-Agent" to UA,
+                        "sec-ch-ua" to "\"Chromium\";v=\"148\", \"Quetta\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+                        "DNT" to "1",
+                        "sec-ch-ua-mobile" to "?1",
+                        "Accept" to "*/*"
+                    )
+                )
+                if (res.isSuccessful && res.text.contains("WEBVTT")) return res.text
+            } catch (e: Exception) {
+                Log.e(TAG, "fetchRawVtt attempt=$attempt", e)
+            }
+            if (attempt == 0) delay(400)
+        }
+        return null
+    }
+
+    // ── VTT → ASS ─────────────────────────────────────────────────
 
     private fun cleanBidi(s: String): String {
         val sb = StringBuilder(s.length)
-
         for (c in s) {
             val cp = c.code
-            val drop = cp == 0x200e ||
-                cp == 0x200f ||
-                cp in 0x202a..0x202e ||
-                cp in 0x2066..0x2069 ||
-                cp == 0xfeff ||
-                cp in 0x200b..0x200d
-
+            val drop = cp == 0x200e || cp == 0x200f || (cp in 0x202a..0x202e) ||
+                (cp in 0x2066..0x2069) || cp == 0xfeff || (cp in 0x200b..0x200d)
             if (!drop) sb.append(c)
         }
-
         return sb.toString()
     }
 
-    private fun styleFor(text: String): String {
-        val t = text.trim()
+    private fun inlineToAss(s: String): String {
+        return s
+            .replace(Regex("<\\s*b\\s*>", RegexOption.IGNORE_CASE), "{\\b1}")
+            .replace(Regex("<\\s*/\\s*b\\s*>", RegexOption.IGNORE_CASE), "{\\b0}")
+            .replace(Regex("<\\s*i\\s*>", RegexOption.IGNORE_CASE), "{\\i1}")
+            .replace(Regex("<\\s*/\\s*i\\s*>", RegexOption.IGNORE_CASE), "{\\i0}")
+            .replace(Regex("<\\s*u\\s*>", RegexOption.IGNORE_CASE), "{\\u1}")
+            .replace(Regex("<\\s*/\\s*u\\s*>", RegexOption.IGNORE_CASE), "{\\u0}")
+            .replace(Regex("<[^>]*>"), "")
+    }
 
+    private fun styleFor(text: String): String {
+        val t = text.replace(Regex("<[^>]*>"), "").trim()
         return when {
             t.contains("♪") || t.contains("♫") || t.startsWith("#") -> "song"
             t.startsWith("(") || t.startsWith("[") -> "NOTE"
@@ -240,175 +365,51 @@ object KawaiiSubs {
     private fun assText(text: String): String {
         val cleaned = cleanBidi(text)
             .replace("{", "\\{")
-            .replace("}", "}")
-
-        return cleaned
-            .split('\n')
-            .filter { it.isNotEmpty() }
+            .replace("}", "\\}")
+        val converted = inlineToAss(cleaned)
+        return converted.split('\n')
+            .filter { it.isNotBlank() }
             .map { RLE + it + PDF }
             .joinToString("\\N")
     }
 
+    // Accepts HH:MM:SS.mmm AND MM:SS.mmm (Black Torch ep 2 uses the latter).
     private fun vttToAssTime(t: String): String {
-        val m = Regex("""(\d{2}):(\d{2}):(\d{2})\.(\d{3})""").find(t) ?: return t
-        val (h, min, sec, ms) = m.destructured
-        val cs = (ms.toInt() / 10).toString().padStart(2, '0')
-        return "$h:$min:$sec.$cs"
+        val m = Regex("""(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?""").find(t.trim()) ?: return t
+        val h = m.groupValues[1].ifEmpty { "0" }.toInt()
+        val min = m.groupValues[2].toInt()
+        val sec = m.groupValues[3].toInt()
+        val frac = m.groupValues[4].padEnd(3, '0').ifEmpty { "000" }.toInt()
+        val cs = (frac / 10).toString().padStart(2, '0')
+        return "$h:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${cs}"
     }
 
     fun vttToAss(vtt: String): String {
-        val sb = StringBuilder()
-        sb.append(ASS_HEADER).append('\n')
-
-        val lines = vtt.replace("\r\n", "\n").split('\n')
+        val sb = StringBuilder().append(ASS_HEADER).append('\n')
+        val lines = vtt.replace("\r\n", "\n").replace('\uFEFF', ' ').split('\n')
         var i = 0
-
         while (i < lines.size) {
             val line = lines[i].trim()
-
             if (line.contains("-->")) {
                 val times = line.split("-->")
                 if (times.size == 2) {
                     val start = vttToAssTime(times[0].trim())
                     val end = vttToAssTime(times[1].trim().substringBefore(' '))
-
                     val textLines = ArrayList<String>()
                     i++
-
                     while (i < lines.size && lines[i].isNotBlank()) {
                         textLines.add(lines[i].trim())
                         i++
                     }
-
                     val text = textLines.joinToString("\n")
-                    if (text.isNotEmpty()) {
-                        val style = styleFor(text)
-                        sb.append("Dialogue: 0,$start,$end,$style,,0,0,0,,${assText(text)}\n")
+                    if (text.replace(Regex("<[^>]*>"), "").isNotBlank()) {
+                        sb.append("Dialogue: 0,$start,$end,${styleFor(text)},,0,0,0,,${assText(text)}\n")
                     }
-
                     continue
                 }
             }
-
             i++
         }
-
         return sb.toString()
-    }
-
-    // ───────────────────────────────────────────────────────────────
-    // Local ASS server
-    // ───────────────────────────────────────────────────────────────
-
-    private fun serveAss(ass: String): String? {
-        if (ass.isBlank()) return null
-
-        trimCacheIfNeeded()
-
-        val id = UUID.randomUUID().toString()
-        assCache[id] = ass
-
-        val port = ensureServer() ?: return null
-        return "http://127.0.0.1:$port/sub/$id.ass"
-    }
-
-    private fun trimCacheIfNeeded() {
-        if (assCache.size <= 120) return
-
-        try {
-            assCache.keys.take(40).forEach { assCache.remove(it) }
-        } catch (_: Exception) {}
-    }
-
-    private fun ensureServer(): Int? {
-        synchronized(serverLock) {
-            val existing = server
-            if (existing != null && !existing.isClosed) {
-                return existing.localPort
-            }
-
-            return try {
-                val s = ServerSocket(0)
-                server = s
-
-                Thread {
-                    while (!s.isClosed) {
-                        try {
-                            val socket = s.accept()
-                            Thread {
-                                handle(socket)
-                            }.apply {
-                                isDaemon = true
-                                name = "KawaiiSubConn-${System.currentTimeMillis()}"
-                            }.start()
-                        } catch (_: Exception) {
-                            if (s.isClosed) break
-                        }
-                    }
-                }.apply {
-                    isDaemon = true
-                    name = "KawaiiSubServer"
-                }.start()
-
-                s.localPort
-            } catch (e: Exception) {
-                Log.e(TAG, "ensureServer failed: ${e.message}")
-                null
-            }
-        }
-    }
-
-    private fun handle(socket: Socket) {
-        try {
-            val input = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val output = socket.getOutputStream()
-
-            val requestLine = input.readLine() ?: return
-            val parts = requestLine.split(" ")
-            if (parts.size < 2) return
-
-            val path = parts[1]
-
-            // Drain headers.
-            while (true) {
-                val h = input.readLine() ?: break
-                if (h.isEmpty()) break
-            }
-
-            if (!path.startsWith("/sub/") || !path.contains(".ass")) {
-                output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
-                return
-            }
-
-            val id = path
-                .substringAfter("/sub/", "")
-                .substringBefore("?")
-                .substringBefore(".ass")
-
-            val ass = assCache[id]
-            if (id.isBlank() || ass == null) {
-                output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
-                return
-            }
-
-            val bytes = ass.toByteArray(Charsets.UTF_8)
-
-            val header = "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: application/x-subtitle-ass; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\n" +
-                "Access-Control-Allow-Origin: *\r\n" +
-                "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
-                "Connection: close\r\n\r\n"
-
-            output.write(header.toByteArray())
-            output.write(bytes)
-            output.flush()
-        } catch (e: Exception) {
-            Log.e(TAG, "handle exception: ${e.message}")
-        } finally {
-            try {
-                socket.close()
-            } catch (_: Exception) {}
-        }
     }
 }
