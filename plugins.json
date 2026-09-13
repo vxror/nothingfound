@@ -5,8 +5,12 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": ["VxROR"],
-    "tvTypes": ["Anime"],
+    "authors": [
+      "VxROR"
+    ],
+    "tvTypes": [
+      "Anime"
+    ],
     "version": 4,
     "internalName": "AnimeWitcher",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Animewitcher.cs3",
@@ -20,8 +24,12 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": ["vxror"],
-    "tvTypes": ["Anime"],
+    "authors": [
+      "vxror"
+    ],
+    "tvTypes": [
+      "Anime"
+    ],
     "version": 167,
     "internalName": "WitAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/witanime.cs3",
@@ -35,8 +43,12 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": ["vxror"],
-    "tvTypes": ["Anime"],
+    "authors": [
+      "vxror"
+    ],
+    "tvTypes": [
+      "Anime"
+    ],
     "version": 33,
     "internalName": "KawaiiAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/Kawaii.cs3",
@@ -50,11 +62,17 @@
     "repositoryUrl": "https://github.com/vxror/nothingfound",
     "status": 1,
     "language": "ar",
-    "authors": ["vxror"],
-    "tvTypes": ["Anime"],
+    "authors": [
+      "vxror"
+    ],
+    "tvTypes": [
+      "Anime"
+    ],
     "version": 1,
     "internalName": "AnimeRift",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/AnimeRift.cs3",
-    "name": "AnimeRift"
+    "name": "AnimeRift",
+    "fileSize": 43287,
+    "fileHash": "sha256-cb89b955f5ccd5d21fe1ac6eb4295a3679648d31ed8363f6a2f77f7a08d8234b"
   }
 ]
