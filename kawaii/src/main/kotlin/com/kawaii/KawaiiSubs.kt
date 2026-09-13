@@ -7,13 +7,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLEncoder
-import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
 object KawaiiSubs {
@@ -31,14 +31,13 @@ object KawaiiSubs {
 
     private var server: ServerSocket? = null
     private val serverLock = Any()
-    private var serverPort = 0
 
     private val subScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private const val WAIT_MS = 10_000L
 
-    private const val RLE = '\u202B'
-    private const val PDF = '\u202C'
+    private const val RLE = '‫'
+    private const val PDF = '‬'
 
     private val ASS_HEADER = """
         [Script Info]
@@ -68,7 +67,6 @@ object KawaiiSubs {
                 try {
                     val s = ServerSocket(p, 50, InetAddress.getByName("127.0.0.1"))
                     server = s
-                    serverPort = p
 
                     Thread {
                         while (!s.isClosed) {
@@ -127,18 +125,23 @@ object KawaiiSubs {
             }
 
             // Cold key (stale replay / process restarted): fetch synchronously here.
+            // [FIX 134] runBlocking — we are on a dedicated server thread whose whole
+            // purpose is to block until the response is ready. This is the ONLY legal
+            // bridge from a raw thread into the suspend fetch layer.
             if (data == null && pending.add(key)) {
                 try {
                     val fields = decodeKey(key)
                     if (fields != null) {
-                        val ass = fetchAndConvert(fields.vttUrl, fields.showId, fields.epNum, fields.titles, fields.translate)
+                        val ass = runBlocking {
+                            fetchAndConvert(fields.vttUrl, fields.showId, fields.epNum, fields.titles, fields.translate)
+                        }
                         if (ass != null) {
                             data = ass.toByteArray(Charsets.UTF_8)
                             warmCache[key] = data
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "handle on-demand fetch", e)
+                    Log.e(TAG, "handle on-demand fetch: ${e.message}")
                 } finally {
                     pending.remove(key)
                 }
@@ -159,7 +162,7 @@ object KawaiiSubs {
             output.write(data)
             output.flush()
         } catch (e: Exception) {
-            Log.e(TAG, "handle", e)
+            Log.e(TAG, "handle: ${e.message}")
         } finally {
             try { socket.close() } catch (_: Exception) {}
         }
@@ -191,7 +194,7 @@ object KawaiiSubs {
                         Log.d(TAG, "subtitle fetch failed [${if (tryTranslate) "ar" else "raw"}] $rawUrl")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "prepareSubtitle", e)
+                    Log.e(TAG, "prepareSubtitle: ${e.message}")
                 } finally {
                     pending.remove(key)
                 }
@@ -209,6 +212,7 @@ object KawaiiSubs {
     }
 
     // ── key codec ─────────────────────────────────────────────────
+    // [FIX] android.util.Base64 — java.util.Base64 needs API 26, minSdk is 21
 
     private class KeyFields(
         val vttUrl: String,
@@ -220,12 +224,15 @@ object KawaiiSubs {
 
     private fun encodeKey(vttUrl: String, showId: String, epNum: String, title: String, translate: Boolean): String {
         val payload = listOf(if (translate) "ar" else "raw", showId, epNum, title, vttUrl).joinToString("|")
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(payload.toByteArray(Charsets.UTF_8))
+        return android.util.Base64.encodeToString(
+            payload.toByteArray(Charsets.UTF_8),
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP
+        )
     }
 
     private fun decodeKey(key: String): KeyFields? {
         return try {
-            val payload = String(Base64.getUrlDecoder().decode(key), Charsets.UTF_8)
+            val payload = String(android.util.Base64.decode(key, android.util.Base64.URL_SAFE), Charsets.UTF_8)
             val f = payload.split("|", limit = 5)
             if (f.size < 5) return null
             KeyFields(
@@ -298,7 +305,7 @@ object KawaiiSubs {
                 )
                 if (res.isSuccessful && res.text.contains("WEBVTT")) return res.text
             } catch (e: Exception) {
-                Log.e(TAG, "fetchTranslation attempt=$attempt", e)
+                Log.e(TAG, "fetchTranslation attempt=$attempt: ${e.message}")
             }
             if (attempt == 0) delay(400)
         }
@@ -322,7 +329,7 @@ object KawaiiSubs {
                 )
                 if (res.isSuccessful && res.text.contains("WEBVTT")) return res.text
             } catch (e: Exception) {
-                Log.e(TAG, "fetchRawVtt attempt=$attempt", e)
+                Log.e(TAG, "fetchRawVtt attempt=$attempt: ${e.message}")
             }
             if (attempt == 0) delay(400)
         }
@@ -342,15 +349,26 @@ object KawaiiSubs {
         return sb.toString()
     }
 
+    /**
+     * [HTML FIX] the site's subs carry HTML markup — well-formed pairs like
+     * <b>word</b>, AND malformed garbage like "<b/>text<b>" (see screenshots).
+     * entities are unescaped first, well-formed tags become ASS overrides,
+     * everything else tag-shaped is stripped by the catch-all — <b/> included.
+     */
     private fun inlineToAss(s: String): String {
-        return s
+        var t = s
+            .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
+        t = t
             .replace(Regex("<\\s*b\\s*>", RegexOption.IGNORE_CASE), "{\\b1}")
             .replace(Regex("<\\s*/\\s*b\\s*>", RegexOption.IGNORE_CASE), "{\\b0}")
             .replace(Regex("<\\s*i\\s*>", RegexOption.IGNORE_CASE), "{\\i1}")
             .replace(Regex("<\\s*/\\s*i\\s*>", RegexOption.IGNORE_CASE), "{\\i0}")
             .replace(Regex("<\\s*u\\s*>", RegexOption.IGNORE_CASE), "{\\u1}")
             .replace(Regex("<\\s*/\\s*u\\s*>", RegexOption.IGNORE_CASE), "{\\u0}")
-            .replace(Regex("<[^>]*>"), "")
+        // catch-all: <b/>, </ b >, <font ...>, <span>, anything tag-shaped → gone
+        t = t.replace(Regex("<[^>]*>"), "")
+        return t.replace(Regex(" {2,}"), " ").trimEnd()
     }
 
     private fun styleFor(text: String): String {
@@ -381,12 +399,12 @@ object KawaiiSubs {
         val sec = m.groupValues[3].toInt()
         val frac = m.groupValues[4].padEnd(3, '0').ifEmpty { "000" }.toInt()
         val cs = (frac / 10).toString().padStart(2, '0')
-        return "$h:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${cs}"
+        return "$h:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.$cs"
     }
 
     fun vttToAss(vtt: String): String {
         val sb = StringBuilder().append(ASS_HEADER).append('\n')
-        val lines = vtt.replace("\r\n", "\n").replace('\uFEFF', ' ').split('\n')
+        val lines = vtt.replace("\r\n", "\n").replace('﻿', ' ').split('\n')
         var i = 0
         while (i < lines.size) {
             val line = lines[i].trim()
