@@ -24,10 +24,7 @@ import javax.crypto.spec.SecretKeySpec
 
 class AnimeRift : MainAPI() {
 
-    // display-only domain (CloudStream opens this in browser)
     override var mainUrl = "https://gateway.anime-rift.com"
-
-    // actual API root — everything is under /api/v4
     private val defaultApiBase = "https://gateway.anime-rift.com/api/v4"
 
     override var name = "AnimeRift"
@@ -203,7 +200,6 @@ class AnimeRift : MainAPI() {
         }
 
         withContext(Dispatchers.IO) {
-            // FID: one shot at Firebase, synthetic on any failure
             if (!firebaseFailed) {
                 try {
                     registerFirebaseInstallation()
@@ -219,7 +215,6 @@ class AnimeRift : MainAPI() {
                 firebaseToken = "synthetic:${System.currentTimeMillis()}"
             }
 
-            // gateway base — only attempt RemoteConfig when Firebase worked
             if (firebaseFailed) {
                 gatewayBaseUrl = defaultApiBase
             } else {
@@ -232,7 +227,6 @@ class AnimeRift : MainAPI() {
                 if (gatewayBaseUrl.isNullOrEmpty()) gatewayBaseUrl = defaultApiBase
             }
 
-            // register device — non-fatal, gateway accepts anonymous calls too
             try {
                 registerDevice()
             } catch (e: Exception) {
@@ -613,11 +607,17 @@ class AnimeRift : MainAPI() {
                 subTitle.startsWith("ar_") || subTitle.isEmpty()
             }.ifEmpty { items.toList() }
 
-            val sortedItems = filteredItems.sortedBy { src ->
-                providerRank(src.get("provider")?.asText() ?: "")
-            }.take(6)
+            // group by provider so multi-quality hosts (rift-streamer) aren't
+            // starved by per-quality hosts (cr2/streamtape) eating all the slots
+            val byProvider = filteredItems.groupBy { it.get("provider")?.asText() ?: "" }
+            val topProviders = byProvider.keys
+                .sortedBy { providerRank(it) }
+                .take(4)
+            val sortedItems = topProviders.flatMap { byProvider[it] ?: emptyList() }
 
-            val semaphore = Semaphore(3)
+            log("providers: ${topProviders.joinToString(",")} → ${sortedItems.size} items")
+
+            val semaphore = Semaphore(4)
             val emittedCount = java.util.concurrent.atomic.AtomicInteger(0)
 
             suspend fun processSource(src: JsonNode) {
