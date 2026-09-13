@@ -47,6 +47,7 @@ subprojects {
             "witanime" -> "com.witanime"
             "vxrux" -> "com.vxrux"
             "kawaii" -> "com.kawaii"
+            "animerift" -> "com.animerift"
             else -> "com.witanime"
         }
         defaultConfig {
