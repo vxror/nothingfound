@@ -154,14 +154,13 @@ class AnimeRift : MainAPI() {
             }
         }
 
-        // FIX: java.io.tmpdir is not writable on Android. Try AcraApplication
-        // context first (CloudStream's Application class), then CommonActivity,
-        // then a private File fallback.
+        // AcraApplication was renamed to CloudStreamApp. Try the new class first,
+        // then CommonActivity, then tmpdir fallback.
         private fun getCacheFile(): File {
             val dir = runCatching {
-                com.lagradost.cloudstream3.AcraApplication.context?.cacheDir
+                CloudStreamApp.context?.cacheDir
             }.getOrNull() ?: runCatching {
-                com.lagradost.cloudstream3.CommonActivity.activity?.cacheDir
+                CommonActivity.activity?.cacheDir
             }.getOrNull() ?: File(System.getProperty("java.io.tmpdir") ?: ".")
             return File(dir, "anime_rift_session_store.json")
         }
