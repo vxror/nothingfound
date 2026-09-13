@@ -1,7 +1,7 @@
 version = 1
 
 cloudstream {
-    description = "Change my ip"
+    description = "Use VPN"
     authors = listOf("Abodabodd")
     language = "ar"
 
