@@ -53,10 +53,11 @@ jobs:
       - name: Copy All Extensions
         run: |
           mkdir -p build
-          rm -f build/Animewitcher.cs3 build/witanime.cs3 build/vxrux.cs3 build/Kawaii.cs3
+          rm -f build/Animewitcher.cs3 build/witanime.cs3 build/vxrux.cs3 build/Kawaii.cs3 build/AnimeRift.cs3
           cp Animewitcher/build/*.cs3 build/Animewitcher.cs3 2>/dev/null || true
           cp witanime/build/*.cs3 build/witanime.cs3 2>/dev/null || true
           cp kawaii/build/*.cs3 build/Kawaii.cs3 2>/dev/null || true
+          cp animerift/build/*.cs3 build/AnimeRift.cs3 2>/dev/null || true
           ls -la build/
       - name: Update plugins.json
         run: |
