@@ -94,7 +94,7 @@ class AnimeRift : MainAPI() {
     private data class PrefetchedLink(val name: String, val url: String, val quality: String, val headers: Map<String, String>)
     private data class PrefetchedBundle(val links: List<PrefetchedLink>, val subs: List<SubtitleFile>, val createdAt: Long)
     private val prefetchCache = java.util.concurrent.ConcurrentHashMap<String, PrefetchedBundle>()
-    @java.lang.Volatile private var episodeOrder: List<String> = emptyList()
+    @kotlin.jvm.Volatile private var episodeOrder: List<String> = emptyList()
 
     private val mapper = ObjectMapper()
 
