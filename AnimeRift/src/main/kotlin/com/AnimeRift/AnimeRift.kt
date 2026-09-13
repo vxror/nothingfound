@@ -1,4 +1,4 @@
-package com.animerift
+package com.AnimeRift
 
 import android.util.Base64
 import android.util.Log
