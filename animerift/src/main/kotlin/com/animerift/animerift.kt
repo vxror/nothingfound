@@ -778,6 +778,8 @@ class AnimeRift : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        Log.d(TAG, "getMainPage ENTER page=$page cooldown=${isCoolingDown()} hasIdentity=${!fid.isNullOrEmpty()}")
+
         if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
 
         ensureInitialized()
@@ -808,6 +810,8 @@ class AnimeRift : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse>? = search(query, 1)?.items
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
+        Log.d(TAG, "search ENTER query=$query page=$page")
+
         ensureInitialized()
         val apiPage = (page - 1).coerceAtLeast(0)
         val url = "$apiBase/library/search?page=$apiPage&sort_by=release_year&sort_direction=1&text_direction=jp"
@@ -840,6 +844,8 @@ class AnimeRift : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        Log.d(TAG, "load ENTER url=$url cooldown=${isCoolingDown()}")
+
         ensureInitialized()
         val animeId = url.substringAfterLast("/")
         val json = apiCall("$apiBase/library/details/$animeId", "ANIME.LIBRARY.DETAILS")
@@ -1022,8 +1028,6 @@ class AnimeRift : MainAPI() {
                 )
                 val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
 
-                // ads claim is off the critical path — server accepts it blind,
-                // no reason to make playback wait for it
                 prefetchScope.launch {
                     try {
                         apiCall(
@@ -1160,8 +1164,13 @@ class AnimeRift : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        Log.d(TAG, "loadLinks ENTER data=$data cooldown=${isCoolingDown()} hasIdentity=${!fid.isNullOrEmpty()}")
+
         val parts = data.split('|')
-        if (parts.size < 2) return@withContext false
+        if (parts.size < 2) {
+            Log.e(TAG, "loadLinks ABORT bad data: $data")
+            return@withContext false
+        }
         val animeId = parts[0]
         val episodeId = parts[1]
         val episodeNumber = parts.getOrNull(2)?.toIntOrNull() ?: 1
@@ -1200,8 +1209,10 @@ class AnimeRift : MainAPI() {
                 episodeOrder.getOrNull(idx + 1)?.let { warmPrefetch(listOf(it)) }
             }
 
+            Log.d(TAG, "loadLinks EXIT emitted=${emitted.get()}")
             return@withContext emitted.get() > 0
         } catch (e: CancellationException) {
+            Log.d(TAG, "loadLinks CANCELLED emitted=${emitted.get()}")
             throw e
         } catch (e: Exception) {
             logErr("loadLinks", e)
