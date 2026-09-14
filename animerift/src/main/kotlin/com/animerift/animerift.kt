@@ -55,7 +55,8 @@ class AnimeRift : MainAPI() {
         private var consecutiveAuthFailures = 0
         private var lastRequestAt = 0L
 
-        // [r0x] pacing + reinit serialization
+        // [r0x] pacing serialization — fixes the race that let parallel calls
+        // fire simultaneously. floor + jitter keeps spacing non-metronomic.
         private const val MIN_REQUEST_GAP_MS = 300L
         private val pacingMutex = Mutex()
         private val reinitMutex = Mutex()
@@ -318,9 +319,8 @@ class AnimeRift : MainAPI() {
         ensureInitialized()
 
         // [r0x] pacing — serialized via mutex (the old check raced under parallel
-        // loadLinks and let calls fire simultaneously), floor raised to 300ms,
-        // ±120ms jitter so spacing isn't metronomic. request volume per play is
-        // now ~1/7 of the old shape, so this is fewer AND better-spaced requests.
+        // loadLinks and let calls fire simultaneously), floor 300ms, ±120ms jitter
+        // so spacing isn't metronomic. same request count as before, human-shaped.
         pacingMutex.withLock {
             val since = System.currentTimeMillis() - lastRequestAt
             if (since >= 0 && since < MIN_REQUEST_GAP_MS) {
@@ -598,45 +598,12 @@ class AnimeRift : MainAPI() {
             val emitted = java.util.concurrent.atomic.AtomicInteger(0)
             val seenUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-            // [r0x] ONE can_play + ONE claim per episode — exactly the real app's play
-            // flow (capture order: can_play → claim → direct_link). the server issues
-            // a session-scoped sessionId (captures show the SAME id returned for
-            // different hostIds), so one fetch covers every server. if a server ever
-            // rejects the shared id, the per-item fallback below recovers silently.
-            val firstItem = sortedItems.firstOrNull()
-            val firstHostId = firstItem?.get("_id")?.asText()
-            val sessionRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
-            if (firstHostId != null) {
-                try {
-                    val canPlayJson = apiCall(
-                        "$baseUrl/library/episode/source/can_play",
-                        "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
-                        method = "POST",
-                        body = mapOf("episodeId" to episodeId, "hostId" to firstHostId, "is_download" to false, "event_name" to "play_episode_unlocked")
-                    )
-                    sessionRef.set(canPlayJson.get("sessionId")?.asText())
-                } catch (_: Exception) {}
-                try {
-                    // [r0x] payload now byte-matches the captured app claim
-                    apiCall(
-                        "$baseUrl/ads_manager/claim", "USER.ADS_MANAGER.CLAIMS", method = "PUT",
-                        body = mapOf(
-                            "event_name" to "support_us_with_rewards_unlocked",
-                            "hostId" to firstHostId,
-                            "episodeId" to episodeId,
-                            "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
-                            "reward_result" to "not_filled",
-                            "streamingServerKey" to (firstItem?.get("provider")?.asText() ?: ""),
-                            "is_optional" to true,
-                            "is_reward" to true
-                        )
-                    )
-                } catch (_: Exception) {}
-            }
-
             // PARALLEL servers — wall-time = slowest provider, not the sum.
             // pacing still applies globally via apiCall's throttle, so requests
             // stay spaced; they just don't queue behind each other's waits.
+            // [r0x] per-server handshake restored: every host gets its own can_play
+            // before direct_link — the server unlocks direct_link per host. do not
+            // share one can_play across servers (tested — everything else disappears).
             supervisorScope {
                 sortedItems.map { src ->
                     async(Dispatchers.IO) {
@@ -652,34 +619,35 @@ class AnimeRift : MainAPI() {
 
                         for (quality in qualitiesList) {
                             try {
-                                var sessionId = sessionRef.get() ?: ""
-                                var dlJson: JsonNode? = null
-                                try {
-                                    dlJson = apiCall(
-                                        "$baseUrl/library/episode/source/direct_link",
-                                        "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK", method = "POST",
-                                        body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId)
+                                val canPlayJson = apiCall(
+                                    "$baseUrl/library/episode/source/can_play",
+                                    "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
+                                    method = "POST",
+                                    body = mapOf(
+                                        "episodeId" to episodeId, "hostId" to hostId,
+                                        "is_download" to false, "event_name" to "play_episode_unlocked"
                                     )
-                                } catch (first: Exception) {
-                                    // [r0x] shared sessionId rejected → refresh for this host, retry once
-                                    try {
-                                        val cp = apiCall(
-                                            "$baseUrl/library/episode/source/can_play",
-                                            "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY", method = "POST",
-                                            body = mapOf("episodeId" to episodeId, "hostId" to hostId, "is_download" to false, "event_name" to "play_episode_unlocked")
+                                )
+                                val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
+
+                                try {
+                                    apiCall(
+                                        "$baseUrl/ads_manager/claim", "USER.ADS_MANAGER.CLAIMS", method = "PUT",
+                                        body = mapOf(
+                                            "event_name" to "play_episode_unlocked", "hostId" to hostId,
+                                            "episodeId" to episodeId,
+                                            "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
+                                            "reward_result" to "not_filled", "streamingServerKey" to provider,
+                                            "is_optional" to false, "is_reward" to true
                                         )
-                                        val fresh = cp.get("sessionId")?.asText() ?: ""
-                                        if (fresh.isNotEmpty()) { sessionRef.set(fresh); sessionId = fresh }
-                                        dlJson = apiCall(
-                                            "$baseUrl/library/episode/source/direct_link",
-                                            "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK", method = "POST",
-                                            body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId)
-                                        )
-                                    } catch (_: Exception) {
-                                        throw first
-                                    }
-                                }
-                                val directLinkJson = dlJson ?: throw Exception("direct_link failed for $serverName/$quality")
+                                    )
+                                } catch (_: Exception) {}
+
+                                val directLinkJson = apiCall(
+                                    "$baseUrl/library/episode/source/direct_link",
+                                    "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK", method = "POST",
+                                    body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId)
+                                )
 
                                 directLinkJson.get("tracks")?.forEach { track ->
                                     val trackUrl = track.get("file")?.asText() ?: track.get("url")?.asText()
@@ -802,58 +770,35 @@ class AnimeRift : MainAPI() {
         } catch (_: Exception) { return }
         val items = sourcesJson.get("items") ?: return
 
-        // [r0x] one can_play + one claim for the whole prefetch — session-scoped
-        // sessionId, same as loadLinks. per-item fallback keeps it robust.
-        var sessionId = ""
-        val firstHostId = items.firstOrNull()?.get("_id")?.asText()
-        if (firstHostId != null) {
-            try {
-                sessionId = apiCall(
-                    "$baseUrl/library/episode/source/can_play", "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
-                    method = "POST",
-                    body = mapOf("episodeId" to episodeId, "hostId" to firstHostId, "is_download" to false, "event_name" to "play_episode_unlocked")
-                ).get("sessionId")?.asText() ?: ""
-            } catch (_: Exception) {}
-            try {
-                apiCall("$baseUrl/ads_manager/claim", "USER.ADS_MANAGER.CLAIMS", method = "PUT",
-                    body = mapOf(
-                        "event_name" to "support_us_with_rewards_unlocked", "hostId" to firstHostId, "episodeId" to episodeId,
-                        "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
-                        "reward_result" to "not_filled", "streamingServerKey" to (items.firstOrNull()?.get("provider")?.asText() ?: ""),
-                        "is_optional" to true, "is_reward" to true
-                    ))
-            } catch (_: Exception) {}
-        }
-
         items.take(4).forEach { src ->
             try {
                 val hostId = src.get("_id")?.asText() ?: return@forEach
                 val serverName = src.get("server_name")?.asText() ?: "Server"
                 val subTitle = src.get("sub_title")?.asText() ?: ""
+                val provider = src.get("provider")?.asText() ?: ""
                 val qualitiesNode = src.get("qualities")
                 val quality = if (qualitiesNode != null && qualitiesNode.size() > 0) qualitiesNode.get(0).asText() else "720P"
 
-                var dlJson: JsonNode? = null
+                val canPlayJson = apiCall(
+                    "$baseUrl/library/episode/source/can_play", "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
+                    method = "POST",
+                    body = mapOf("episodeId" to episodeId, "hostId" to hostId, "is_download" to false, "event_name" to "play_episode_unlocked")
+                )
+                val sessionId = canPlayJson.get("sessionId")?.asText() ?: ""
+
                 try {
-                    dlJson = apiCall("$baseUrl/library/episode/source/direct_link", "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
-                        method = "POST",
-                        body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId))
-                } catch (_: Exception) {
-                    // [r0x] shared sessionId rejected → refresh for this host, retry once
-                    if (sessionId.isNotEmpty()) {
-                        try {
-                            sessionId = apiCall(
-                                "$baseUrl/library/episode/source/can_play", "ANIME.LIBRARY.EPISODES.SOURCES.CHECK_AVAILABILITY",
-                                method = "POST",
-                                body = mapOf("episodeId" to episodeId, "hostId" to hostId, "is_download" to false, "event_name" to "play_episode_unlocked")
-                            ).get("sessionId")?.asText() ?: sessionId
-                            dlJson = apiCall("$baseUrl/library/episode/source/direct_link", "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
-                                method = "POST",
-                                body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId))
-                        } catch (_: Exception) {}
-                    }
-                }
-                val dl = dlJson ?: return@forEach
+                    apiCall("$baseUrl/ads_manager/claim", "USER.ADS_MANAGER.CLAIMS", method = "PUT",
+                        body = mapOf(
+                            "event_name" to "play_episode_unlocked", "hostId" to hostId, "episodeId" to episodeId,
+                            "transactionRef" to "${System.currentTimeMillis()}_${Random().nextInt(99999999)}",
+                            "reward_result" to "not_filled", "streamingServerKey" to provider,
+                            "is_optional" to false, "is_reward" to true
+                        ))
+                } catch (_: Exception) {}
+
+                val dl = apiCall("$baseUrl/library/episode/source/direct_link", "ANIME.LIBRARY.EPISODES.SOURCES.DIRECT_LINK",
+                    method = "POST",
+                    body = mapOf("id" to hostId, "quality" to quality, "with_internal_player" to "1", "sessionId" to sessionId))
 
                 dl.get("tracks")?.forEach { track ->
                     val u = track.get("file")?.asText() ?: track.get("url")?.asText()
