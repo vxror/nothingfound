@@ -68,11 +68,11 @@
     "tvTypes": [
       "Anime"
     ],
-    "version": 22,
+    "version": 23,
     "internalName": "AnimeRift",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/AnimeRift.cs3",
     "name": "AnimeRift",
-    "fileSize": 53100,
-    "fileHash": "sha256-6436d80fc11c43a27d837762d0bc4db69e23408b6e117ed1b66c4a7fa9dba89a"
+    "fileSize": 49029,
+    "fileHash": "sha256-f6a7aa9c49bd9b36a6cf2fdabb877f40c381e42fb89ae0777f5cfeb384e43133"
   }
 ]
