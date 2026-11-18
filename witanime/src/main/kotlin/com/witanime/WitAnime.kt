@@ -34,13 +34,11 @@ class WitAnime : MainAPI() {
         private const val STORE_FILE = "wita_link_cache.json"
 
         private class CachedLinks(val links: List<ExtractorLink>, val subs: List<SubtitleFile>, val ts: Long)
-
         private val linkCache = ConcurrentHashMap<String, CachedLinks>()
         private val inFlight = ConcurrentHashMap<String, Job>()
         private val nextEpMap = ConcurrentHashMap<String, String>()
         private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val persistMutex = Mutex()
-
         @Volatile private var storeLoaded = false
         @Volatile private var diskCtx: Context? = null
 
@@ -129,8 +127,7 @@ class WitAnime : MainAPI() {
 
         private fun putCache(url: String, links: List<ExtractorLink>, subs: List<SubtitleFile>) {
             linkCache[url] = CachedLinks(links, subs, System.currentTimeMillis())
-            trimCache()
-            persistStoreAsync()
+            trimCache(); persistStoreAsync()
         }
 
         private fun deliverCached(url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
@@ -146,35 +143,30 @@ class WitAnime : MainAPI() {
         }
 
         private fun qualityRank(q: String): Int = when (q.uppercase().trim()) {
-            "4K", "2160P" -> 400
-            "FHD", "1080P" -> 300
-            "HD", "720P" -> 200
-            "SD", "480P" -> 100
-            else -> 50
+            "4K", "2160P" -> 400; "FHD", "1080P" -> 300; "HD", "720P" -> 200; "SD", "480P" -> 100; else -> 50
         }
     }
 
     @Volatile private var cfMode = false
     private fun ua(): String = if (cfMode) (WitaWeb.webUa ?: EXTRACTOR_UA) else EXTRACTOR_UA
 
-    init {
-        WitaWeb.warmup()
-        bgScope.launch { ensureStoreLoaded() }
-    }
+    init { WitaWeb.warmup(); bgScope.launch { ensureStoreLoaded() } }
+
+    private fun docHeaders(referer: String?): Map<String, String> = mapOf(
+        "User-Agent" to ua(),
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-User" to "?1", "Sec-Fetch-Site" to (if (referer != null) "same-origin" else "none")
+    )
 
     private suspend fun siteHtml(url: String, silent: Boolean = false): String? {
-        val headers = mapOf(
-            "User-Agent" to ua(),
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
-            "Upgrade-Insecure-Requests" to "1",
-        )
-        val body = withTimeoutOrNull(15_000L) { sessionGet(url, referer = "$mainUrl/", headers = headers) }
+        val body = withContext(Dispatchers.IO) { sessionGet(url, referer = "$mainUrl/", headers = docHeaders("$mainUrl/")) }
         if (body != null && body.isNotBlank() && !WitaWeb.looksChallenge(body)) { cfMode = false; return body }
         WitaLog.d("[$url] challenge → WebView render")
         val rendered = WitaWeb.fetchHtml(url, silent) ?: return null
-        cfMode = true
-        injectWebViewCookies(url)
+        cfMode = true; injectWebViewCookies(url)
         return rendered
     }
 
@@ -195,9 +187,7 @@ class WitAnime : MainAPI() {
 
     private fun cleanLinkName(name: String): String = name
         .replace(Regex("""(?i)\b(4k|2160p|1440p|1080p|720p|480p|360p|240p|fhd|hd|sd)\b"""), "")
-        .replace(Regex("""\(\s*\)"""), "")
-        .replace(Regex("""\s{2,}"""), " ")
-        .trim()
+        .replace(Regex("""\(\s*\)"""), "").replace(Regex("""\s{2,}"""), " ").trim()
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = fetchDoc(mainUrl)
@@ -207,14 +197,11 @@ class WitAnime : MainAPI() {
             val items = section.select("a[href*='/watch/'], a[href*='/anime/'], a[href*='/movie/']").mapNotNull { card ->
                 val href = card.attr("href")
                 if (!href.contains("/watch/") && !href.contains("/anime/") && !href.contains("/movie/")) return@mapNotNull null
-                val name = card.selectFirst("h3")?.text()?.trim()
-                    ?: card.attr("title").ifBlank { null }
-                    ?: card.selectFirst("img")?.attr("alt")?.ifBlank { null }
-                    ?: return@mapNotNull null
+                val name = card.selectFirst("h3")?.text()?.trim() ?: card.attr("title").ifBlank { null }
+                    ?: card.selectFirst("img")?.attr("alt")?.ifBlank { null } ?: return@mapNotNull null
                 val epText = card.selectFirst("div:contains(الحلقة)")?.text()?.trim()
                 val finalTitle = if (!epText.isNullOrEmpty() && !name.contains("الحلقة")) "$name - $epText" else name
-                val isMovie = href.contains("/movie/")
-                newAnimeSearchResponse(finalTitle, fixUrl(href), if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+                newAnimeSearchResponse(finalTitle, fixUrl(href), if (href.contains("/movie/")) TvType.AnimeMovie else TvType.Anime) {
                     posterUrl = smartPoster(card.selectFirst("img")?.attr("src"))
                 }
             }.distinctBy { it.url }
@@ -223,9 +210,8 @@ class WitAnime : MainAPI() {
         document.selectFirst("aside")?.let { aside ->
             val asideTitle = aside.selectFirst("h2")?.text()?.trim() ?: "أشهر أنميات الموسم"
             val asideItems = aside.select("a[href*='/anime/']").mapNotNull { item ->
-                val href = item.attr("href")
                 val name = item.selectFirst("span[dir='ltr']")?.text()?.trim() ?: return@mapNotNull null
-                newAnimeSearchResponse(name, fixUrl(href), TvType.Anime) {
+                newAnimeSearchResponse(name, fixUrl(item.attr("href")), TvType.Anime) {
                     posterUrl = smartPoster(item.selectFirst("img")?.attr("src"))
                 }
             }.distinctBy { it.url }
@@ -240,8 +226,7 @@ class WitAnime : MainAPI() {
         return document.select("div.grid a[href*='/anime/'], div.grid a[href*='/movie/']").mapNotNull { card ->
             val href = card.attr("href")
             val title = card.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
-            val isMovie = href.contains("/movie/")
-            newAnimeSearchResponse(title, fixUrl(href), if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+            newAnimeSearchResponse(title, fixUrl(href), if (href.contains("/movie/")) TvType.AnimeMovie else TvType.Anime) {
                 posterUrl = smartPoster(card.selectFirst("img")?.attr("src"))
             }
         }.distinctBy { it.url }
@@ -252,8 +237,7 @@ class WitAnime : MainAPI() {
         val title = document.selectFirst("h1 span[dir='ltr']")?.text()?.trim()
             ?: document.selectFirst("h1")?.text()?.trim()
             ?: document.selectFirst("meta[property='og:title']")?.attr("content")
-                ?.replace("مترجم", "")?.replace("اون لاين", "")?.replace("فيلم", "")?.replace("انمي", "")?.trim()
-            ?: ""
+                ?.replace("مترجم", "")?.replace("اون لاين", "")?.replace("فيلم", "")?.replace("انمي", "")?.trim() ?: ""
         val poster = document.selectFirst("img[src*='/posters/']")?.attr("src")
             ?: document.selectFirst("div.shrink-0 img")?.attr("src")
             ?: document.selectFirst("meta[property='og:image']")?.attr("content")
@@ -262,7 +246,6 @@ class WitAnime : MainAPI() {
         val isMovie = url.contains("/movie/")
         val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
         val genres = document.select("div.flex-wrap.gap-2 span.rounded-full").map { it.text().trim() }.filter { it.isNotEmpty() }
-
         var year: Int? = null
         var status = ShowStatus.Completed
         if (document.selectFirst("span:contains(مستمر)") != null) status = ShowStatus.Ongoing
@@ -283,15 +266,12 @@ class WitAnime : MainAPI() {
                 val epNum = Regex("""/(\d+)$""").find(epHref)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("""\d+""").find(epTag.text())?.value?.toIntOrNull()
                 episodes.add(newEpisode(fixUrl(epHref)) {
-                    this.name = "الحلقة ${epNum ?: ""}".trim()
-                    this.episode = epNum
-                    this.posterUrl = smartPoster(poster)
+                    this.name = "الحلقة ${epNum ?: ""}".trim(); this.episode = epNum; this.posterUrl = smartPoster(poster)
                 })
             }
             episodes.sortBy { it.episode ?: Int.MAX_VALUE }
         }
         val distinct = episodes.distinctBy { it.data }
-
         val epUrls = distinct.map { it.data }
         var changed = false
         for (i in epUrls.indices) {
@@ -305,12 +285,8 @@ class WitAnime : MainAPI() {
 
         WitaLog.d("loaded '$title' episodes=${distinct.size}")
         return newAnimeLoadResponse(title, url, tvType) {
-            this.posterUrl = smartPoster(poster)
-            this.plot = description
-            this.tags = genres
-            this.year = year
-            this.showStatus = status
-            this.score = rating?.let { Score.from10(it) }
+            this.posterUrl = smartPoster(poster); this.plot = description; this.tags = genres
+            this.year = year; this.showStatus = status; this.score = rating?.let { Score.from10(it) }
             addEpisodes(DubStatus.Subbed, distinct)
         }
     }
@@ -335,8 +311,7 @@ class WitAnime : MainAPI() {
     private fun schedulePrefetch(currentUrl: String, forceFirst: String? = null) {
         if (inFlight.size > 6) return
         val next = forceFirst ?: nextEpMap[currentUrl] ?: return
-        prefetchOne(next)
-        nextEpMap[next]?.let { prefetchOne(it) }
+        prefetchOne(next); nextEpMap[next]?.let { prefetchOne(it) }
     }
 
     private fun prefetchOne(epUrl: String) {
@@ -361,14 +336,9 @@ class WitAnime : MainAPI() {
     private data class GateResult(val success: Boolean, val isRateLimited: Boolean, val remaining: Int = -1, val embedUrl: String? = null)
 
     private fun gateHeaders(csrf: String, watchUrl: String): Map<String, String> = mapOf(
-        "User-Agent" to ua(),
-        "Accept" to "application/json",
-        "X-CSRF-TOKEN" to csrf,
-        "Origin" to mainUrl,
-        "Referer" to watchUrl,
-        "Sec-Fetch-Site" to "same-origin",
-        "Sec-Fetch-Mode" to "cors",
-        "Sec-Fetch-Dest" to "empty",
+        "User-Agent" to ua(), "Accept" to "application/json", "X-CSRF-TOKEN" to csrf,
+        "Origin" to mainUrl, "Referer" to watchUrl,
+        "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty"
     )
 
     private fun unlockGate(s: ServerItem, csrf: String, watchUrl: String): GateResult {
@@ -380,11 +350,11 @@ class WitAnime : MainAPI() {
                 var refPolicy = "no-referrer"
                 val sReq = Request.Builder().url("$mainUrl/watch/stream-source/$encoded").post(empty)
                     .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
-                sessionClient.newCall(sReq).execute().use { r ->
+                engineClient.newCall(sReq).execute().use { r ->
                     val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
                     if (r.code == 429) return GateResult(false, true, rem)
                     val b = r.body?.string().orEmpty()
-                    if (!r.isSuccessful) return GateResult(false, false, rem)
+                    if (!r.isSuccessful) { WitaLog.d("[${s.label}] stream-source ${r.code}"); return GateResult(false, false, rem) }
                     runCatching { JSONObject(b) }.getOrNull()?.let { j ->
                         j.optString("gateUrl").takeIf { it.isNotBlank() }?.let { gatePath = it }
                         j.optString("referrerPolicy").takeIf { it.isNotBlank() }?.let { refPolicy = it }
@@ -395,12 +365,10 @@ class WitAnime : MainAPI() {
                     .header("User-Agent", ua())
                     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
                     .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
-                    .header("Sec-Fetch-Site", "same-origin")
-                    .header("Sec-Fetch-Mode", "navigate")
-                    .header("Sec-Fetch-Dest", "iframe")
-                    .header("Upgrade-Insecure-Requests", "1")
+                    .header("Sec-Fetch-Site", "same-origin").header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Dest", "iframe").header("Upgrade-Insecure-Requests", "1")
                 if (refPolicy.equals("origin", true)) gb.header("Referer", "$mainUrl/")
-                noRedirectSessionClient.newCall(gb.build()).execute().use { r ->
+                noRedirectEngineClient.newCall(gb.build()).execute().use { r ->
                     val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
                     if (r.code == 429) return GateResult(false, true, rem)
                     var embed = r.header("Location")
@@ -416,21 +384,18 @@ class WitAnime : MainAPI() {
             } else {
                 val sReq = Request.Builder().url("$mainUrl/watch/download-source/$encoded").post(empty)
                     .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
-                sessionClient.newCall(sReq).execute().use { r ->
+                engineClient.newCall(sReq).execute().use { r ->
                     val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
                     if (r.code == 429) return GateResult(false, true, rem)
-                    if (!r.isSuccessful) return GateResult(false, false, rem)
+                    if (!r.isSuccessful) { WitaLog.d("[${s.label}] download-source ${r.code}"); return GateResult(false, false, rem) }
                 }
                 val gReq = Request.Builder().url("$mainUrl/watch/download-gate/$encoded").get()
                     .header("User-Agent", ua())
                     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .header("Referer", watchUrl)
-                    .header("Sec-Fetch-Site", "same-origin")
-                    .header("Sec-Fetch-Mode", "navigate")
-                    .header("Sec-Fetch-Dest", "document")
-                    .header("Upgrade-Insecure-Requests", "1")
-                    .build()
-                noRedirectSessionClient.newCall(gReq).execute().use { r ->
+                    .header("Sec-Fetch-Site", "same-origin").header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Dest", "document").header("Upgrade-Insecure-Requests", "1").build()
+                noRedirectEngineClient.newCall(gReq).execute().use { r ->
                     val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
                     if (r.code == 429) return GateResult(false, true, rem)
                     val loc = r.header("Location")
@@ -438,8 +403,12 @@ class WitAnime : MainAPI() {
                 }
             }
             GateResult(false, false)
-        } catch (_: Exception) { GateResult(false, false) }
+        } catch (e: Exception) { WitaLog.d("gate error: ${e.message}"); GateResult(false, false) }
     }
+
+    private fun extractCsrf(html: String): String? =
+        Regex("""name=['"]csrf-token['"]\s+content=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+            ?: Regex("""data-csrf=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
 
     private suspend fun extractLinks(
         data: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, silent: Boolean = false
@@ -451,23 +420,55 @@ class WitAnime : MainAPI() {
         }
         return try {
             val watchUrl = fixUrl(data.substringBefore('?').trimEnd('/'))
-            val html = siteHtml(watchUrl, silent) ?: run { WitaLog.d("watch page EMPTY"); return emptyList() }
-            val csrf = Regex("""name=['"]csrf-token['"]\s+content=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
-                ?: Regex("""data-csrf=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
-                ?: run { WitaLog.e("no CSRF token"); return emptyList() }
-            val rawSources = Regex("""sourcesUrl\s*:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
-                ?.replace("\\/", "/")?.trim() ?: "$watchUrl/sources"
+            val pageReq = Request.Builder().url(watchUrl)
+                .apply { docHeaders("$mainUrl/").forEach { (k, v) -> header(k, v) } }.build()
+
+            var finalWatchUrl = watchUrl
+            var pageHtml = withContext(Dispatchers.IO) {
+                try {
+                    engineClient.newCall(pageReq).execute().use { r ->
+                        finalWatchUrl = r.request.url.toString()
+                        WitaLog.d("watch page code=${r.code} url=$finalWatchUrl")
+                        if (r.isSuccessful) r.body?.string() else null
+                    }
+                } catch (e: Exception) { WitaLog.e("watch page error: ${e.message}"); null }
+            }
+            if (pageHtml == null || WitaWeb.looksChallenge(pageHtml)) {
+                pageHtml = WitaWeb.fetchHtml(watchUrl, silent)
+                if (pageHtml != null) { cfMode = true; injectWebViewCookies(finalWatchUrl) }
+            }
+            if (pageHtml.isNullOrBlank()) { WitaLog.e("watch page EMPTY"); return emptyList() }
+
+            var csrf = extractCsrf(pageHtml) ?: run { WitaLog.e("no CSRF token"); return emptyList() }
+            val rawSources = Regex("""sourcesUrl\s*:\s*['"]([^'"]+)['"]""").find(pageHtml)?.groupValues?.get(1)
+                ?.replace("\\/", "/")?.trim() ?: "$finalWatchUrl/sources"
             val sourcesUrl = fixUrl(rawSources)
             WitaLog.d("sources → $sourcesUrl")
 
-            delay(300)
-            val sourcesJson = withContext(Dispatchers.IO) {
+            suspend fun postSources(token: String): String? = withContext(Dispatchers.IO) {
                 try {
                     val req = Request.Builder().url(sourcesUrl).post(ByteArray(0).toRequestBody(null))
-                        .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
-                    sessionClient.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
-                } catch (_: Exception) { null }
-            } ?: run { WitaLog.e("sources POST failed"); return emptyList() }
+                        .apply { gateHeaders(token, finalWatchUrl).forEach { (k, v) -> header(k, v) } }.build()
+                    engineClient.newCall(req).execute().use { r ->
+                        val b = r.body?.string().orEmpty()
+                        WitaLog.d("sources POST code=${r.code} len=${b.length}")
+                        if (r.isSuccessful) b else { WitaLog.e("sources POST ${r.code}: ${b.take(160)}"); null }
+                    }
+                } catch (e: Exception) { WitaLog.e("sources POST exception: ${e.message}"); null }
+            }
+
+            delay(300)
+            var sourcesJson = postSources(csrf)
+            if (sourcesJson == null) {
+                // session may be stale → refresh page (new cookies+csrf) and retry once
+                WitaLog.d("sources failed → refreshing session once")
+                val refresh = withContext(Dispatchers.IO) {
+                    try { engineClient.newCall(pageReq).execute().use { it.body?.string() } } catch (_: Exception) { null }
+                }
+                val c2 = refresh?.let { extractCsrf(it) }
+                if (c2 != null) { csrf = c2; delay(500); sourcesJson = postSources(csrf) }
+            }
+            if (sourcesJson == null) { WitaLog.e("sources POST failed (after retry)"); return emptyList() }
 
             val root = try { JSONObject(sourcesJson) } catch (_: Exception) { return emptyList() }
             val allServers = mutableListOf<ServerItem>()
@@ -527,11 +528,8 @@ class WitAnime : MainAPI() {
                 var quotaDead = false
                 for ((idx, server) in servers.withIndex()) {
                     if (quotaDead) break
-                    val gate = withContext(Dispatchers.IO) { unlockGate(server, csrf, watchUrl) }
-                    if (gate.isRateLimited || gate.remaining == 0) {
-                        WitaLog.d("[${server.label}] gate quota reached — stopping")
-                        quotaDead = true
-                    }
+                    val gate = withContext(Dispatchers.IO) { unlockGate(server, csrf, finalWatchUrl) }
+                    if (gate.isRateLimited || gate.remaining == 0) { WitaLog.d("[${server.label}] quota reached"); quotaDead = true }
                     val embed = gate.embedUrl
                     if (gate.success && !embed.isNullOrBlank()) {
                         WitaLog.d("[${server.label} | ${server.quality}] → $embed")
@@ -539,7 +537,7 @@ class WitAnime : MainAPI() {
                             semaphore.withPermit {
                                 val budget = if (embed.contains("yonaplay")) 75_000L else 25_000L
                                 withTimeoutOrNull(budget) {
-                                    routeLink(embed, watchUrl, subtitleCallback, mkAt(idx, idx * 1000L), server.quality.uppercase())
+                                    routeLink(embed, finalWatchUrl, subtitleCallback, mkAt(idx, idx * 1000L), server.quality.uppercase())
                                 } ?: WitaLog.d("[${server.label}] TIMEOUT")
                             }
                         })
@@ -600,7 +598,6 @@ class WitAnime : MainAPI() {
             val origin = hostOf(yonaplayUrl)
             var html = withTimeoutOrNull(12_000L) { sessionGet(yonaplayUrl, referer = "$mainUrl/") } ?: return false
             if (WitaWeb.looksChallenge(html)) html = siteHtml(yonaplayUrl) ?: return false
-
             var code = ""; var embedToken = ""; var pageKey = ""
             Regex("""window\._E\s*=\s*(\{[^;]+?\})""").find(html)?.groupValues?.get(1)?.let { raw ->
                 runCatching { JSONObject(raw) }.getOrNull()?.let {
@@ -617,14 +614,11 @@ class WitAnime : MainAPI() {
             }
             if (code.isEmpty() || pageKey.isEmpty()) return false
             if (embedToken.isNotEmpty()) apiHeaders["X-Embed-Token"] = embedToken
-
             val srcRaw = withTimeoutOrNull(10_000L) {
                 sessionPost("$origin/api/sources.php", JSONObject().put("code", code).toString(), referer = yonaplayUrl, headers = apiHeaders)
             } ?: return false
             val qualities = runCatching { JSONObject(srcRaw).optJSONObject("qualities") }.getOrNull() ?: return false
-
-            var idx = 0L
-            var any = false
+            var idx = 0L; var any = false
             for (qKey in listOf("4k", "fhd", "hd", "sd")) {
                 val group = qualities.optJSONObject(qKey) ?: continue
                 val serversArr = group.optJSONArray("servers") ?: continue
@@ -670,9 +664,7 @@ class WitAnime : MainAPI() {
             if (tryYonaApi(yonaplayUrl, subtitleCallback, emitAt)) return
             val html = siteHtml(yonaplayUrl) ?: run { WitaLog.w("Yona fetch failed"); return }
             WitaLog.d("Yona legacy len=${html.length}")
-            val seen = mutableSetOf<String>()
-            var idx = 0L
-
+            val seen = mutableSetOf<String>(); var idx = 0L
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 val myIdx = idx++
                 try {
