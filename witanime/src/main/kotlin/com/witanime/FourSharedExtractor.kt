@@ -3,83 +3,51 @@ package com.witanime
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 
 class FourSharedExtractor : ExtractorApi() {
     override val name = "4Shared"
     override val mainUrl = "https://www.4shared.com"
     override val requiresReferer = false
-
-    /** quality label from the parent server (HD/FHD), set by routeLink */
     var linkLabel: String? = null
 
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val headers = mapOf("User-Agent" to EXTRACTOR_UA)
-            val res = app.get(url, referer = referer, headers = headers)
-            val html = res.text
-            val doc = res.document
-            println("WitAnimeDebug: 4Shared len=${html.length} url=${res.url.take(80)}")
-
-            val link = doc.selectFirst("video source[src]")?.attr("src")?.takeIf { it.startsWith("http") }
+            val fileId = Regex("""4shared\.com/(?:web/embed/file|embed|video|file|s)/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+                .find(url)?.groupValues?.get(1)
+            val pageUrl = if (fileId != null) "$mainUrl/web/embed/file/$fileId" else url
+            val html = sessionGet(pageUrl, referer = "$mainUrl/")
+                ?: app.get(pageUrl, referer = referer, headers = mapOf("User-Agent" to EXTRACTOR_UA)).text
+            val doc = Jsoup.parse(html, pageUrl)
+            val link = doc.selectFirst("video source[src], video[src]")?.attr("src")?.takeIf { it.isNotBlank() }
+                ?.let { if (it.startsWith("//")) "https:$it" else it }?.takeIf { it.startsWith("http") }
+                ?: Regex("""https?://dc\d+\.4shared\.com/[^\s"'<>]+\.mp4[^\s"'<>]*""", RegexOption.IGNORE_CASE).find(html)?.value
                 ?: Regex("""downloadUrl\s*[:=]\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                ?: Regex("""href=["']([^"']*download[^"']*)["']""").find(html)?.groupValues?.get(1)?.let { fixUrl(it) }
                 ?: Regex(""""(https?://[^"]+/(?:download|videoplay)[^"]*)"""").find(html)?.groupValues?.get(1)
-                ?: null
-
-            if (link == null) {
-                println("WitAnimeDebug: 4Shared: no link found, trying download page fallback")
-                tryDownloadPageFallback(url, linkLabel, callback)
-                return
-            }
-
-            val isPlayable = try {
-                app.get(link, headers = headers + mapOf("Range" to "bytes=0-0"), referer = "$mainUrl/").isSuccessful
-            } catch (_: Exception) { false }
-
-            if (!isPlayable) {
-                println("WitAnimeDebug: 4Shared: link not playable, trying fallback")
-                tryDownloadPageFallback(url, linkLabel, callback)
-                return
-            }
-
-            val qName = qualityName(link, linkLabel)
-            callback(newExtractorLink(name, name + (qName?.let { " $it" } ?: ""), link, ExtractorLinkType.VIDEO) {
-                this.referer = "$mainUrl/"
-                quality = bestQuality(link, linkLabel)
-            })
-        } catch (e: Exception) {
-            println("WitAnimeDebug: 4Shared error: ${e.message}")
-        }
+            if (link == null) { tryDownloadPageFallback(pageUrl, callback); return }
+            if (!isPlayable(link, "$mainUrl/")) { tryDownloadPageFallback(pageUrl, callback); return }
+            emitLink(link, "$mainUrl/", callback)
+        } catch (e: Exception) { WitaLog.e("4Shared error: ${e.message}") }
     }
 
-    /** Fallback for large/FHD files that show a download page instead of an embed */
-    private suspend fun tryDownloadPageFallback(
-        originalUrl: String,
-        qLabel: String?,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    private suspend fun emitLink(link: String, ref: String, callback: (ExtractorLink) -> Unit) {
+        val qName = qualityName(link, linkLabel)
+        callback(newExtractorLink(name, name + (qName?.let { " $it" } ?: ""), link, ExtractorLinkType.VIDEO) {
+            this.referer = ref
+            quality = bestQuality(link, linkLabel)
+        })
+    }
+
+    private suspend fun tryDownloadPageFallback(originalUrl: String, callback: (ExtractorLink) -> Unit) {
         try {
-            val dlPageUrl = originalUrl.replace("/embed/", "/file/")
-            val headers = mapOf("User-Agent" to EXTRACTOR_UA)
-            val dlHtml = app.get(dlPageUrl, headers = headers, referer = "$mainUrl/").text
-
+            val dlPageUrl = originalUrl.replace("/embed/", "/file/").replace("/web/embed/file/", "/file/")
+            val dlHtml = sessionGet(dlPageUrl, referer = "$mainUrl/") ?: return
             val dlLink = Regex("""href=["'](https?://[^"']*download[^"']*)["']""").find(dlHtml)?.groupValues?.get(1)
-                ?: Regex(""""(https?://dc\d*\.\d+\.4shared\.com/[^"]+)"""").find(dlHtml)?.groupValues?.get(1)
+                ?: Regex(""""(https?://dc\d*\.[^"]*4shared\.com/[^"]+)"""").find(dlHtml)?.groupValues?.get(1)
                 ?: return
-
-            val isPlayable = try {
-                app.get(dlLink, headers = headers + mapOf("Range" to "bytes=0-0"), referer = dlPageUrl).isSuccessful
-            } catch (_: Exception) { false }
-
-            if (isPlayable) {
-                val qName = qualityName(dlLink, qLabel)
-                callback(newExtractorLink(name, name + (qName?.let { " $it" } ?: ""), dlLink, ExtractorLinkType.VIDEO) {
-                    this.referer = dlPageUrl
-                    quality = bestQuality(dlLink, qLabel)
-                })
-            }
+            if (isPlayable(dlLink, dlPageUrl)) emitLink(dlLink, dlPageUrl, callback)
         } catch (_: Exception) {}
     }
 }
