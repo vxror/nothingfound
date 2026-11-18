@@ -10,16 +10,20 @@ class WitAnimePlugin : Plugin() {
         registerMainAPI(WitAnime())
 
         registerExtractorAPI(VideaExtractor())
+        registerExtractorAPI(VideasExtractor())
         registerExtractorAPI(VideasFrExtractor())
         registerExtractorAPI(MailruExtractor())
         registerExtractorAPI(OkRuExtractor())
         registerExtractorAPI(MegaExtractor())
         registerExtractorAPI(FourSharedExtractor())
         registerExtractorAPI(FileMoonExtractor())
-        registerExtractorAPI(DotPlayExtractor())     // ← NEW
-        registerExtractorAPI(SoraplayExtractor())   // ← NEW
+        registerExtractorAPI(DotPlayExtractor())
+        registerExtractorAPI(SoraplayExtractor())
+        registerExtractorAPI(GoFileExtractor())
+        registerExtractorAPI(GoogleDriveExtractor())
+        registerExtractorAPI(HgCloudExtractor())
+        registerExtractorAPI(VibuxerExtractor())
 
-        // Dood family
         registerExtractorAPI(DoodExtractor())
         registerExtractorAPI(DoodToExtractor())
         registerExtractorAPI(DoodLaExtractor())
@@ -28,37 +32,16 @@ class WitAnimePlugin : Plugin() {
         registerExtractorAPI(Ds2PlayExtractor())
         registerExtractorAPI(D000dExtractor())
 
-        // StreamWish family — extends the app's BUILT-IN proven extractor
-        registerExtractorAPI(Mwish())
-        registerExtractorAPI(Dwish())
-        registerExtractorAPI(Ewish())
-        registerExtractorAPI(WishembedPro())
-        registerExtractorAPI(Kswplayer())
-        registerExtractorAPI(Wishfast())
-        registerExtractorAPI(Streamwish2())
-        registerExtractorAPI(SfastwishCom())
-        registerExtractorAPI(StrwishXyz())
-        registerExtractorAPI(StrwishCom())
-        registerExtractorAPI(FlaswishCom())
-        registerExtractorAPI(Awish())
-        registerExtractorAPI(Obeywish())
-        registerExtractorAPI(Jodwish())
-        registerExtractorAPI(Swhoi())
-        registerExtractorAPI(UqloadsXyz())
-        registerExtractorAPI(CdnwishCom())
-        registerExtractorAPI(Asnwish())
-        registerExtractorAPI(Nekowish())
-        registerExtractorAPI(Nekostream())
-        registerExtractorAPI(Swdyu())
-        registerExtractorAPI(Wishonly())
-        registerExtractorAPI(Playerwish())
-        registerExtractorAPI(StreamHLSTo())
-        registerExtractorAPI(HlsWish())
-        registerExtractorAPI(StreamWishCom())
-        registerExtractorAPI(StreamWishTop())
+        registerExtractorAPI(Mwish()); registerExtractorAPI(Dwish()); registerExtractorAPI(Ewish())
+        registerExtractorAPI(WishembedPro()); registerExtractorAPI(Kswplayer()); registerExtractorAPI(Wishfast())
+        registerExtractorAPI(Streamwish2()); registerExtractorAPI(SfastwishCom()); registerExtractorAPI(StrwishXyz())
+        registerExtractorAPI(StrwishCom()); registerExtractorAPI(FlaswishCom()); registerExtractorAPI(Awish())
+        registerExtractorAPI(Obeywish()); registerExtractorAPI(Jodwish()); registerExtractorAPI(Swhoi())
+        registerExtractorAPI(UqloadsXyz()); registerExtractorAPI(CdnwishCom()); registerExtractorAPI(Asnwish())
+        registerExtractorAPI(Nekowish()); registerExtractorAPI(Nekostream()); registerExtractorAPI(Swdyu())
+        registerExtractorAPI(Wishonly()); registerExtractorAPI(Playerwish()); registerExtractorAPI(StreamHLSTo())
+        registerExtractorAPI(HlsWish()); registerExtractorAPI(StreamWishCom()); registerExtractorAPI(StreamWishTop())
 
-        try { MegaProxy.start() } catch (e: Exception) {
-            println("WitAnimeDebug: MegaProxy start failed: ${e.message}")
-        }
+        try { MegaProxy.start() } catch (e: Exception) { WitaLog.e("MegaProxy start failed: ${e.message}") }
     }
 }
