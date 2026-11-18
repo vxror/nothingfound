@@ -13,10 +13,7 @@ class DotPlayExtractor : ExtractorApi() {
     override val name = "DotPlay"
     override val mainUrl = "https://dotplay.net"
     override val requiresReferer = false
-
     private val cfKiller = CloudflareKiller()
-
-    /** quality label (HD/FHD) from the parent server, set by routeLink */
     var linkLabel: String? = null
 
     override suspend fun getUrl(
@@ -24,124 +21,88 @@ class DotPlayExtractor : ExtractorApi() {
     ) {
         try {
             val code = url.substringAfter("/embed/").substringBefore("/").substringBefore("?")
-            if (code.isBlank()) { println("WitAnimeDebug: DotPlay no code"); return }
-
+            if (code.isBlank()) { WitaLog.d("DotPlay no code"); return }
             val headers = mapOf("User-Agent" to EXTRACTOR_UA)
 
-            // ═══ METHOD 1: embed page (session) → api.php → base64-decoded video_url ═══
             try {
-                app.get(url, headers = headers, referer = referer, interceptor = cfKiller)
+                var embedHtml = sessionGet(url, referer = referer)
+                if (embedHtml == null || WitaWeb.looksChallenge(embedHtml)) {
+                    embedHtml = try { app.get(url, headers = headers, referer = referer, interceptor = cfKiller).text }
+                    catch (_: Exception) { embedHtml ?: "" }
+                }
+                val embedCode = Regex("""window\.embedCode\s*=\s*["']([^"']+)["']""").find(embedHtml)?.groupValues?.get(1) ?: code
+                val embedToken = Regex("""window\.embedToken\s*=\s*["']([^"']+)["']""").find(embedHtml)?.groupValues?.get(1).orEmpty()
+                val apiHeaders = mutableMapOf("Accept" to "application/json")
+                if (embedToken.isNotBlank()) apiHeaders["X-Embed-Token"] = embedToken
 
-                val apiUrl = "$mainUrl/api.php?code=$code"
-                val apiResp = app.get(apiUrl, headers = headers + mapOf("Accept" to "application/json"), referer = url, interceptor = cfKiller)
-                val jsonStr = apiResp.text
-                println("WitAnimeDebug: DotPlay api=${jsonStr.take(250)}")
-
+                val apiUrl = "$mainUrl/api.php?code=$embedCode"
+                var jsonStr = sessionGet(apiUrl, referer = url, headers = apiHeaders)
+                if (jsonStr.isNullOrBlank() || !jsonStr.trimStart().startsWith("{")) {
+                    jsonStr = try { app.get(apiUrl, headers = headers + apiHeaders, referer = url, interceptor = cfKiller).text }
+                    catch (_: Exception) { jsonStr ?: "" }
+                }
                 val json = try { JSONObject(jsonStr) } catch (_: Exception) { null }
-
-                // video_url is BASE64-ENCODED
                 val encodedUrl = json?.optString("video_url", "") ?: ""
                 var videoUrl = ""
                 if (encodedUrl.isNotBlank()) {
-                    try {
+                    videoUrl = try {
                         var fixed = encodedUrl.trim()
                         val pad = fixed.length % 4
                         if (pad != 0) fixed += "=".repeat(4 - pad)
-                        videoUrl = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
-                    } catch (_: Exception) { videoUrl = encodedUrl }
+                        String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                    } catch (_: Exception) { encodedUrl }
                 }
-
-                // fallback: recursive scan + base64 decode every long field
                 if (!videoUrl.startsWith("http")) {
-                    val urls = extractUrlsFromJson(jsonStr).filter {
-                        it.startsWith("http") && !it.contains("dotplay.net") &&
-                        !it.endsWith(".jpg") && !it.endsWith(".png")
-                    }
-                    videoUrl = urls.firstOrNull() ?: ""
+                    videoUrl = extractUrlsFromJson(jsonStr).firstOrNull {
+                        it.startsWith("http") && !it.contains("dotplay.net") && !it.endsWith(".jpg") && !it.endsWith(".png")
+                    } ?: ""
                     if (!videoUrl.startsWith("http") && json != null) {
-                        val encodedCandidates = mutableListOf<String>()
-                        collectEncodedStrings(json, encodedCandidates)
-                        for (enc in encodedCandidates) {
+                        val enc = mutableListOf<String>()
+                        collectEncodedStrings(json, enc)
+                        for (e in enc) {
                             try {
-                                var fixed = enc.trim()
+                                var fixed = e.trim()
                                 val pad = fixed.length % 4
                                 if (pad != 0) fixed += "=".repeat(4 - pad)
-                                val decoded = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
-                                if (decoded.startsWith("http")) { videoUrl = decoded; break }
+                                val d = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
+                                if (d.startsWith("http")) { videoUrl = d; break }
                             } catch (_: Exception) {}
                         }
                     }
                 }
+                if (videoUrl.startsWith("http")) { emitVideo(videoUrl, callback); return }
 
-                if (videoUrl.startsWith("http")) {
-                    emitVideo(videoUrl, callback)
-                    return
-                }
-            } catch (e: Exception) {
-                println("WitAnimeDebug: DotPlay method1 fail: ${e.message}")
-            }
-
-            // ═══ METHOD 2: embed page scan (base64 tokens in HTML) ═══
-            try {
-                val embedHtml = app.get(url, headers = headers, referer = referer, interceptor = cfKiller).text
                 Regex("""[A-Za-z0-9+/=]{40,}""").findAll(embedHtml).map { it.value }.distinct().take(30).forEach { tok ->
                     try {
                         var fixed = tok
                         val pad = fixed.length % 4
                         if (pad != 0) fixed += "=".repeat(4 - pad)
                         val d = String(Base64.decode(fixed, Base64.DEFAULT)).trim()
-                        if (d.startsWith("http")) {
-                            println("WitAnimeDebug: DotPlay b64 -> ${d.take(100)}")
-                            emitVideo(d, callback)
-                            return
-                        }
+                        if (d.startsWith("http")) { emitVideo(d, callback); return }
                     } catch (_: Exception) {}
                 }
                 val combined = "$embedHtml\n${unpackPackedJs(embedHtml) ?: ""}".replace("\\/", "/")
                 val found = Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m3u8)[^\s"'<>\\]*)""").findAll(combined)
                     .map { it.groupValues[1].trimEnd('#') }.distinct().toList()
-                if (found.isNotEmpty()) {
-                    found.forEach { emitVideo(it, callback) }
-                    return
-                }
-            } catch (_: Exception) {}
+                if (found.isNotEmpty()) { found.forEach { emitVideo(it, callback) }; return }
+            } catch (e: Exception) { WitaLog.d("DotPlay method1/2 fail: ${e.message}") }
 
-            // ═══ METHOD 3: WebView (✅ paren fixed) ═══
-            println("WitAnimeDebug: DotPlay trying WebView")
             try {
                 val resolver = WebViewResolver(
                     interceptUrl = Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8|previews\.dropbox"""),
                     additionalUrls = listOf(Regex("""dropboxusercontent|dropbox\.com|\.mp4|\.m3u8|previews\.dropbox""")),
-                    useOkhttp = false,
-                    timeout = 25_000L
+                    useOkhttp = false, timeout = 25_000L
                 )
                 val intercepted = app.get(url, referer = referer, interceptor = resolver).url
-                if (intercepted.isNotEmpty() && intercepted != url) {
-                    println("WitAnimeDebug: DotPlay WV -> ${intercepted.take(100)}")
-                    emitVideo(intercepted, callback)
-                }
-            } catch (e: Exception) {
-                println("WitAnimeDebug: DotPlay WV fail: ${e.message}")
-            }
-        } catch (e: Exception) {
-            println("WitAnimeDebug: DotPlay error: ${e.message}")
-        }
+                if (intercepted.isNotEmpty() && intercepted != url) emitVideo(intercepted, callback)
+            } catch (e: Exception) { WitaLog.d("DotPlay WV fail: ${e.message}") }
+        } catch (e: Exception) { WitaLog.e("DotPlay error: ${e.message}") }
     }
 
     private suspend fun emitVideo(videoUrl: String, callback: (ExtractorLink) -> Unit) {
-        // strip |timestamp, #, quotes
-        val cleanUrl = videoUrl
-            .trim()
-            .substringBefore('|')
-            .trimEnd('#', '"', '\'')
-            .replace(" ", "%20")
-
-        println("WitAnimeDebug: DotPlay emitting -> ${cleanUrl.take(100)}")
-
+        val cleanUrl = videoUrl.trim().substringBefore('|').trimEnd('#', '"', '\'').replace(" ", "%20")
         val qName = qualityName(cleanUrl, linkLabel)
-        val displayLabel = "DotPlay" + (qName?.let { " $it" } ?: "")
-
-        callback(newExtractorLink(name, displayLabel, cleanUrl,
+        callback(newExtractorLink(name, "DotPlay" + (qName?.let { " $it" } ?: ""), cleanUrl,
             if (cleanUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
             this.referer = mainUrl
             quality = bestQuality(cleanUrl, linkLabel)
@@ -152,9 +113,7 @@ class DotPlayExtractor : ExtractorApi() {
         val urls = mutableListOf<String>()
         try { collectUrls(JSONObject(jsonStr), urls) } catch (_: Exception) {
             try { collectUrls(JSONArray(jsonStr), urls) } catch (_: Exception) {
-                Regex("""https?://[^\s"',}\\]+""").findAll(jsonStr).forEach {
-                    urls.add(it.value.trimEnd('}', ']', '"'))
-                }
+                Regex("""https?://[^\s"',}\\]+""").findAll(jsonStr).forEach { urls.add(it.value.trimEnd('}', ']', '"')) }
             }
         }
         return urls.distinct()
