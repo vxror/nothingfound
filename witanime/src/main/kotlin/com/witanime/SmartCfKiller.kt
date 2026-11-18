@@ -34,9 +34,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.ui.settings.Globals
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
@@ -70,9 +68,7 @@ private object ActivityResolver {
             if (a != null && !a.isFinishing && !a.isDestroyed) return a
         }
         ensureRegistered()
-        resumed.get()?.get()?.let { a ->
-            if (!a.isFinishing && !a.isDestroyed) return a
-        }
+        resumed.get()?.get()?.let { a -> if (!a.isFinishing && !a.isDestroyed) return a }
         return scanActivityRecords()
     }
 
@@ -117,34 +113,21 @@ private object ActivityResolver {
 }
 
 object WitaWeb {
-
     private val CHALLENGE_TITLES = listOf(
         "just a moment", "checking your browser", "attention required",
         "verify you are human", "one more step", "ddos-guard"
     )
-
-    // [v159] hidden renders now run in PARALLEL (up to 3 at once) — the old
-    // single mutex serialized every page behind every other page, which under
-    // WARP (where every fetch is a render) made the whole extension crawl
     private val renderSlots = Semaphore(3)
 
     private class CacheEntry(val html: String, val ts: Long)
     private val htmlCache = ConcurrentHashMap<String, CacheEntry>()
-
-    // [v159] 10 minutes — going back after an episode hits the cache
     private const val CACHE_TTL = 600_000L
-
-    // [v159] wrong states (e.g. WARP left replay=false, now on real IP) self-correct in 2 min
     private const val REPLAY_TTL = 2 * 60_000L
 
     @Volatile var wasChallenged: Boolean = false
 
-    /** the WebView user-agent the clearance was earned with — persisted to disk */
     @Volatile var webUa: String? = null
-        set(value) {
-            field = value
-            if (value != null) persistUa(value)
-        }
+        set(value) { field = value; if (value != null) persistUa(value) }
 
     @Volatile private var replayWorks: Boolean? = null
     @Volatile private var replayCheckedAt = 0L
@@ -159,31 +142,25 @@ object WitaWeb {
     }.getOrNull()
 
     private fun persistUa(ua: String) {
-        try {
-            appCtx()?.getSharedPreferences(UA_PREFS, Context.MODE_PRIVATE)
-                ?.edit()?.putString(UA_KEY, ua)?.apply()
-        } catch (_: Exception) {}
+        try { appCtx()?.getSharedPreferences(UA_PREFS, Context.MODE_PRIVATE)?.edit()?.putString(UA_KEY, ua)?.apply() } catch (_: Exception) {}
     }
 
-    private fun loadPersistedUa(): String? {
-        return try {
-            appCtx()?.getSharedPreferences(UA_PREFS, Context.MODE_PRIVATE)
-                ?.getString(UA_KEY, null)?.takeIf { it.isNotBlank() }
-        } catch (_: Exception) { null }
-    }
+    private fun loadPersistedUa(): String? = try {
+        appCtx()?.getSharedPreferences(UA_PREFS, Context.MODE_PRIVATE)?.getString(UA_KEY, null)?.takeIf { it.isNotBlank() }
+    } catch (_: Exception) { null }
 
     fun warmup() {
         ActivityResolver.warmup()
-        if (webUa == null) {
-            webUa = loadPersistedUa()
-        }
+        if (webUa == null) webUa = loadPersistedUa()
     }
 
+    /** strong markers only — passive CF scripts on normal pages don't match */
     fun looksChallenge(html: String?): Boolean {
         if (html.isNullOrBlank()) return false
         val l = html.lowercase()
         if (CHALLENGE_TITLES.any { l.contains(it) }) return true
-        return l.contains("challenge-platform") && l.contains("cloudflare")
+        if (l.contains("cf_chl_opt") || l.contains("challenge-running") || l.contains("cf-turnstile")) return true
+        return l.contains("/cdn-cgi/challenge-platform/h/")
     }
 
     fun isChallengeTitle(title: String): Boolean {
@@ -203,18 +180,12 @@ object WitaWeb {
         HiddenRender.lastSuccessAt > 0 && System.currentTimeMillis() - HiddenRender.lastSuccessAt < 120_000L
 
     suspend fun clearanceCookie(url: String): String? = withContext(Dispatchers.Main) {
-        runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
-            ?.takeIf { it.contains("cf_clearance") }
+        runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()?.takeIf { it.contains("cf_clearance") }
     }
 
-    /** [v159] remove a proven-dead clearance cookie so nothing keeps sending it —
-     *  a stale clearance makes Cloudflare serve HARDER challenges */
     fun expireClearance(url: String) {
         try {
-            val host = try {
-                val u = Uri.parse(url)
-                "${u.scheme}://${u.host}"
-            } catch (_: Exception) { url }
+            val host = try { val u = Uri.parse(url); "${u.scheme}://${u.host}" } catch (_: Exception) { url }
             CookieManager.getInstance().apply {
                 listOf("cf_clearance", "cf_chl_rc_ni", "cf_chl_prog").forEach { name ->
                     setCookie(host, "$name=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT")
@@ -230,25 +201,17 @@ object WitaWeb {
             htmlCache.remove(url)
         }
         return renderSlots.withPermit {
-            htmlCache[url]?.let { e ->
-                if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withPermit e.html
-            }
-            WitaLog.d("hidden render (invisible) for $url")
+            htmlCache[url]?.let { e -> if (System.currentTimeMillis() - e.ts < CACHE_TTL) return@withPermit e.html }
+            WitaLog.d("hidden render for $url")
             val hidden = HiddenRender.fetch(url)
             if (hidden != null) {
-                WitaLog.d("hidden render OK — no UI shown")
                 htmlCache[url] = CacheEntry(hidden, System.currentTimeMillis())
                 return@withPermit hidden
             }
-            if (silent) {
-                WitaLog.d("silent mode (background prefetch) — dialog suppressed")
-                return@withPermit null
-            }
+            if (silent) return@withPermit null
             WitaLog.d("challenge needs a human → visible dialog")
             val html = VisibleRender.fetch(url, 120_000L)
-            if (html != null) {
-                htmlCache[url] = CacheEntry(html, System.currentTimeMillis())
-            }
+            if (html != null) htmlCache[url] = CacheEntry(html, System.currentTimeMillis())
             html
         }
     }
@@ -256,11 +219,7 @@ object WitaWeb {
 
 private fun unwrapJs(result: String?): String? {
     if (result == null || result == "null") return null
-    return try {
-        JSONArray("[$result]").optString(0)
-    } catch (e: Exception) {
-        result
-    }
+    return try { JSONArray("[$result]").optString(0) } catch (e: Exception) { result }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -273,34 +232,39 @@ private fun WebView.configForCf() {
     settings.loadsImagesAutomatically = true
     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     settings.mediaPlaybackRequiresUserGesture = false
-    settings.userAgentString = settings.userAgentString
-        .replace("; wv", "")
-        .replace(Regex("Version/\\d+\\.\\d+ "), "")
+    settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
 }
 
-/**
- * [v159] hidden renderer: fresh full-size WebView per render (v153 proven
- * design), pushed off-screen. Poll/settle tightened for speed (250ms/350ms).
- * The CfAutoClick loop robot-clicks the CF box invisibly after ~1s.
- */
+/** first-load headers matching the WebView's own UA (CF fingerprints the navigation) */
+internal fun cfHeadersFor(ua: String): Map<String, String> {
+    val ver = Regex("""Chrome/(\d+)""").find(ua)?.groupValues?.get(1) ?: "131"
+    val mobile = ua.contains("Mobile")
+    return mapOf(
+        "Upgrade-Insecure-Requests" to "1",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+        "sec-ch-ua" to "\"Chromium\";v=\"$ver\", \"Google Chrome\";v=\"$ver\", \"Not_A Brand\";v=\"24\"",
+        "sec-ch-ua-mobile" to (if (mobile) "?1" else "?0"),
+        "sec-ch-ua-platform" to (if (mobile) "\"Android\"" else "\"Windows\""),
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "none",
+        "Sec-Fetch-User" to "?1"
+    )
+}
+
 private object HiddenRender {
-    private const val POLL_MS = 250L      // [v159] faster poll — pages that pass need speed
-    private const val SETTLE_MS = 350L    // [v159] content HTML rarely needs a full second
+    private const val POLL_MS = 250L
+    private const val SETTLE_MS = 350L
     private const val CHALLENGE_GRACE_MS = 15_000L
     private const val HARD_TIMEOUT_MS = 30_000L
     private const val MIN_HTML_LEN = 2_000
 
     @Volatile var lastSuccessAt: Long = 0L
 
-    // NOTE: no stale-cookie clearing here on purpose — the hidden renderer may
-    // still pass silently with existing cookies. Clearing belongs in the
-    // fallback dialog only, where the cookie is proven dead.
     suspend fun fetch(url: String): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
-        if (activity == null) {
-            WitaLog.d("no activity available — hidden render skipped")
-            return@withContext null
-        }
+        if (activity == null) return@withContext null
         suspendCancellableCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             val done = AtomicBoolean(false)
@@ -311,10 +275,8 @@ private object HiddenRender {
 
             fun cleanup() {
                 handler.removeCallbacksAndMessages(null)
-                val c = container
-                container = null
-                val wv = webView
-                webView = null
+                val c = container; container = null
+                val wv = webView; webView = null
                 try { (c?.parent as? ViewGroup)?.removeView(c) } catch (_: Exception) {}
                 try { wv?.stopLoading() } catch (_: Exception) {}
                 try { wv?.destroy() } catch (_: Exception) {}
@@ -336,9 +298,7 @@ private object HiddenRender {
                 wv2.evaluateJavascript("document.documentElement.outerHTML") { jsHtml ->
                     if (done.get()) return@evaluateJavascript
                     val html = unwrapJs(jsHtml)
-                    if (html != null && html.length > MIN_HTML_LEN && !WitaWeb.looksChallenge(html)) {
-                        finish(html)
-                    }
+                    if (html != null && html.length > MIN_HTML_LEN && !WitaWeb.looksChallenge(html)) finish(html)
                 }
             }
 
@@ -346,32 +306,21 @@ private object HiddenRender {
                 val wv = WebView(activity)
                 webView = wv
                 wv.configForCf()
-                // [v157] invisible auto-clicker — robot-clicks the CF checkbox
                 CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
                 capturedUa = wv.settings.userAgentString
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
                 }
-                CookieManager.getInstance().apply {
-                    setAcceptCookie(true)
-                    setAcceptThirdPartyCookies(wv, true)
-                }
+                CookieManager.getInstance().apply { setAcceptCookie(true); setAcceptThirdPartyCookies(wv, true) }
 
                 val c = FrameLayout(activity)
                 container = c
-                c.addView(wv, FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                ))
-                activity.addContentView(c, ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                ))
-                // full size (Cloudflare needs real dimensions) but off-screen
+                c.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                activity.addContentView(c, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
                 c.translationX = -10000f
                 c.translationY = -10000f
 
-                wv.loadUrl(url)
+                wv.loadUrl(url, cfHeadersFor(wv.settings.userAgentString))
 
                 val poll = object : Runnable {
                     override fun run() {
@@ -383,8 +332,7 @@ private object HiddenRender {
                             if (done.get()) return@evaluateJavascript
                             val title = unwrapJs(jsTitle).orEmpty()
                             if (WitaWeb.isChallengeTitle(title)) {
-                                if (elapsed > CHALLENGE_GRACE_MS) finish(null)
-                                else handler.postDelayed(this, POLL_MS)
+                                if (elapsed > CHALLENGE_GRACE_MS) finish(null) else handler.postDelayed(this, POLL_MS)
                                 return@evaluateJavascript
                             }
                             handler.postDelayed({
@@ -402,11 +350,7 @@ private object HiddenRender {
                 finish(null)
             }
 
-            cont.invokeOnCancellation {
-                if (done.compareAndSet(false, true)) {
-                    handler.post { cleanup() }
-                }
-            }
+            cont.invokeOnCancellation { if (done.compareAndSet(false, true)) handler.post { cleanup() } }
         }
     }
 }
@@ -414,17 +358,10 @@ private object HiddenRender {
 private object VisibleRender {
     suspend fun fetch(url: String, timeoutMs: Long): String? = withContext(Dispatchers.Main) {
         val activity: Activity? = ActivityResolver.current()
-        if (activity == null) {
-            WitaLog.d("no activity — dialog skipped")
-            return@withContext null
-        }
+        if (activity == null) return@withContext null
         suspendCancellableCoroutine { cont ->
-            val dlg = WitaRenderDialog(activity, url, timeoutMs) { html ->
-                if (cont.isActive) cont.resume(html)
-            }
-            try {
-                dlg.show()
-            } catch (e: Exception) {
+            val dlg = WitaRenderDialog(activity, url, timeoutMs) { html -> if (cont.isActive) cont.resume(html) }
+            try { dlg.show() } catch (e: Exception) {
                 WitaLog.e("dialog error ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
@@ -434,12 +371,12 @@ private object VisibleRender {
 }
 
 object WitaImgProxy {
-
     private var serverSocket: ServerSocket? = null
 
-    private val cache = object : LinkedHashMap<String, ByteArray>(32, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>): Boolean {
-            return values.sumOf { it.size } > 24 * 1024 * 1024
+    // content-type cached WITH the bytes (png/webp no longer served as jpeg)
+    private val cache = object : LinkedHashMap<String, Pair<ByteArray, String>>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<ByteArray, String>>): Boolean {
+            return values.sumOf { it.first.size } > 24 * 1024 * 1024
         }
     }
 
@@ -486,8 +423,7 @@ object WitaImgProxy {
 
     private fun fetchImage(target: String, ua: String?, cookie: String?): Pair<ByteArray, String>? {
         return try {
-            val builder = Request.Builder().url(target)
-                .header("Referer", "https://witanime.you/")
+            val builder = Request.Builder().url(target).header("Referer", "https://witanime.site/")
             if (ua != null) builder.header("User-Agent", ua)
             if (cookie != null) builder.header("Cookie", cookie)
             app.baseClient.newCall(builder.build()).execute().use { resp ->
@@ -510,48 +446,27 @@ object WitaImgProxy {
         if (parts.size < 2 || !parts[1].startsWith("/img")) { write404(output); return }
         val target = Uri.parse("http://localhost" + parts[1]).getQueryParameter("u")
         if (target.isNullOrBlank() || !target.startsWith("http")) { write404(output); return }
-
-        while (true) {
-            val l = input.readLine() ?: break
-            if (l.isEmpty()) break
-        }
+        while (true) { val l = input.readLine() ?: break; if (l.isEmpty()) break }
 
         val cached = synchronized(cache) { cache[target] }
-        if (cached != null) {
-            writeImage(output, cached, "image/jpeg")
-            return
-        }
+        if (cached != null) { writeImage(output, cached.first, cached.second); return }
 
         val cookie = runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
         val ua = WitaWeb.webUa
         var result: Pair<ByteArray, String>? = null
-        if (ua != null) {
-            result = fetchImage(target, ua, cookie)
-        }
-        if (result == null) {
-            result = fetchImage(target, null, null)
-        }
-
+        if (ua != null) result = fetchImage(target, ua, cookie)
+        if (result == null) result = fetchImage(target, null, null)
         if (result == null) { write404(output); return }
-        val (bytes, contentType) = result
-        synchronized(cache) { cache[target] = bytes }
-        writeImage(output, bytes, contentType)
+        synchronized(cache) { cache[target] = result }
+        writeImage(output, result.first, result.second)
     }
 
     fun proxyUrl(target: String): String? {
         val port = start() ?: return null
-        return try {
-            "http://127.0.0.1:$port/img?u=" + java.net.URLEncoder.encode(target, "UTF-8")
-        } catch (_: Exception) { null }
+        return try { "http://127.0.0.1:$port/img?u=" + java.net.URLEncoder.encode(target, "UTF-8") } catch (_: Exception) { null }
     }
 }
 
-/**
- * [v158] the fallback dialog: stale CF cookies are EXPIRED before loading
- * (proven dead here, and a dead clearance makes CF serve a harder challenge),
- * D-pad fake cursor for Android TV, Done button to force extraction.
- * [v157] CfAutoClick runs here too — often solves before the overlay lifts.
- */
 private class WitaRenderDialog(
     private val activity: Activity,
     private val targetUrl: String,
@@ -624,18 +539,10 @@ private class WitaRenderDialog(
         override fun run() {
             if (done.get()) return
             val elapsed = SystemClock.uptimeMillis() - startedAt
-            if (elapsed > timeoutMs) {
-                status("Timed out — انتهت المهلة")
-                finish(null)
-                return
-            }
+            if (elapsed > timeoutMs) { status("Timed out — انتهت المهلة"); finish(null); return }
             val wv = webView
-            if (wv == null) {
-                handler.postDelayed(this, POLL_MS)
-                return
-            }
+            if (wv == null) { handler.postDelayed(this, POLL_MS); return }
             if (elapsed > REVEAL_AFTER_MS && overlay?.parent != null) liftOverlay()
-
             wv.evaluateJavascript("document.title") { jsTitle ->
                 if (done.get()) return@evaluateJavascript
                 val title = unwrapJs(jsTitle).orEmpty()
@@ -655,8 +562,6 @@ private class WitaRenderDialog(
         }
     }
 
-    // ---- TV D-pad cursor ----
-
     private fun moveCursor(dx: Float, dy: Float) {
         val holder = holderRef ?: return
         val size = cursorView?.layoutParams?.width ?: 0
@@ -668,19 +573,12 @@ private class WitaRenderDialog(
 
     private fun clickAtCursor() {
         val wv = webView ?: return
-        val x = cursorPos[0]
-        val y = cursorPos[1]
+        val x = cursorPos[0]; val y = cursorPos[1]
         val t = SystemClock.uptimeMillis()
         val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0)
         val up = MotionEvent.obtain(t, t + 120, MotionEvent.ACTION_UP, x, y, 0)
-        try {
-            wv.dispatchTouchEvent(down)
-            wv.dispatchTouchEvent(up)
-        } catch (_: Exception) {
-        } finally {
-            down.recycle()
-            up.recycle()
-        }
+        try { wv.dispatchTouchEvent(down); wv.dispatchTouchEvent(up) } catch (_: Exception) {}
+        finally { down.recycle(); up.recycle() }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -695,7 +593,6 @@ private class WitaRenderDialog(
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(16), dp(20), dp(12))
         }
-
         root.addView(TextView(activity).apply {
             text = "WitAnime — Cloudflare Verification"
             textSize = 16f
@@ -703,7 +600,6 @@ private class WitaRenderDialog(
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setPadding(0, 0, 0, dp(6))
         })
-
         val status = TextView(activity).apply {
             text = "Loading…"
             textSize = 12f
@@ -712,18 +608,13 @@ private class WitaRenderDialog(
         }
         statusText = status
         root.addView(status)
-
         root.addView(TextView(activity).apply {
-            text = if (isTv) "D-pad moves the cursor, OK/Enter clicks the checkbox."
-                   else "Solve the CAPTCHA below, then tap Done."
+            text = if (isTv) "D-pad moves the cursor, OK/Enter clicks the checkbox." else "Solve the CAPTCHA below, then tap Done."
             textSize = 11f
             setTextColor(Color.parseColor("#707080"))
             setPadding(0, 0, 0, dp(8))
         })
-
-        val progress = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-            isIndeterminate = true
-        }
+        val progress = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true }
         root.addView(progress, LinearLayout.LayoutParams(-1, dp(4)).also { it.bottomMargin = dp(10) })
 
         val holder = FrameLayout(activity)
@@ -731,18 +622,13 @@ private class WitaRenderDialog(
         val wv = WebView(activity)
         webView = wv
         wv.configForCf()
-        // [v157] auto-click here too — often solves the challenge BEFORE the
-        // overlay lifts at 4s, so the user never even sees the checkbox
         CfAutoClick.startAutoClickLoop(wv, handler) { done.get() }
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?) = false
         }
         holder.addView(wv, FrameLayout.LayoutParams(-1, -1))
 
-        val cover = FrameLayout(activity).apply {
-            setBackgroundColor(0xFF0B0B0F.toInt())
-            isClickable = true
-        }
+        val cover = FrameLayout(activity).apply { setBackgroundColor(0xFF0B0B0F.toInt()); isClickable = true }
         val chip = TextView(activity).apply {
             text = "Verifying protected source…"
             setTextColor(Color.WHITE)
@@ -764,8 +650,7 @@ private class WitaRenderDialog(
                 }
             }
             cursorView = cursor
-            holder.addView(cursor)   // last child = on top of the cover
-
+            holder.addView(cursor)
             holder.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
                 override fun onGlobalLayout() {
                     holder.viewTreeObserver.removeOnGlobalLayoutListener(this)
@@ -775,7 +660,6 @@ private class WitaRenderDialog(
                     cursor.translationY = cursorPos[1] - cursorSize / 2f
                 }
             })
-
             val step = CURSOR_STEP_DP * density
             holder.isFocusable = true
             holder.isFocusableInTouchMode = true
@@ -794,10 +678,7 @@ private class WitaRenderDialog(
 
         root.addView(holder, LinearLayout.LayoutParams(-1, (screenH * 0.7f).toInt()))
 
-        val btnRow = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
+        val btnRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         btnRow.addView(Button(activity).apply {
             text = "Done"
             setOnClickListener {
@@ -806,17 +687,8 @@ private class WitaRenderDialog(
                 if (!done.get()) status("No cookies yet. Solve the CAPTCHA first.")
             }
         })
-        btnRow.addView(Button(activity).apply {
-            text = "Cancel"
-            setOnClickListener { finish(null) }
-        })
-        root.addView(
-            btnRow,
-            LinearLayout.LayoutParams(-2, -2).also {
-                it.topMargin = dp(10)
-                it.gravity = Gravity.CENTER_HORIZONTAL
-            }
-        )
+        btnRow.addView(Button(activity).apply { text = "Cancel"; setOnClickListener { finish(null) } })
+        root.addView(btnRow, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = dp(10); it.gravity = Gravity.CENTER_HORIZONTAL })
 
         val d = Dialog(activity)
         d.requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -824,23 +696,14 @@ private class WitaRenderDialog(
         d.setCancelable(false)
         d.setOnDismissListener {
             handler.removeCallbacksAndMessages(null)
-            if (!done.get()) {
-                done.set(true)
-                try { onResult(null) } catch (_: Exception) {}
-            }
+            if (!done.get()) { done.set(true); try { onResult(null) } catch (_: Exception) {} }
         }
         dialog = d
 
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(wv, true)
-            // [v158] the old clearance is PROVEN dead at this point (hidden render
-            // already failed with it) and Cloudflare serves a HARDER challenge when
-            // a dead clearance is present — expire it so the solve starts clean
-            val host = try {
-                val u = Uri.parse(targetUrl)
-                "${u.scheme}://${u.host}"
-            } catch (_: Exception) { targetUrl }
+            val host = try { val u = Uri.parse(targetUrl); "${u.scheme}://${u.host}" } catch (_: Exception) { targetUrl }
             listOf("cf_clearance", "cf_chl_rc_ni", "cf_chl_prog").forEach { name ->
                 try { setCookie(host, "$name=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT") } catch (_: Exception) {}
             }
@@ -854,7 +717,7 @@ private class WitaRenderDialog(
         }
         wv.requestFocus()
         if (isTv) holder.requestFocus()
-        wv.loadUrl(targetUrl)
+        wv.loadUrl(targetUrl, cfHeadersFor(wv.settings.userAgentString))
         handler.postDelayed(poll, POLL_MS)
     }
 }
