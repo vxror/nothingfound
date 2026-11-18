@@ -30,12 +30,12 @@
     "tvTypes": [
       "Anime"
     ],
-    "version": 168,
+    "version": 169,
     "internalName": "WitAnime",
     "url": "https://github.com/vxror/nothingfound/raw/refs/heads/main/build/witanime.cs3",
     "name": "WitAnime",
-    "fileSize": 205567,
-    "fileHash": "sha256-458d1848569721001ccc5269ca8a0322d2fb323aba83c0b5fa4a05033cf20387"
+    "fileSize": 205863,
+    "fileHash": "sha256-edc7c1429bf66a69f93055bc2937d1a7f926292a25dc137bbaa0781a356f7a9f"
   },
   {
     "iconUrl": "https://kawaiianime.cc/favicon.png",
