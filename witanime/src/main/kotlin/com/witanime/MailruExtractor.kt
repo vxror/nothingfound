@@ -1,82 +1,44 @@
 package com.witanime
 
-import com.lagradost.api.Log
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.*
 
 class MailruExtractor : ExtractorApi() {
-    override val name = "MailRue"
+    override val name = "MailRu"
     override val mainUrl = "https://my.mail.ru"
     override val requiresReferer = false
 
     override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        val TAG = "MAILRU_EXTRACTOR"
         val extRef = referer ?: url
-
-        val vidId = url.substringAfter("video/embed/").trim()
-        if (vidId.isBlank()) {
-
-            return
-        }
-
+        val vidId = url.substringAfter("video/embed/").substringBefore("?").trim()
+        if (vidId.isBlank() || vidId == url) return
         val videoReq = try {
-            app.get("${mainUrl}/+/video/meta/${vidId}", referer = extRef)
-        } catch (e: Exception) {
-
-            return
-        }
-
+            app.get("$mainUrl/+/video/meta/$vidId", referer = extRef, headers = mapOf("User-Agent" to EXTRACTOR_UA) + CHROME_HINTS)
+        } catch (e: Exception) { WitaLog.d("MailRu meta fail: ${e.message}"); return }
         val videoKey = videoReq.cookies["video_key"]?.toString().orEmpty()
-
-        val videoData = AppUtils.tryParseJson<MailRuData>(videoReq.text)
-        if (videoData == null) {
-
-            return
-        }
-
-        for (video in videoData.videos) {
+        val videoData = AppUtils.tryParseJson<MailRuData>(videoReq.text) ?: return
+        for (video in videoData.videos ?: emptyList()) {
             var videoUrl = if (video.url.startsWith("//")) "https:${video.url}" else video.url
-
-            if (videoKey.isNotBlank()) {
-                videoUrl = if (videoUrl.contains("?")) {
-                    "$videoUrl&video_key=$videoKey"
-                } else {
-                    "$videoUrl?video_key=$videoKey"
-                }
-            }
-
+            if (videoKey.isNotBlank())
+                videoUrl = if (videoUrl.contains("?")) "$videoUrl&video_key=$videoKey" else "$videoUrl?video_key=$videoKey"
             try {
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = videoUrl,
-                        type = if (videoUrl.contains(".m3u8", ignoreCase = true))
-                            ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-
-                        this.referer = extRef
-
-                        this.quality = getQualityFromName(video.key)
-                    }
-                )
-            } catch (e: Exception) {
-
-            }
+                callback(newExtractorLink(name, "$name ${video.key}", videoUrl,
+                    if (videoUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                    this.referer = extRef
+                    this.quality = getQualityFromName(video.key)
+                })
+            } catch (e: Exception) { WitaLog.d("MailRu emit fail: ${e.message}") }
         }
     }
 
     data class MailRuData(
-        @JsonProperty("provider") val provider: String,
-        @JsonProperty("videos") val videos: List<MailRuVideoData>
+        @JsonProperty("provider") val provider: String? = null,
+        @JsonProperty("videos") val videos: List<MailRuVideoData>? = null
     )
-
     data class MailRuVideoData(
         @JsonProperty("url") val url: String,
         @JsonProperty("key") val key: String
