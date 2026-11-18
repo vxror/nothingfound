@@ -3,6 +3,7 @@ package com.witanime
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.random.Random
 
 open class DoodExtractor : ExtractorApi() {
@@ -15,25 +16,25 @@ open class DoodExtractor : ExtractorApi() {
     ) {
         try {
             val embed = url.replace("/d/", "/e/").replace("/w/", "/e/")
-            val headers = mapOf("User-Agent" to EXTRACTOR_UA)
+            val headers = mapOf("User-Agent" to EXTRACTOR_UA) + CHROME_HINTS
             val response = app.get(embed, referer = referer, headers = headers)
             val content = response.text
-            if (!content.contains("/pass_md5/")) { println("WitAnimeDebug: Dood no pass_md5: $url"); return }
-
-            val doodHost = hostOf(response.url)          // self-resolves the REAL dood domain
+            if (!content.contains("/pass_md5/")) { WitaLog.d("Dood no pass_md5: $url"); return }
+            val doodHost = hostOf(response.url)
             val md5Path = Regex("""/pass_md5/[^'"\s]*""").find(content)?.value ?: return
-            val token = md5Path.substringAfterLast("/")   // token from the PATH
-            val pass = app.get(doodHost + md5Path, referer = response.url, headers = headers).text
+            val token = md5Path.substringAfterLast("/")
+            val pass = withTimeoutOrNull(10_000L) {
+                app.get(doodHost + md5Path, referer = response.url, headers = headers).text
+            } ?: return
             val rnd = (1..10).map { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Random.nextInt(62)] }.joinToString("")
-            val link = "$pass$rnd?token=$token"           // ?token= is REQUIRED
-
+            val link = "$pass$rnd?token=$token&expiry=${System.currentTimeMillis()}"
             val q = Regex("""(\d{3,4})p""").find(content.substringAfter("<title>").substringBefore("</title>"))?.groupValues?.get(1)
-            println("WitAnimeDebug: Dood resolved via $doodHost (q=$q)")
+            WitaLog.d("Dood resolved via $doodHost (q=$q)")
             callback(newExtractorLink(this.name, this.name, link, ExtractorLinkType.VIDEO) {
                 this.referer = "$doodHost/"
                 quality = getQualityFromName(q)
             })
-        } catch (e: Exception) { println("WitAnimeDebug: Dood error: ${e.message}") }
+        } catch (e: Exception) { WitaLog.e("Dood error: ${e.message}") }
     }
 }
 
