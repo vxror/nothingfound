@@ -5,12 +5,14 @@ import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mvvm.logError
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import java.io.File
 import java.net.URLEncoder
-import java.nio.charset.Charset
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.*
@@ -18,19 +20,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
-import org.jsoup.nodes.Document
 
 class WitAnime : MainAPI() {
-    override var mainUrl = "https://witanime.you"
+    override var mainUrl = "https://witanime.site"
     override var name = "WitAnime"
     override val hasMainPage = true
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    private val FRAMEWORK_HASH = "9933bd27-92ea-4ee9-807d-e612029d6318"
-
     companion object {
-        // [v166] 45 minutes — prefetched next-episode links survive browsing
         private const val LINK_CACHE_TTL = 45 * 60_000L
         private const val LINK_CACHE_MAX = 12
         private const val STORE_FILE = "wita_link_cache.json"
@@ -61,36 +59,21 @@ class WitAnime : MainAPI() {
             .put("s", l.source).put("n", l.name).put("u", l.url)
             .put("r", l.referer ?: "").put("q", l.quality)
             .put("t", l.type?.name ?: "").put("x", l.extractorData ?: "")
+            .put("h", JSONObject().apply { l.headers.forEach { (k, v) -> put(k, v) } })
 
         @Suppress("DEPRECATION_ERROR")
         private fun linkFromJson(o: JSONObject): ExtractorLink {
             val typeStr = o.optString("t")
             var type: ExtractorLinkType? = null
-            if (typeStr.isNotBlank()) {
-                val all = ExtractorLinkType.values()
-                for (t in all) {
-                    if (t.name == typeStr) {
-                        type = t
-                        break
-                    }
-                }
-            }
+            if (typeStr.isNotBlank()) for (t in ExtractorLinkType.values()) if (t.name == typeStr) { type = t; break }
             val extra = o.optString("x")
-            return ExtractorLink(
-                o.optString("s"),
-                o.optString("n"),
-                o.optString("u"),
-                o.optString("r"),
-                o.optInt("q"),
-                type,
-                mapOf(),
-                if (extra.isBlank()) null else extra
-            )
+            val hdrs = mutableMapOf<String, String>()
+            o.optJSONObject("h")?.let { h -> h.keys().forEach { k -> hdrs[k] = h.optString(k) } }
+            return ExtractorLink(o.optString("s"), o.optString("n"), o.optString("u"), o.optString("r"),
+                o.optInt("q"), type, hdrs, if (extra.isBlank()) null else extra)
         }
 
-        private fun subToJson(s: SubtitleFile): JSONObject = JSONObject()
-            .put("l", s.lang).put("u", s.url)
-
+        private fun subToJson(s: SubtitleFile): JSONObject = JSONObject().put("l", s.lang).put("u", s.url)
         private fun subFromJson(o: JSONObject) = SubtitleFile(o.optString("l"), o.optString("u"))
 
         private fun ensureStoreLoaded() {
@@ -110,19 +93,13 @@ class WitAnime : MainAPI() {
                         val ts = o.optLong("ts")
                         if (System.currentTimeMillis() - ts > LINK_CACHE_TTL) return@forEach
                         val arr = o.optJSONArray("l") ?: return@forEach
-                        val ls = (0 until arr.length()).mapNotNull { i ->
-                            runCatching { linkFromJson(arr.optJSONObject(i)) }.getOrNull()
-                        }
+                        val ls = (0 until arr.length()).mapNotNull { i -> runCatching { linkFromJson(arr.optJSONObject(i)) }.getOrNull() }
                         val sarr = o.optJSONArray("s") ?: JSONArray()
-                        val ss = (0 until sarr.length()).mapNotNull { i ->
-                            runCatching { subFromJson(sarr.optJSONObject(i)) }.getOrNull()
-                        }
+                        val ss = (0 until sarr.length()).mapNotNull { i -> runCatching { subFromJson(sarr.optJSONObject(i)) }.getOrNull() }
                         if (ls.isNotEmpty()) linkCache[epUrl] = CachedLinks(ls, ss, ts)
                     }
-                    WitaLog.d("restored ${linkCache.size} cached episodes from disk")
-                } catch (e: Exception) {
-                    WitaLog.e("store load fail ${e.message}")
-                }
+                    WitaLog.d("restored ${linkCache.size} cached episodes")
+                } catch (e: Exception) { WitaLog.e("store load fail ${e.message}") }
             }
         }
 
@@ -132,19 +109,14 @@ class WitAnime : MainAPI() {
                     try {
                         val links = JSONObject()
                         linkCache.forEach { (ep, c) ->
-                            links.put(ep, JSONObject()
-                                .put("ts", c.ts)
+                            links.put(ep, JSONObject().put("ts", c.ts)
                                 .put("l", JSONArray(c.links.map { linkToJson(it) }))
-                                .put("s", JSONArray(c.subs.map { subToJson(it) }))
-                            )
+                                .put("s", JSONArray(c.subs.map { subToJson(it) })))
                         }
                         val eps = JSONObject()
                         nextEpMap.forEach { (k, v) -> eps.put(k, v) }
-                        val root = JSONObject().put("links", links).put("eps", eps)
-                        ctx()?.let { File(it.filesDir, STORE_FILE).writeText(root.toString()) }
-                    } catch (e: Exception) {
-                        WitaLog.e("store persist fail ${e.message}")
-                    }
+                        ctx()?.let { File(it.filesDir, STORE_FILE).writeText(JSONObject().put("links", links).put("eps", eps).toString()) }
+                    } catch (e: Exception) { WitaLog.e("store persist fail ${e.message}") }
                 }
             }
         }
@@ -161,29 +133,60 @@ class WitAnime : MainAPI() {
             persistStoreAsync()
         }
 
-        private fun deliverCached(
-            url: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit
-        ): Boolean {
+        private fun deliverCached(url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
             ensureStoreLoaded()
             val c = linkCache[url] ?: return false
-            if (System.currentTimeMillis() - c.ts > LINK_CACHE_TTL) {
-                linkCache.remove(url)
-                return false
-            }
-            WitaLog.d("CACHE HIT — ${c.links.size} links instantly")
-            c.subs.forEach(subtitleCallback)
-            c.links.forEach(callback)
+            if (System.currentTimeMillis() - c.ts > LINK_CACHE_TTL) { linkCache.remove(url); return false }
+            val links = if (WitaState.isCasting) c.links.filter { !it.url.startsWith("http://127.0.0.1") } else c.links
+            if (links.isEmpty()) return false
+            WitaLog.d("CACHE HIT — ${links.size} links")
+            c.subs.forEach { runCatching { subtitleCallback(it) } }
+            links.forEach { runCatching { callback(it) } }
             return true
+        }
+
+        private fun qualityRank(q: String): Int = when (q.uppercase().trim()) {
+            "4K", "2160P" -> 400
+            "FHD", "1080P" -> 300
+            "HD", "720P" -> 200
+            "SD", "480P" -> 100
+            else -> 50
         }
     }
 
-    private val userAgent = EXTRACTOR_UA
+    @Volatile private var cfMode = false
+    private fun ua(): String = if (cfMode) (WitaWeb.webUa ?: EXTRACTOR_UA) else EXTRACTOR_UA
 
     init {
         WitaWeb.warmup()
         bgScope.launch { ensureStoreLoaded() }
+    }
+
+    private suspend fun siteHtml(url: String, silent: Boolean = false): String? {
+        val headers = mapOf(
+            "User-Agent" to ua(),
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+            "Upgrade-Insecure-Requests" to "1",
+        )
+        val body = withTimeoutOrNull(15_000L) { sessionGet(url, referer = "$mainUrl/", headers = headers) }
+        if (body != null && body.isNotBlank() && !WitaWeb.looksChallenge(body)) { cfMode = false; return body }
+        WitaLog.d("[$url] challenge → WebView render")
+        val rendered = WitaWeb.fetchHtml(url, silent) ?: return null
+        cfMode = true
+        injectWebViewCookies(url)
+        return rendered
+    }
+
+    private suspend fun fetchDoc(url: String): Document {
+        val body = siteHtml(url) ?: throw ErrorLoadingException("فشل تحميل الموقع — تحقق من الاتصال")
+        return Jsoup.parse(body, url)
+    }
+
+    private fun smartPoster(raw: String?): String? {
+        val fixed = fixUrlNull(raw) ?: return null
+        if (WitaWeb.replayWorks() == false) return WitaImgProxy.proxyUrl(fixed) ?: fixed
+        return fixed
     }
 
     @Suppress("DEPRECATION_ERROR")
@@ -196,234 +199,144 @@ class WitAnime : MainAPI() {
         .replace(Regex("""\s{2,}"""), " ")
         .trim()
 
-    private fun smartPoster(raw: String?): String? {
-        val fixed = fixUrlNull(raw) ?: return null
-        if (WitaWeb.replayWorks() == false) {
-            return WitaImgProxy.proxyUrl(fixed) ?: fixed
-        }
-        return fixed
-    }
-
-    private suspend fun smartFetch(url: String, referer: String? = null, silent: Boolean = false): String? {
-        // [v159] three-level strategy:
-        //   1. cookie+UA replay  (only when replay works or is unknown)
-        //   2. PLAIN request     (ALWAYS — the fast lane when the cookie is poison)
-        //   3. WebView render    (only when BOTH okhttp paths are challenged)
-        val replayKnownBad = WitaWeb.replayWorks() == false
-
-        if (!replayKnownBad) {
-            val headers = mutableMapOf("User-Agent" to userAgent)
-            WitaWeb.clearanceCookie(url)?.let { c -> headers["Cookie"] = c }
-            WitaWeb.webUa?.let { ua -> headers["User-Agent"] = ua }
-            val body = try {
-                app.get(url, headers = headers, referer = referer).text
-            } catch (_: Exception) { null }
-            if (body != null && body.isNotBlank() && !WitaWeb.looksChallenge(body)) {
-                WitaWeb.setReplayWorks(true)
-                return body
-            }
-        }
-
-        // attempt 2: PLAIN — always attempted
-        val plain = try {
-            app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-        } catch (_: Exception) { null }
-        if (plain != null && plain.isNotBlank() && !WitaWeb.looksChallenge(plain)) {
-            if (!replayKnownBad) {
-                WitaWeb.setReplayWorks(false)
-                WitaWeb.expireClearance(url)
-            }
-            return plain
-        }
-
-        if (plain == null && replayKnownBad) {
-            delay(400)
-            val retry = try {
-                app.get(url, headers = mapOf("User-Agent" to userAgent), referer = referer).text
-            } catch (_: Exception) { null }
-            if (retry != null && retry.isNotBlank() && !WitaWeb.looksChallenge(retry)) return retry
-            if (retry == null) return null
-        }
-
-        WitaLog.d("[$url] challenge → WebView render")
-        val html = WitaWeb.fetchHtml(url, silent)
-
-        if (html != null && WitaWeb.replayWorks() == null && WitaWeb.webUa != null) {
-            val cookie = WitaWeb.clearanceCookie(url)
-            val ua = WitaWeb.webUa
-            if (cookie != null && ua != null) {
-                val probe = try {
-                    app.get(url, headers = mapOf("User-Agent" to ua, "Cookie" to cookie), referer = referer).text
-                } catch (_: Exception) { null }
-                WitaWeb.setReplayWorks(probe != null && !WitaWeb.looksChallenge(probe) && probe.isNotBlank())
-                WitaLog.d("replay probe = ${WitaWeb.replayWorks()}")
-            }
-        }
-        return html
-    }
-
-    private suspend fun fetchDoc(url: String): Document {
-        val body = smartFetch(url)
-            ?: throw ErrorLoadingException("فشل تحميل الموقع — تحقق من الاتصال")
-        return Jsoup.parse(body, url)
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = try { fetchDoc(mainUrl) } catch (e: Exception) {
-            throw ErrorLoadingException("فشل تحميل الموقع: ${e.message}")
-        }
-        WitaLog.d("title=${document.title()} widgets=${document.select("div.main-widget").size}")
-
+        val document = fetchDoc(mainUrl)
         val homePageList = ArrayList<HomePageList>()
-        document.select("div.main-widget").forEach { widget ->
-            val title = widget.selectFirst("div.main-didget-head h3")?.text()?.trim() ?: return@forEach
-            val isEpisodeList = title.contains("حلقات")
-            val items = widget.select(if (isEpisodeList) "div.episodes-card-container" else "div.anime-card-container").mapNotNull {
-                val a = if (isEpisodeList) it.selectFirst(".ep-card-anime-title a") else it.selectFirst("a.overlay")
-                val itemUrl = fixUrl(a?.attr("href") ?: return@mapNotNull null)
-                val itemName = (if (isEpisodeList) a?.text() else it.selectFirst(".anime-card-title a")?.text()) ?: ""
-                val img = it.selectFirst("img")
-                val itemPoster = img?.attr("src")?.ifBlank { img.attr("data-src") }
-                val finalTitle = if (isEpisodeList) "$itemName - ${it.selectFirst(".episodes-card-title a")?.text() ?: ""}" else itemName
-                newAnimeSearchResponse(finalTitle, itemUrl, TvType.Anime) { posterUrl = smartPoster(itemPoster) }
-            }
+        document.select("section.mb-14").forEach { section ->
+            val title = section.selectFirst("h2")?.text()?.trim() ?: return@forEach
+            val items = section.select("a[href*='/watch/'], a[href*='/anime/'], a[href*='/movie/']").mapNotNull { card ->
+                val href = card.attr("href")
+                if (!href.contains("/watch/") && !href.contains("/anime/") && !href.contains("/movie/")) return@mapNotNull null
+                val name = card.selectFirst("h3")?.text()?.trim()
+                    ?: card.attr("title").ifBlank { null }
+                    ?: card.selectFirst("img")?.attr("alt")?.ifBlank { null }
+                    ?: return@mapNotNull null
+                val epText = card.selectFirst("div:contains(الحلقة)")?.text()?.trim()
+                val finalTitle = if (!epText.isNullOrEmpty() && !name.contains("الحلقة")) "$name - $epText" else name
+                val isMovie = href.contains("/movie/")
+                newAnimeSearchResponse(finalTitle, fixUrl(href), if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+                    posterUrl = smartPoster(card.selectFirst("img")?.attr("src"))
+                }
+            }.distinctBy { it.url }
             if (items.isNotEmpty()) homePageList.add(HomePageList(title, items))
+        }
+        document.selectFirst("aside")?.let { aside ->
+            val asideTitle = aside.selectFirst("h2")?.text()?.trim() ?: "أشهر أنميات الموسم"
+            val asideItems = aside.select("a[href*='/anime/']").mapNotNull { item ->
+                val href = item.attr("href")
+                val name = item.selectFirst("span[dir='ltr']")?.text()?.trim() ?: return@mapNotNull null
+                newAnimeSearchResponse(name, fixUrl(href), TvType.Anime) {
+                    posterUrl = smartPoster(item.selectFirst("img")?.attr("src"))
+                }
+            }.distinctBy { it.url }
+            if (asideItems.isNotEmpty()) homePageList.add(HomePageList(asideTitle, asideItems))
         }
         return newHomePageResponse(homePageList, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?search_param=animes&s=" + URLEncoder.encode(query, "UTF-8")
+        val url = "$mainUrl/search?q=" + URLEncoder.encode(query.trim(), "UTF-8")
         val document = try { fetchDoc(url) } catch (e: Exception) { return emptyList() }
-        return document.select("div.anime-list-content div.anime-card-container").mapNotNull {
-            val href = it.selectFirst("div.anime-card-poster a")?.attr("href") ?: return@mapNotNull null
-            val title = it.selectFirst("div.anime-card-title h3 a")?.text() ?: return@mapNotNull null
-            newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
-                posterUrl = smartPoster(it.selectFirst("img.img-responsive")?.attr("src"))
+        return document.select("div.grid a[href*='/anime/'], div.grid a[href*='/movie/']").mapNotNull { card ->
+            val href = card.attr("href")
+            val title = card.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
+            val isMovie = href.contains("/movie/")
+            newAnimeSearchResponse(title, fixUrl(href), if (isMovie) TvType.AnimeMovie else TvType.Anime) {
+                posterUrl = smartPoster(card.selectFirst("img")?.attr("src"))
             }
-        }
+        }.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val document = fetchDoc(url)
+        val title = document.selectFirst("h1 span[dir='ltr']")?.text()?.trim()
+            ?: document.selectFirst("h1")?.text()?.trim()
+            ?: document.selectFirst("meta[property='og:title']")?.attr("content")
+                ?.replace("مترجم", "")?.replace("اون لاين", "")?.replace("فيلم", "")?.replace("انمي", "")?.trim()
+            ?: ""
+        val poster = document.selectFirst("img[src*='/posters/']")?.attr("src")
+            ?: document.selectFirst("div.shrink-0 img")?.attr("src")
+            ?: document.selectFirst("meta[property='og:image']")?.attr("content")
+        val description = document.selectFirst("p.leading-relaxed")?.text()?.trim()
+            ?: document.selectFirst("meta[property='og:description']")?.attr("content")
+        val isMovie = url.contains("/movie/")
+        val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
+        val genres = document.select("div.flex-wrap.gap-2 span.rounded-full").map { it.text().trim() }.filter { it.isNotEmpty() }
 
-        val title = document.selectFirst("h1.anime-details-title")?.text()?.trim() ?: ""
-        val poster = document.selectFirst("div.anime-thumbnail img")?.attr("src")
-        val description = document.selectFirst("p.anime-story")?.text()?.trim()
-        val genres = document.select("ul.anime-genres li a").map { it.text() }
-
-        var status = ShowStatus.Ongoing
-        var tvType = TvType.Anime
-        document.select(".anime-info").forEach {
-            val infoText = it.text()
-            if (infoText.startsWith("حالة الأنمي:")) status = if (infoText.contains("مكتمل")) ShowStatus.Completed else ShowStatus.Ongoing
-            if (infoText.startsWith("النوع:")) tvType = if (infoText.contains("Movie")) TvType.AnimeMovie else TvType.Anime
+        var year: Int? = null
+        var status = ShowStatus.Completed
+        if (document.selectFirst("span:contains(مستمر)") != null) status = ShowStatus.Ongoing
+        document.select("div.grid > div").forEach { box ->
+            val label = box.selectFirst("span")?.text()?.trim() ?: ""
+            val value = box.selectFirst("p")?.text()?.trim() ?: ""
+            if (label.contains("السنة")) year = Regex("""\d{4}""").find(value)?.value?.toIntOrNull() ?: year
         }
+        val rating = document.selectFirst("span[dir='ltr']:has(svg)")?.text()?.trim()?.toDoubleOrNull()
 
-        var episodes = listOf<Episode>()
-        val match = Regex("""var\s+processedEpisodeData\s*=\s*'([^']+)'""").find(document.html())
-        val encodedData = match?.groupValues?.get(1)
-        if (!encodedData.isNullOrBlank()) {
-            try {
-                val parts = encodedData.split(".")
-                if (parts.size == 2) {
-                    val p1 = String(Base64.decode(parts[0], Base64.DEFAULT))
-                    val p2 = String(Base64.decode(parts[1], Base64.DEFAULT))
-                    val sb = StringBuilder()
-                    for (i in p1.indices) sb.append((p1[i].code xor p2[i % p2.length].code).toChar())
-                    val eps = AppUtils.parseJson(sb.toString()) as? List<Map<String, Any>>
-                    if (eps != null) {
-                        val epUrls = eps.mapNotNull { it["url"]?.toString() }
-                        var changed = false
-                        for (i in epUrls.indices) {
-                            val nxt = epUrls.getOrNull(i + 1)
-                            if (nxt != null && nextEpMap[epUrls[i]] != nxt) {
-                                nextEpMap[epUrls[i]] = nxt
-                                changed = true
-                            }
-                        }
-                        if (nextEpMap.size > 400) nextEpMap.clear()
-                        if (changed) persistStoreAsync()
-
-                        episodes = eps.mapNotNull { ep ->
-                            val epUrl = ep["url"]?.toString() ?: return@mapNotNull null
-                            val epName = ep["number"]?.toString() ?: ep["title"]?.toString() ?: "حلقة"
-                            val epNum = when (val raw = ep["number"]) {
-                                is Int -> raw
-                                is Long -> raw.toInt()
-                                is Double -> raw.toInt()
-                                else -> raw?.toString()?.trim()?.toDoubleOrNull()?.toInt()
-                            }
-                            newEpisode(epUrl) {
-                                this.name = epName
-                                this.episode = epNum
-                            }
-                        }
-
-                        // [v166] prefetch the first episode immediately —
-                        // by the time you tap it, links are already cached
-                        val first = epUrls.firstOrNull()
-                        if (first != null && linkCache[first] == null && !inFlight.containsKey(first)) {
-                            schedulePrefetch(first, forceFirst = first)
-                        }
-                    }
-                }
-            } catch (e: Exception) { logError(e) }
+        val episodes = mutableListOf<Episode>()
+        if (isMovie) {
+            val watchUrl = document.selectFirst("a[href*='/watch/movie/']")?.attr("href") ?: url
+            episodes.add(newEpisode(fixUrl(watchUrl)) { this.name = title; this.episode = 1; this.posterUrl = smartPoster(poster) })
+        } else {
+            document.select("div[data-episode-list] a[href*='/watch/']").forEach { epTag ->
+                val epHref = epTag.attr("href")
+                val epNum = Regex("""/(\d+)$""").find(epHref)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""\d+""").find(epTag.text())?.value?.toIntOrNull()
+                episodes.add(newEpisode(fixUrl(epHref)) {
+                    this.name = "الحلقة ${epNum ?: ""}".trim()
+                    this.episode = epNum
+                    this.posterUrl = smartPoster(poster)
+                })
+            }
+            episodes.sortBy { it.episode ?: Int.MAX_VALUE }
         }
-        WitaLog.d("loaded '$title' episodes=${episodes.size}")
+        val distinct = episodes.distinctBy { it.data }
 
+        val epUrls = distinct.map { it.data }
+        var changed = false
+        for (i in epUrls.indices) {
+            val nxt = epUrls.getOrNull(i + 1)
+            if (nxt != null && nextEpMap[epUrls[i]] != nxt) { nextEpMap[epUrls[i]] = nxt; changed = true }
+        }
+        if (nextEpMap.size > 400) nextEpMap.clear()
+        if (changed) persistStoreAsync()
+        val first = epUrls.firstOrNull()
+        if (first != null && linkCache[first] == null && !inFlight.containsKey(first)) schedulePrefetch(first, forceFirst = first)
+
+        WitaLog.d("loaded '$title' episodes=${distinct.size}")
         return newAnimeLoadResponse(title, url, tvType) {
             this.posterUrl = smartPoster(poster)
             this.plot = description
             this.tags = genres
+            this.year = year
             this.showStatus = status
-            addEpisodes(DubStatus.Subbed, episodes)
+            this.score = rating?.let { Score.from10(it) }
+            addEpisodes(DubStatus.Subbed, distinct)
         }
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ensureStoreLoaded()
-
-        // [v166] cache hit = the whole reason this exists: when you open the
-        // NEXT episode after a prefetch, links deliver instantly from RAM/disk
-        if (deliverCached(data, subtitleCallback, callback)) {
-            schedulePrefetch(data)
-            return true
-        }
-
+        WitaState.isCasting = isCasting
+        if (deliverCached(data, subtitleCallback, callback)) { schedulePrefetch(data); return true }
         val pending = inFlight[data]
-        if (pending != null && pending.isActive) {
-            WitaLog.d("prefetch in-flight — waiting")
-            withTimeoutOrNull(15_000) { pending.join() }
-            if (deliverCached(data, subtitleCallback, callback)) {
-                schedulePrefetch(data)
-                return true
-            }
-            WitaLog.d("prefetch produced nothing → full load (dialog allowed)")
-            inFlight.remove(data)
+        if (pending != null) {
+            if (pending.isActive) { WitaLog.d("prefetch in-flight — waiting"); withTimeoutOrNull(15_000) { pending.join() } }
+            if (deliverCached(data, subtitleCallback, callback)) { schedulePrefetch(data); return true }
+            inFlight.remove(data, pending)
         }
-
         val capturedSubs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
         val subCb: (SubtitleFile) -> Unit = { s -> subtitleCallback(s); capturedSubs.add(s) }
-
         val links = extractLinks(data, subCb, callback)
-
-        if (links.isNotEmpty()) {
-            putCache(data, links, capturedSubs.toList())
-            schedulePrefetch(data)
-            return true
-        }
+        if (links.isNotEmpty()) { putCache(data, links, capturedSubs.toList()); schedulePrefetch(data); return true }
         return false
     }
 
-    // [v166] deep prefetch: next TWO episodes warm in the background
     private fun schedulePrefetch(currentUrl: String, forceFirst: String? = null) {
         if (inFlight.size > 6) return
         val next = forceFirst ?: nextEpMap[currentUrl] ?: return
         prefetchOne(next)
-        // also warm the episode after next — by the time you finish one
-        // episode, TWO ahead are already resolved and cached
-        nextEpMap[next]?.let { nextNext -> prefetchOne(nextNext) }
+        nextEpMap[next]?.let { prefetchOne(it) }
     }
 
     private fun prefetchOne(epUrl: String) {
@@ -431,226 +344,239 @@ class WitAnime : MainAPI() {
         if (c != null && System.currentTimeMillis() - c.ts < LINK_CACHE_TTL) return
         if (inFlight.containsKey(epUrl)) return
         WitaLog.d("prefetch START $epUrl")
-        val job = bgScope.launch {
+        lateinit var job: Job
+        job = bgScope.launch(start = CoroutineStart.LAZY) {
             try {
                 val subs = Collections.synchronizedList(mutableListOf<SubtitleFile>())
                 val links = extractLinks(epUrl, { subs.add(it) }, {}, silent = true)
-                if (links.isNotEmpty()) {
-                    putCache(epUrl, links, subs.toList())
-                    WitaLog.d("prefetched ${links.size} links ($epUrl)")
-                } else {
-                    WitaLog.d("prefetch EMPTY ($epUrl) — will full-load on open")
-                }
-            } catch (e: Exception) {
-                WitaLog.e("prefetch error: ${e.message}")
-            } finally {
-                inFlight.remove(epUrl)
-            }
+                if (links.isNotEmpty()) { putCache(epUrl, links, subs.toList()); WitaLog.d("prefetched ${links.size} links") }
+                else WitaLog.d("prefetch EMPTY ($epUrl)")
+            } catch (e: Exception) { WitaLog.e("prefetch error: ${e.message}") }
+            finally { inFlight.remove(epUrl, job) }
         }
-        inFlight[epUrl] = job
+        if (inFlight.putIfAbsent(epUrl, job) == null) job.start()
+    }
+
+    data class ServerItem(val quality: String, val label: String, val token: String, val isStream: Boolean)
+    private data class GateResult(val success: Boolean, val isRateLimited: Boolean, val remaining: Int = -1, val embedUrl: String? = null)
+
+    private fun gateHeaders(csrf: String, watchUrl: String): Map<String, String> = mapOf(
+        "User-Agent" to ua(),
+        "Accept" to "application/json",
+        "X-CSRF-TOKEN" to csrf,
+        "Origin" to mainUrl,
+        "Referer" to watchUrl,
+        "Sec-Fetch-Site" to "same-origin",
+        "Sec-Fetch-Mode" to "cors",
+        "Sec-Fetch-Dest" to "empty",
+    )
+
+    private fun unlockGate(s: ServerItem, csrf: String, watchUrl: String): GateResult {
+        val encoded = URLEncoder.encode(s.token, "UTF-8")
+        val empty = ByteArray(0).toRequestBody(null)
+        return try {
+            if (s.isStream) {
+                var gatePath = "/watch/stream-gate/$encoded"
+                var refPolicy = "no-referrer"
+                val sReq = Request.Builder().url("$mainUrl/watch/stream-source/$encoded").post(empty)
+                    .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
+                sessionClient.newCall(sReq).execute().use { r ->
+                    val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
+                    if (r.code == 429) return GateResult(false, true, rem)
+                    val b = r.body?.string().orEmpty()
+                    if (!r.isSuccessful) return GateResult(false, false, rem)
+                    runCatching { JSONObject(b) }.getOrNull()?.let { j ->
+                        j.optString("gateUrl").takeIf { it.isNotBlank() }?.let { gatePath = it }
+                        j.optString("referrerPolicy").takeIf { it.isNotBlank() }?.let { refPolicy = it }
+                    }
+                }
+                val fullGateUrl = fixUrl(gatePath)
+                val gb = Request.Builder().url(fullGateUrl).get()
+                    .header("User-Agent", ua())
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                    .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Dest", "iframe")
+                    .header("Upgrade-Insecure-Requests", "1")
+                if (refPolicy.equals("origin", true)) gb.header("Referer", "$mainUrl/")
+                noRedirectSessionClient.newCall(gb.build()).execute().use { r ->
+                    val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
+                    if (r.code == 429) return GateResult(false, true, rem)
+                    var embed = r.header("Location")
+                    if (embed.isNullOrBlank()) {
+                        val b = r.body?.string().orEmpty()
+                        val doc = Jsoup.parse(b, fullGateUrl)
+                        embed = doc.selectFirst("iframe[src]")?.attr("src")
+                            ?: Regex("""url=['"]([^'"]+)['"]""").find(b)?.groupValues?.get(1)
+                            ?: Regex("""href=["'](https?://[^"']+)["']""").find(b)?.groupValues?.get(1)
+                    }
+                    if (!embed.isNullOrBlank() && embed.startsWith("http")) return GateResult(true, false, rem, fixUrl(embed))
+                }
+            } else {
+                val sReq = Request.Builder().url("$mainUrl/watch/download-source/$encoded").post(empty)
+                    .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
+                sessionClient.newCall(sReq).execute().use { r ->
+                    val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
+                    if (r.code == 429) return GateResult(false, true, rem)
+                    if (!r.isSuccessful) return GateResult(false, false, rem)
+                }
+                val gReq = Request.Builder().url("$mainUrl/watch/download-gate/$encoded").get()
+                    .header("User-Agent", ua())
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Referer", watchUrl)
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Dest", "document")
+                    .header("Upgrade-Insecure-Requests", "1")
+                    .build()
+                noRedirectSessionClient.newCall(gReq).execute().use { r ->
+                    val rem = r.header("x-ratelimit-remaining")?.toIntOrNull() ?: -1
+                    if (r.code == 429) return GateResult(false, true, rem)
+                    val loc = r.header("Location")
+                    if (!loc.isNullOrBlank()) return GateResult(true, false, rem, fixUrl(loc.trim()))
+                }
+            }
+            GateResult(false, false)
+        } catch (_: Exception) { GateResult(false, false) }
     }
 
     private suspend fun extractLinks(
-        data: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        silent: Boolean = false
+        data: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, silent: Boolean = false
     ): List<ExtractorLink> {
-        fun cleanBase64Chars(s: String) = s.replace(Regex("[^A-Za-z0-9+/=]"), "")
-        fun b64Bytes(i: String?): ByteArray = if (i.isNullOrBlank()) ByteArray(0) else try { Base64.decode(i, Base64.DEFAULT) } catch (_: Exception) { ByteArray(0) }
-        fun bytesStr(b: ByteArray): String = if (b.isEmpty()) "" else try { String(b, Charsets.UTF_8) } catch (_: Exception) { try { String(b, Charset.forName("ISO-8859-1")) } catch (_: Exception) { b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() } } }
-        fun hexBytes(h: String?): ByteArray = if (h.isNullOrBlank()) ByteArray(0) else { val c = h.replace(Regex("[^0-9a-fA-F]"), ""); if (c.length % 2 != 0) ByteArray(0) else c.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
-        fun xor(d: ByteArray, k: ByteArray): ByteArray = if (k.isEmpty()) d else ByteArray(d.size) { i -> (d[i].toInt() xor k[i % k.size].toInt()).toByte() }
-        fun trim(s: String?): String = s?.replace(Regex("[\\x00\\u0000]"), "")?.trim() ?: ""
-
-        suspend fun fetch(u: String): String = smartFetch(u, referer = data, silent = silent) ?: ""
-
-        fun findServers(html: String): List<Pair<String, String>> {
-            val items = mutableListOf<Pair<String, String>>()
-            Regex("""(<a[^>]+class=["'][^"']*server-link[^"']*["'][^>]*>.*?</a>)""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
-                val tag = m.groupValues[1]
-                val sid = Regex("""data-server-id\s*=\s*["']([^"']+)["']""").find(tag)?.groupValues?.get(1)
-                val label = Regex("""<span[^>]+class=["'][^"']*ser[^"']*["'][^>]*>(.*?)</span>""", RegexOption.DOT_MATCHES_ALL).find(tag)?.groupValues?.get(1)?.replace(Regex("\\s+"), " ")?.trim()
-                if (sid != null) items.add(sid to (label ?: "server-$sid"))
-            }
-            return items
-        }
-
-        fun decodeWatch(raw: String, cfg: JSONObject?): String {
-            return try {
-                val cleaned = cleanBase64Chars(raw.reversed())
-                val decoded = b64Bytes(cleaned)
-                if (decoded.isEmpty()) return ""
-                var off = 0
-                if (cfg != null) {
-                    val kIdx = String(b64Bytes(cfg.optString("k", ""))).trim().toIntOrNull() ?: 0
-                    val d = cfg.optJSONArray("d")
-                    if (d != null && kIdx in 0 until d.length()) off = d.optInt(kIdx)
-                }
-                val sliced = if (off in 1 until decoded.size) decoded.copyOf(decoded.size - off) else decoded
-                trim(bytesStr(sliced))
-            } catch (_: Exception) { "" }
-        }
-
-        fun decryptDownloads(html: String): List<String> {
-            val out = mutableListOf<String>()
-            try {
-                val mR = Regex("""var\s+_m\s*=\s*\{\s*"r"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return emptyList()
-                val secret = b64Bytes(mR)
-                if (secret.isEmpty()) return emptyList()
-                val pMap = mutableMapOf<Int, List<String>>()
-                Regex("""var\s+_p(\d+)\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).findAll(html).forEach { m ->
-                    val n = m.groupValues[1].toIntOrNull() ?: return@forEach
-                    pMap[n] = Regex(""""([^"]*)"""").findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
-                }
-                val seqList: List<String> = Regex("""var\s+_x\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
-                    ?.let { Regex(""""([^"]*)"""").findAll(it).map { m -> m.groupValues[1] }.toList() }
-                    ?: Regex("""var\s+_s\s*=\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
-                    ?.let { Regex("\"([^\"]*)\"").findAll(it).map { m -> m.groupValues[1] }.toList() }
-                    ?: emptyList()
-                for (i in seqList.indices) {
-                    val chunks = pMap[i] ?: continue
-                    val seqStr = trim(bytesStr(xor(hexBytes(seqList[i]), secret)))
-                    val seqArr = try { JSONArray(seqStr) } catch (_: Exception) { null } ?: continue
-                    val dec = chunks.map { trim(bytesStr(xor(hexBytes(it), secret))) }
-                    val arranged = Array(seqArr.length()) { "" }
-                    for (j in 0 until seqArr.length()) {
-                        val pos = seqArr.optInt(j)
-                        if (pos in arranged.indices) arranged[pos] = dec.getOrNull(j) ?: ""
-                    }
-                    out.add(arranged.joinToString(""))
-                }
-            } catch (e: Exception) { WitaLog.e("dl error: ${e.message}") }
-            return out
-        }
-
         data class Entry(val serverIdx: Int, val order: Long, val link: ExtractorLink)
         val collected = Collections.synchronizedList(mutableListOf<Entry>())
         fun mkAt(serverIdx: Int, base: Long): (Long) -> (ExtractorLink) -> Unit = { sub ->
             { l -> collected.add(Entry(serverIdx, base + sub, l)) }
         }
-
         return try {
-            val html = fetch(data)
-            if (html.isBlank()) { WitaLog.d("episode fetch EMPTY"); return emptyList() }
+            val watchUrl = fixUrl(data.substringBefore('?').trimEnd('/'))
+            val html = siteHtml(watchUrl, silent) ?: run { WitaLog.d("watch page EMPTY"); return emptyList() }
+            val csrf = Regex("""name=['"]csrf-token['"]\s+content=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+                ?: Regex("""data-csrf=['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+                ?: run { WitaLog.e("no CSRF token"); return emptyList() }
+            val rawSources = Regex("""sourcesUrl\s*:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+                ?.replace("\\/", "/")?.trim() ?: "$watchUrl/sources"
+            val sourcesUrl = fixUrl(rawSources)
+            WitaLog.d("sources → $sourcesUrl")
 
-            val zT = Regex("""_zT\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
-            val zV = Regex("""_zV\s*=\s*"([A-Za-z0-9+/=]{20,})"""").find(html)?.groupValues?.get(1)
-            val resArr = zT?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
-            val cfgArr = zV?.let { try { JSONArray(String(b64Bytes(it))) } catch (_: Exception) { null } }
-            val servers = findServers(html)
-            val dlLinks = decryptDownloads(html).filter { !it.contains("mediafire", true) }
-            WitaLog.d("resArr=${resArr?.length() ?: -1} servers=${servers.size} downloads=${dlLinks.size}")
-
-            val semaphore = Semaphore(3)
-
-            suspend fun decodeAndRoute(idx: Int, sid: String, label: String) {
+            delay(300)
+            val sourcesJson = withContext(Dispatchers.IO) {
                 try {
-                    val i = sid.toIntOrNull() ?: -1
-                    if (resArr == null || i !in 0 until resArr.length()) { WitaLog.d("[$label] no registry"); return }
-                    val link = decodeWatch(resArr.optString(i), cfgArr?.optJSONObject(i))
-                    WitaLog.d("[$label] -> ${link.take(90)}")
-                    if (link.isNotBlank()) {
-                        val finalLink = if (link.matches(Regex("""^https://yonaplay\.net/embed\.php\?id=\d+$""")))
-                            "$link&apiKey=$FRAMEWORK_HASH" else link
-                        withTimeoutOrNull(25_000) {
-                            routeLink(finalLink, data, subtitleCallback, mkAt(idx, idx * 1000L))
-                        } ?: WitaLog.d("[$label] TIMEOUT")
-                    }
-                } catch (_: Exception) {}
-            }
+                    val req = Request.Builder().url(sourcesUrl).post(ByteArray(0).toRequestBody(null))
+                        .apply { gateHeaders(csrf, watchUrl).forEach { (k, v) -> header(k, v) } }.build()
+                    sessionClient.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
+                } catch (_: Exception) { null }
+            } ?: run { WitaLog.e("sources POST failed"); return emptyList() }
 
-            supervisorScope {
-                servers.mapIndexed { i, (sid, label) ->
-                    async(Dispatchers.IO) {
-                        delay((i % 3) * 350L)
-                        semaphore.withPermit { decodeAndRoute(i, sid, label) }
-                    }
-                }.awaitAll()
-            }
-
-            val produced = HashMap<Int, Int>()
-            synchronized(collected) { for (e in collected) produced[e.serverIdx] = (produced[e.serverIdx] ?: 0) + 1 }
-            val toRetry = servers.mapIndexed { i, s -> i to s }.filter { (produced[it.first] ?: 0) == 0 }
-
-            // [v165] WAVE 1: emit everything pass-1 produced RIGHT NOW — the
-            // player gets the fast servers' links in seconds while slow
-            // WebView servers keep grinding in the background
-            val emittedUrls = HashSet<String>()
-            fun emitWave() {
-                val ordered = synchronized(collected) { collected.toList() }
-                    .filter { emittedUrls.add(it.link.url) }
-                    .sortedWith(
-                        compareBy<Entry> { it.order }
-                            .thenByDescending { it.link.quality }
-                            .thenBy { it.link.name }
-                    )
-                ordered.forEach { callback(it.link) }
-            }
-            emitWave()
-
-            if (toRetry.isNotEmpty()) {
-                supervisorScope {
-                    toRetry.mapIndexed { j, (i, server) ->
-                        async(Dispatchers.IO) {
-                            delay((j % 3) * 350L)
-                            semaphore.withPermit {
-                                WitaLog.d("[${server.second}] empty → retry")
-                                try {
-                                    withTimeoutOrNull(15_000L) { decodeAndRoute(i, server.first, server.second) }
-                                } catch (_: Exception) {}
-                            }
+            val root = try { JSONObject(sourcesJson) } catch (_: Exception) { return emptyList() }
+            val allServers = mutableListOf<ServerItem>()
+            fun extractGroup(players: JSONObject?, downloads: JSONObject?) {
+                players?.let { p ->
+                    for (q in p.keys()) {
+                        val arr = p.optJSONArray(q) ?: continue
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val token = o.optString("token")
+                            val label = o.optString("label").ifBlank { o.optString("name", "Server") }
+                            if (token.isNotBlank()) allServers.add(ServerItem(q, label, token, true))
                         }
-                    }.awaitAll()
+                    }
+                }
+                downloads?.let { d ->
+                    for (q in d.keys()) {
+                        val arr = d.optJSONArray(q) ?: continue
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val token = o.optString("token")
+                            val label = o.optString("label").ifBlank { o.optString("name", "Download") }
+                            if (token.isNotBlank()) allServers.add(ServerItem(q, label, token, false))
+                        }
+                    }
                 }
             }
+            extractGroup(root.optJSONObject("players"), root.optJSONObject("downloads"))
+            root.optJSONObject("versions")?.let { v ->
+                v.keys().forEach { ver ->
+                    val sub = v.optJSONObject(ver) ?: return@forEach
+                    extractGroup(sub.optJSONObject("players"), sub.optJSONObject("downloads"))
+                }
+            }
+            if (allServers.isEmpty()) { WitaLog.d("no servers"); return emptyList() }
 
-            supervisorScope {
-                dlLinks.mapIndexed { i, dl ->
-                    async(Dispatchers.IO) {
-                        delay((i % 3) * 350L)
-                        semaphore.withPermit {
-                            try {
-                                val idx = dl.indexOf("http")
-                                val final = trim(if (idx >= 0) dl.substring(idx) else dl)
-                                if (final.startsWith("http")) withTimeoutOrNull(20_000) {
-                                    routeLink(final, data, subtitleCallback, mkAt(-1, 100_000_000L), null, i.toLong())
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }.awaitAll()
+            val servers = allServers
+                .sortedWith(compareByDescending<ServerItem> { it.isStream }.thenByDescending { qualityRank(it.quality) })
+                .take(10)
+            WitaLog.d("${allServers.size} servers → trying ${servers.size}")
+
+            val semaphore = Semaphore(3)
+            val emittedUrls = HashSet<String>()
+            val emitLock = Any()
+            fun emitWave() {
+                val ordered = synchronized(emitLock) {
+                    synchronized(collected) { collected.toList() }
+                        .filter { emittedUrls.add(it.link.url) }
+                        .sortedWith(compareBy<Entry> { it.order }.thenByDescending { it.link.quality }.thenBy { it.link.name })
+                }
+                ordered.forEach { runCatching { callback(it.link) } }
             }
 
-            // [v165] WAVE 2: late arrivals (retries + download links) appended
+            supervisorScope {
+                val flusher = launch { while (isActive) { delay(1_200L); emitWave() } }
+                val tasks = mutableListOf<Deferred<Unit>>()
+                var quotaDead = false
+                for ((idx, server) in servers.withIndex()) {
+                    if (quotaDead) break
+                    val gate = withContext(Dispatchers.IO) { unlockGate(server, csrf, watchUrl) }
+                    if (gate.isRateLimited || gate.remaining == 0) {
+                        WitaLog.d("[${server.label}] gate quota reached — stopping")
+                        quotaDead = true
+                    }
+                    val embed = gate.embedUrl
+                    if (gate.success && !embed.isNullOrBlank()) {
+                        WitaLog.d("[${server.label} | ${server.quality}] → $embed")
+                        tasks.add(async(Dispatchers.IO) {
+                            semaphore.withPermit {
+                                val budget = if (embed.contains("yonaplay")) 75_000L else 25_000L
+                                withTimeoutOrNull(budget) {
+                                    routeLink(embed, watchUrl, subtitleCallback, mkAt(idx, idx * 1000L), server.quality.uppercase())
+                                } ?: WitaLog.d("[${server.label}] TIMEOUT")
+                            }
+                        })
+                    }
+                    if (!quotaDead && idx < servers.size - 1) delay(800)
+                }
+                tasks.awaitAll()
+                flusher.cancel()
+            }
             emitWave()
             synchronized(collected) { collected.toList() }.map { it.link }
         } catch (e: Exception) { logError(e); emptyList() }
     }
 
     private suspend fun routeLink(
-        link: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        emitAt: (Long) -> (ExtractorLink) -> Unit,
-        qLabel: String? = null,
-        selfOrder: Long = 0L
+        link: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit,
+        emitAt: (Long) -> (ExtractorLink) -> Unit, qLabel: String? = null, selfOrder: Long = 0L
     ) {
         val rawCb = emitAt(selfOrder)
         val emit: (ExtractorLink) -> Unit = { l ->
             val cleaned = cleanLinkName(l.name)
             if (cleaned.isBlank() || cleaned == l.name) rawCb(l) else rawCb(renameLink(l, cleaned))
         }
-
         WitaLog.d("routing -> $link")
         val host = linkHost(link)
         when {
             host.contains("yonaplay") -> decodeYonaplayAndLoad(link, subtitleCallback, emitAt)
             host.contains("dotplay") -> DotPlayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
             host.contains("soraplay") -> SoraplayExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
+            isHgCloudLink(link) -> HgCloudExtractor().getUrl(link, referer, subtitleCallback, emit)
             isDirectCdnLink(link) -> emitDirectCdn(link, qLabel, emit)
+            host.contains("drive.google") || host.contains("drive.usercontent") ->
+                GoogleDriveExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
+            host.contains("gofile.io") -> GoFileExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("videa.hu") -> VideaExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("videas.fr") -> VideasFrExtractor().getUrl(link, referer, subtitleCallback, emit)
+            host.contains("videas.com") -> VideasExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("ok.ru") || host.contains("odnoklassniki") -> OkRuExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("my.mail.ru") || link.contains("/video/embed/", true) -> MailruExtractor().getUrl(link, referer, subtitleCallback, emit)
             isMegaLink(link) -> MegaExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
@@ -658,7 +584,6 @@ class WitAnime : MainAPI() {
             host.contains("filemoon") -> FileMoonExtractor().getUrl(link, referer, subtitleCallback, emit)
             host.contains("4shared") -> FourSharedExtractor().apply { linkLabel = qLabel }.getUrl(link, referer, subtitleCallback, emit)
             host.contains("mediafire") -> { }
-            // [v159] workupload is a download host with its own human puzzle
             host.contains("workupload") -> { }
             isStreamWishLink(link) -> handleUnknownEmbed(link, referer, "StreamWish", subtitleCallback, emit)
             else -> {
@@ -668,68 +593,98 @@ class WitAnime : MainAPI() {
         }
     }
 
+    private suspend fun tryYonaApi(
+        yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, emitAt: (Long) -> (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val origin = hostOf(yonaplayUrl)
+            var html = withTimeoutOrNull(12_000L) { sessionGet(yonaplayUrl, referer = "$mainUrl/") } ?: return false
+            if (WitaWeb.looksChallenge(html)) html = siteHtml(yonaplayUrl) ?: return false
+
+            var code = ""; var embedToken = ""; var pageKey = ""
+            Regex("""window\._E\s*=\s*(\{[^;]+?\})""").find(html)?.groupValues?.get(1)?.let { raw ->
+                runCatching { JSONObject(raw) }.getOrNull()?.let {
+                    code = it.optString("c").trim(); embedToken = it.optString("t").trim(); pageKey = it.optString("k").trim()
+                }
+            }
+            val apiHeaders = mutableMapOf("Origin" to origin, "Accept" to "application/json")
+            if (code.isEmpty() || pageKey.isEmpty()) {
+                val initRaw = withTimeoutOrNull(10_000L) {
+                    sessionPost("$origin/api/init-session.php", "{}", referer = yonaplayUrl, headers = apiHeaders)
+                } ?: return false
+                val initObj = runCatching { JSONObject(initRaw) }.getOrNull() ?: return false
+                code = initObj.optString("c").trim(); embedToken = initObj.optString("t").trim(); pageKey = initObj.optString("k").trim()
+            }
+            if (code.isEmpty() || pageKey.isEmpty()) return false
+            if (embedToken.isNotEmpty()) apiHeaders["X-Embed-Token"] = embedToken
+
+            val srcRaw = withTimeoutOrNull(10_000L) {
+                sessionPost("$origin/api/sources.php", JSONObject().put("code", code).toString(), referer = yonaplayUrl, headers = apiHeaders)
+            } ?: return false
+            val qualities = runCatching { JSONObject(srcRaw).optJSONObject("qualities") }.getOrNull() ?: return false
+
+            var idx = 0L
+            var any = false
+            for (qKey in listOf("4k", "fhd", "hd", "sd")) {
+                val group = qualities.optJSONObject(qKey) ?: continue
+                val serversArr = group.optJSONArray("servers") ?: continue
+                val qVal = labelQuality(qKey)
+                for (i in 0 until minOf(serversArr.length(), 2)) {
+                    val srv = serversArr.optJSONObject(i) ?: continue
+                    val srvName = srv.optString("name", "Server").trim()
+                    val srvToken = srv.optString("token").trim()
+                    if (srvToken.isEmpty()) continue
+                    val payload = JSONObject().put("code", code).put("token", srvToken).put("key", pageKey).toString()
+                    val aRaw = withTimeoutOrNull(8_000L) {
+                        sessionPost("$origin/api/api.php", payload, referer = yonaplayUrl, headers = apiHeaders)
+                    } ?: continue
+                    val encD = runCatching { JSONObject(aRaw).optString("d").trim() }.getOrDefault("")
+                    if (encD.isEmpty()) continue
+                    val decoded = aesGcmDecrypt(encD, pageKey)?.takeIf { it.startsWith("http") } ?: continue
+                    WitaLog.d("YonaAPI [$srvName | ${qKey.uppercase()}] -> ${decoded.take(90)}")
+                    val myIdx = idx++
+                    val knownEmbed = isHgCloudLink(decoded) || isStreamWishLink(decoded) ||
+                        listOf("dotplay", "yonaplay", "mega", "dood", "d000d", "ok.ru",
+                            "videa", "4shared", "gofile", "drive.google", "filemoon", "mail.ru").any { decoded.contains(it) }
+                    if (!knownEmbed && (decoded.contains(".m3u8") || decoded.contains(".mp4"))) {
+                        emitAt(myIdx)(newExtractorLink("Yonaplay", "Yonaplay ($srvName ${qKey.uppercase()})", decoded,
+                            if (decoded.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                            referer = "$origin/"; quality = qVal
+                        })
+                        any = true
+                    } else {
+                        withTimeoutOrNull(12_000L) { routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, qKey.uppercase(), myIdx) }
+                        any = true
+                    }
+                }
+            }
+            if (any) WitaLog.d("YonaAPI SUCCESS ($idx servers)")
+            any
+        } catch (e: Exception) { WitaLog.d("YonaAPI fail: ${e.message}"); false }
+    }
+
     private suspend fun decodeYonaplayAndLoad(
-        yonaplayUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        emitAt: (Long) -> (ExtractorLink) -> Unit
+        yonaplayUrl: String, subtitleCallback: (SubtitleFile) -> Unit, emitAt: (Long) -> (ExtractorLink) -> Unit
     ) {
         try {
-            val html = smartFetch(yonaplayUrl, referer = "$mainUrl/") ?: run {
-                WitaLog.w("Yona fetch failed"); return
-            }
-            WitaLog.d("Yona len=${html.length}")
-
+            if (tryYonaApi(yonaplayUrl, subtitleCallback, emitAt)) return
+            val html = siteHtml(yonaplayUrl) ?: run { WitaLog.w("Yona fetch failed"); return }
+            WitaLog.d("Yona legacy len=${html.length}")
             val seen = mutableSetOf<String>()
             var idx = 0L
-
-            fun named(base: String, qLabel: String?): String {
-                val n = cleanLinkName(if (qLabel.isNullOrBlank()) base else "$base ($qLabel)")
-                return n.ifBlank { base }
-            }
-
-            Regex(
-                """<li[^>]*onclick="go_to_player\('([A-Za-z0-9+/=]+)'\)"[^>]*>\s*(?:<img[^>]*>\s*)?<span>\s*([^<]*?)\s*</span>\s*<p>\s*([^<]*?)\s*</p>""",
-                RegexOption.DOT_MATCHES_ALL
-            ).findAll(html).forEach { m ->
-                val b64 = m.groupValues[1]
-                val hostLabel = m.groupValues[2].trim()
-                val qLabel = m.groupValues[3].trim().trimEnd('-', ' ').trim()
-                val myIdx = idx++
-                try {
-                    val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
-                    if (decoded.startsWith("http") && seen.add(decoded)) {
-                        WitaLog.d("Yona [$hostLabel | $qLabel] -> ${decoded.take(90)}")
-                        if (decoded.contains("drive.google.com/file/d/")) {
-                            Regex("""/file/d/([0-9A-Za-z_-]{10,})""").find(decoded)?.groupValues?.get(1)?.let { fid ->
-                                emitAt(myIdx)(newExtractorLink("Yonaplay", named("Google Drive", qLabel),
-                                    "https://drive.usercontent.google.com/download?id=$fid&export=download&confirm=t", ExtractorLinkType.VIDEO) {
-                                    referer = "https://drive.google.com/"; quality = labelQuality(qLabel)
-                                })
-                            }
-                        } else {
-                            withTimeoutOrNull(10_000) {
-                                routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, qLabel, myIdx)
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
 
             Regex("""go_to_player\('([A-Za-z0-9+/=]+)'\)""").findAll(html).map { it.groupValues[1] }.forEach { b64 ->
                 val myIdx = idx++
                 try {
                     val decoded = String(Base64.decode(b64, Base64.DEFAULT)).trim()
-                    if (decoded.startsWith("http") && seen.add(decoded)) {
+                    if (decoded.startsWith("http") && seen.add(decoded))
                         withTimeoutOrNull(10_000) { routeLink(decoded, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
-                    }
                 } catch (_: Exception) {}
             }
-
-            Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|workupload\.com|gofile\.io)/[^\s"'<>]+""").findAll(html).forEach {
+            Regex("""https?://(?:mega\.nz|mega\.co\.nz|www\.4shared\.com|drive\.google\.com|gofile\.io|hgcloud\.[a-z]+|vibuxer\.com)/[^\s"'<>]+""").findAll(html).forEach {
                 val myIdx = idx++
                 if (seen.add(it.value)) withTimeoutOrNull(10_000) { routeLink(it.value, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
             }
-
             Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).forEach { m ->
                 var src = m.groupValues[1]
                 if (src.startsWith("//")) src = "https:$src"
@@ -738,26 +693,21 @@ class WitAnime : MainAPI() {
                     withTimeoutOrNull(10_000) { routeLink(src, yonaplayUrl, subtitleCallback, emitAt, null, myIdx) }
                 }
             }
-
             Regex("""https?://[^\s"'<>]+""").findAll(html).map { it.value.trimEnd('"', '\'', ')', ';', ',') }
                 .filter { isDirectCdnLink(it) }.distinct().forEach { cdn ->
-                    if (seen.add(cdn)) {
-                        val myIdx = idx++
-                        emitDirectCdn(cdn, callback = emitAt(myIdx))
-                    }
+                    if (seen.add(cdn)) { val myIdx = idx++; emitDirectCdn(cdn, callback = emitAt(myIdx)) }
                 }
-
             Regex("""(https?://[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)""").findAll(html).forEach { m ->
                 val url = m.groupValues[1]
                 if (!url.contains("googleapis") && !url.contains("drive.google") && !isDirectCdnLink(url) && seen.add(url)) {
                     val myIdx = idx++
                     emitAt(myIdx)(newExtractorLink("Yonaplay", "Yonaplay Direct", url,
                         if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                        referer = yonaplayUrl; quality = Qualities.Unknown.value
+                        referer = yonaplayUrl; quality = urlQuality(url)
                     })
                 }
             }
-            WitaLog.d("Yona processed=$idx")
+            WitaLog.d("Yona legacy processed=$idx")
         } catch (e: Exception) { WitaLog.e("Yonaplay error: ${e.message}") }
     }
 }
