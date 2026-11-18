@@ -1,9 +1,9 @@
 package com.witanime
 
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -13,23 +13,10 @@ class OkRuExtractor : ExtractorApi() {
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
 
-    /** Playback headers — Origin is REQUIRED by ok.ru CDN for CORS */
-    private val playbackHeaders = mapOf(
-        "User-Agent" to EXTRACTOR_UA,
-        "Referer" to "https://ok.ru/",
-        "Origin" to "https://ok.ru",
-    )
-
-    /** [v168] intercept regex that EXCLUDES the preview-image host —
-     *  iv.okcdn.ru/videoPreview is the poster thumbnail, not a stream.
-     *  the lookbehind makes iv.okcdn.ru not match, while vd.okcdn.ru,
-     *  videoPlayerCdn and any .m3u8 still do */
+    private val playbackHeaders = mapOf("User-Agent" to EXTRACTOR_UA, "Referer" to "https://ok.ru/", "Origin" to "https://ok.ru")
     private val interceptRx = Regex("""(?<!iv\.)okcdn\.ru|videoPlayerCdn|\.m3u8""")
 
-    /** [v168] cap the 4-8 quality variants at the best 3 */
-    private suspend fun emitCapped(
-        videos: JSONArray, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun emitCapped(videos: JSONArray, callback: (ExtractorLink) -> Unit): Boolean {
         val candidates = ArrayList<Triple<String, String, Int>>()
         for (i in 0 until videos.length()) {
             val v = videos.optJSONObject(i) ?: continue
@@ -41,10 +28,10 @@ class OkRuExtractor : ExtractorApi() {
             candidates.add(Triple("$name $vName", full, okruQuality(vName)))
         }
         candidates.sortByDescending { it.third }
-        val picked = candidates.take(3)
-        println("WitAnimeDebug: OkRu emitCapped — ${candidates.size} found, emitting ${picked.size}")
+        val picked = candidates.distinctBy { it.second }.take(3)
         picked.forEach { (nm, full, q) ->
-            callback(newExtractorLink(name, nm, full, ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, nm, full,
+                if (full.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = "https://ok.ru/"
                 this.headers = playbackHeaders
                 quality = q
@@ -57,167 +44,92 @@ class OkRuExtractor : ExtractorApi() {
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         try {
-            println("WitAnimeDebug: OkRu START url=$url")
-
             val videoId = url.substringAfter("/videoembed/").substringAfter("/video/")
                 .substringBefore("/").substringBefore("?").trim()
-            if (videoId.isBlank()) { println("WitAnimeDebug: OkRu no ID"); return }
-
+            if (videoId.isBlank()) { WitaLog.d("OkRu no ID"); return }
             val headers = mapOf(
-                "User-Agent" to EXTRACTOR_UA,
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
-                "Referer" to (referer ?: "https://ok.ru/"),
-                "Sec-Fetch-Dest" to "iframe",
-                "Sec-Fetch-Mode" to "navigate",
-                "Sec-Fetch-Site" to "cross-site",
+                "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "cross-site",
             )
-
             var emitted = false
+            val warmHtml = withTimeoutOrNull(6_000L) {
+                sessionGet(url, referer = referer ?: "https://ok.ru/", headers = headers)
+            }.orEmpty()
 
-            // ═══ METHOD 1: Metadata API — [v168] fast-fail at 8s so a dead API
-            //     can't eat the route budget (was burning 15s+ on Read timeouts,
-            //     leaving the WebView zero time to run) ═══
             try {
-                app.get(url, headers = headers)
-
-                val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
                 val apiText = withTimeoutOrNull(8_000L) {
-                    app.get(apiUrl, headers = headers).text
-                } ?: ""
-                println("WitAnimeDebug: OkRu API len=${apiText.length}")
-
+                    sessionGet("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId",
+                        referer = url, headers = headers + mapOf("Accept" to "application/json"))
+                }.orEmpty()
                 if (apiText.length > 100) {
                     val json = try { JSONObject(apiText) } catch (_: Exception) { null }
                     if (json != null) {
-                        val videos = json.optJSONArray("videos")
-                        if (videos != null && videos.length() > 0) {
-                            emitted = emitCapped(videos, callback)
-                        }
-
+                        json.optJSONArray("videos")?.let { if (it.length() > 0) emitted = emitCapped(it, callback) }
                         if (!emitted) {
                             val hls = json.optString("hlsManifestUrl")
-                            if (hls.isNotBlank() && hls.startsWith("http")) {
-                                println("WitAnimeDebug: OkRu API hls -> ${hls.take(90)}")
-                                M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach {
-                                    callback(it); emitted = true
-                                }
-                            }
+                            if (hls.startsWith("http"))
+                                M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach { callback(it); emitted = true }
                         }
-
-                        if (!emitted) {
-                            val movie = json.optJSONObject("movie")
-                            val movieVideos = movie?.optJSONArray("videos")
-                            if (movieVideos != null) {
-                                emitted = emitCapped(movieVideos, callback)
-                            }
-                        }
+                        if (!emitted) json.optJSONObject("movie")?.optJSONArray("videos")?.let { emitted = emitCapped(it, callback) }
                     }
                 }
-                if (emitted) { println("WitAnimeDebug: OkRu: API SUCCESS"); return }
-            } catch (e: Exception) {
-                println("WitAnimeDebug: OkRu API fail: ${e.message}")
-            }
+                if (emitted) { WitaLog.d("OkRu API SUCCESS"); return }
+            } catch (e: Exception) { WitaLog.d("OkRu API fail: ${e.message}") }
 
-            // ═══ METHOD 2: HTML scrape ═══
             try {
-                val html = withTimeoutOrNull(8_000L) {
-                    app.get(url, headers = headers).text
-                } ?: ""
-                if (html.length > 500 && emitFromHtml(html, callback)) {
-                    println("WitAnimeDebug: OkRu: HTML SUCCESS")
-                    return
-                }
+                if (warmHtml.length > 500 && emitFromHtml(warmHtml, callback)) { WitaLog.d("OkRu HTML SUCCESS"); return }
             } catch (_: Exception) {}
 
-            // ═══ METHOD 3: WebView intercept — now actually gets time to run,
-            //     and no longer stops at the preview thumbnail ═══
-            println("WitAnimeDebug: OkRu: trying WebView")
             try {
-                val resolver = WebViewResolver(
-                    interceptUrl = interceptRx,
-                    additionalUrls = listOf(interceptRx),
-                    useOkhttp = false,
-                    timeout = 15_000L
-                )
-                val wvResp = app.get(url, referer = referer, interceptor = resolver)
-                val intercepted = wvResp.url
-                println("WitAnimeDebug: OkRu WV=${intercepted.take(120)}")
-
-                // [v168] safety net — never accept the preview thumbnail as a stream
-                if (intercepted.contains("videoPreview")) {
-                    println("WitAnimeDebug: OkRu WV caught preview image, not a stream — rejecting")
-                    return
-                }
-
+                val resolver = WebViewResolver(interceptUrl = interceptRx, additionalUrls = listOf(interceptRx), useOkhttp = false, timeout = 15_000L)
+                val intercepted = app.get(url, referer = referer, interceptor = resolver).url
+                if (intercepted.contains("videoPreview")) return
                 if (intercepted.isNotEmpty() && intercepted.contains("okcdn")) {
-                    if (intercepted.contains("videoPlayerCdn") || intercepted.contains(".m3u8")) {
+                    if (intercepted.contains("videoPlayerCdn") || intercepted.contains(".m3u8"))
                         M3u8Helper.generateM3u8(name, intercepted, "https://ok.ru/", headers = playbackHeaders).forEach(callback)
-                    } else {
-                        callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.M3U8) {
-                            this.referer = "https://ok.ru/"
-                            this.headers = playbackHeaders
-                        })
-                    }
-                    println("WitAnimeDebug: OkRu WV SUCCESS")
+                    else callback(newExtractorLink(name, name, intercepted, ExtractorLinkType.M3U8) {
+                        this.referer = "https://ok.ru/"; this.headers = playbackHeaders
+                    })
                 }
-            } catch (e: Exception) {
-                println("WitAnimeDebug: OkRu WV fail: ${e.message}")
-            }
-        } catch (e: Exception) {
-            println("WitAnimeDebug: OkRu error: ${e.message}")
-        }
+            } catch (e: Exception) { WitaLog.d("OkRu WV fail: ${e.message}") }
+        } catch (e: Exception) { WitaLog.e("OkRu error: ${e.message}") }
     }
 
     private suspend fun emitFromHtml(html: String, callback: (ExtractorLink) -> Unit): Boolean {
-        val unescaped = html
-            .replace("\\&quot;", "\"")
-            .replace("&quot;", "\"")
-            .replace("\\\\", "\\")
+        val unescaped = html.replace("\\&quot;", "\"").replace("&quot;", "\"").replace("\\\\", "\\")
             .replace(Regex("""\\u([0-9A-Fa-f]{4})""")) { it.groupValues[1].toInt(16).toChar().toString() }
-
         var emitted = false
-
         val hls = Regex("""(?:hlsManifestUrl|ondemandHls)"?\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(unescaped)?.groupValues?.get(1)?.trim()
         if (hls != null && hls.startsWith("http")) {
-            M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach {
-                callback(it); emitted = true
-            }
+            M3u8Helper.generateM3u8(name, hls, "https://ok.ru/", headers = playbackHeaders).forEach { callback(it); emitted = true }
             if (emitted) return true
         }
-
         for (text in listOf(unescaped, html)) {
             val videosStr = Regex(""""videos":(\[[^]]*\])"""").find(text)?.groupValues?.get(1)
             if (videosStr != null) {
                 val videos = try { JSONArray(videosStr) } catch (_: Exception) { null }
-                if (videos != null && videos.length() > 0) {
-                    emitted = emitCapped(videos, callback)
-                    if (emitted) return true
-                }
+                if (videos != null && videos.length() > 0) { emitted = emitCapped(videos, callback); if (emitted) return true }
             }
         }
-
         Regex("""(https?://[a-zA-Z0-9.-]+\.okcdn\.ru/[^\s"'<>\\]+)""").findAll(html)
             .map { it.groupValues[1] }.distinct().take(5).forEach { cdnUrl ->
-                if (cdnUrl.contains("m3u8") || cdnUrl.contains("videoPlayerCdn")) {
-                    M3u8Helper.generateM3u8(name, cdnUrl, "https://ok.ru/", headers = playbackHeaders).forEach {
-                        callback(it); emitted = true
-                    }
-                }
+                if (cdnUrl.contains("m3u8") || cdnUrl.contains("videoPlayerCdn"))
+                    M3u8Helper.generateM3u8(name, cdnUrl, "https://ok.ru/", headers = playbackHeaders).forEach { callback(it); emitted = true }
             }
-
         return emitted
     }
 
     private fun okruQuality(name: String): Int {
-        val n = name.uppercase()
+        val n = name.lowercase()
         return when {
-            n.contains("4K") || n.contains("ULTRA") -> Qualities.P2160.value
-            n.contains("1440") || n.contains("QUAD") -> Qualities.P1440.value
-            n.contains("1080") || n.contains("FULL") -> Qualities.P1080.value
-            n.contains("720") || n.contains("HD") -> Qualities.P720.value
-            n.contains("480") || n.contains("SD") -> Qualities.P480.value
-            n.contains("360") || n.contains("LOW") -> Qualities.P360.value
+            n.contains("ultra") || n.contains("4k") || n.contains("2160") -> Qualities.P2160.value
+            n.contains("quad") || n.contains("1440") -> Qualities.P1440.value
+            n.contains("full") || n.contains("1080") -> Qualities.P1080.value
+            n == "hd" || n.contains("720") -> Qualities.P720.value
+            n == "sd" || n.contains("480") -> Qualities.P480.value
+            n == "low" || n.contains("360") -> Qualities.P360.value
+            n == "lowest" || n == "mobile" || n.contains("240") -> Qualities.P240.value
             else -> Qualities.Unknown.value
         }
     }
