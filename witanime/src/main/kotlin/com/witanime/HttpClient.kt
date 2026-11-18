@@ -1,6 +1,5 @@
 package com.witanime
 
-import com.lagradost.cloudstream3.app
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -23,7 +22,7 @@ internal class SessionCookieJar : CookieJar {
         val base = baseDomain(url.host)
         for (c in cookies) {
             val key = "$base|${c.name}"
-            if (c.value.isEmpty() || c.expiresAt < System.currentTimeMillis()) store.remove(key) else store[key] = c
+            if (c.value.isEmpty()) store.remove(key) else store[key] = c
         }
     }
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
@@ -31,6 +30,8 @@ internal class SessionCookieJar : CookieJar {
         val now = System.currentTimeMillis()
         return store.entries.filter { (k, c) -> (k.startsWith("$base|") || c.matches(url)) && c.expiresAt > now }.map { it.value }
     }
+    fun cookieValue(host: String, name: String): String? =
+        store.entries.firstOrNull { it.key.startsWith("${baseDomain(host)}|") && it.value.name == name }?.value?.value
 }
 
 internal val sessionCookieJar = SessionCookieJar()
@@ -49,32 +50,41 @@ private val clientHints = Interceptor { chain ->
     } else chain.proceed(req)
 }
 
-internal val sessionClient: OkHttpClient by lazy {
-    app.baseClient.newBuilder()
+/** DEDICATED client built from scratch — NOT app.baseClient.newBuilder().
+ *  The app client carries its own interceptors/cookies/cache that injected a
+ *  conflicting Laravel session → /sources POST 419. This mirrors the proven
+ *  reference client exactly (own jar + hints + timeouts). */
+internal val engineClient: OkHttpClient by lazy {
+    OkHttpClient.Builder()
         .cookieJar(sessionCookieJar)
         .addInterceptor(clientHints)
-        .connectTimeout(12, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .callTimeout(25, TimeUnit.SECONDS)
         .build()
 }
 
-internal val noRedirectSessionClient: OkHttpClient by lazy {
-    sessionClient.newBuilder().followRedirects(false).followSslRedirects(false).build()
+internal val sessionClient: OkHttpClient get() = engineClient
+
+internal val noRedirectEngineClient: OkHttpClient by lazy {
+    engineClient.newBuilder().followRedirects(false).followSslRedirects(false).build()
 }
+internal val noRedirectSessionClient: OkHttpClient get() = noRedirectEngineClient
 
 internal fun sessionGet(url: String, referer: String? = null, headers: Map<String, String> = emptyMap()): String? = try {
     val b = Request.Builder().url(url).header("User-Agent", EXTRACTOR_UA)
     if (referer != null) b.header("Referer", referer)
     headers.forEach { (k, v) -> b.header(k, v) }
-    sessionClient.newCall(b.build()).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
+    engineClient.newCall(b.build()).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
 } catch (_: Exception) { null }
 
 internal fun sessionGetFull(url: String, referer: String? = null, headers: Map<String, String> = emptyMap()): Pair<String, String>? = try {
     val b = Request.Builder().url(url).header("User-Agent", EXTRACTOR_UA)
     if (referer != null) b.header("Referer", referer)
     headers.forEach { (k, v) -> b.header(k, v) }
-    sessionClient.newCall(b.build()).execute().use { r ->
+    engineClient.newCall(b.build()).execute().use { r ->
         if (r.isSuccessful) (r.request.url.toString() to (r.body?.string() ?: "")) else null
     }
 } catch (_: Exception) { null }
@@ -84,16 +94,15 @@ internal fun sessionPost(url: String, json: String, referer: String? = null, hea
         .post(json.toRequestBody("application/json; charset=utf-8".toMediaType()))
     if (referer != null) b.header("Referer", referer)
     headers.forEach { (k, v) -> b.header(k, v) }
-    sessionClient.newCall(b.build()).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
+    engineClient.newCall(b.build()).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
 } catch (_: Exception) { null }
 
 internal fun isPlayable(url: String, referer: String?): Boolean = try {
     val b = Request.Builder().url(url).header("User-Agent", EXTRACTOR_UA).header("Range", "bytes=0-0")
     if (referer != null) b.header("Referer", referer)
-    sessionClient.newCall(b.build()).execute().use { it.isSuccessful }
+    engineClient.newCall(b.build()).execute().use { it.isSuccessful }
 } catch (_: Exception) { false }
 
-/** bridge WebView cf_clearance into the OkHttp jar after a WitaWeb render */
 internal fun injectWebViewCookies(url: String) {
     try {
         val raw = android.webkit.CookieManager.getInstance().getCookie(url) ?: return
